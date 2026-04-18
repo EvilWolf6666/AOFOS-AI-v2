@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虛擬環境
+venv/
+
+# 資料檔（個人記憶不上傳）
+data/
+
+# VSCode
+.vscode/
+
+# 系統檔
+.DS_Store
+Thumbs.db
