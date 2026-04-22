@@ -15,10 +15,19 @@ def main():
         print("[記憶已載入]")
     else:
         print("[首次啟動，無歷史記憶]")
-    print("指令：/remember <內容> 手動存入知識，/list 查看已存知識，quit 離開\n")
+    print("模式：t = 文字輸入，v = 語音輸入（預設文字）")
+    print("指令：/remember <內容>、/list、/mode t、/mode v、quit\n")
+
+    voice_input = None
+    mode = "t"  # 預設文字模式
 
     while True:
-        user_input = input("你：").strip()
+        if mode == "t":
+            user_input = input("你：").strip()
+        else:
+            user_input = voice_input.listen()
+            if not user_input:
+                continue
 
         # 離開
         if user_input.lower() == "quit":
@@ -29,14 +38,28 @@ def main():
         if not user_input:
             continue
 
-        # 手動存入 RAG 知識
+        # 切換模式
+        if user_input == "/mode t":
+            mode = "t"
+            print("[切換為文字模式]\n")
+            continue
+
+        if user_input == "/mode v":
+            if voice_input is None:
+                from core.voice_input import VoiceInput
+                voice_input = VoiceInput(model_size="small", language="zh")
+            mode = "v"
+            print("[切換為語音模式]\n")
+            continue
+
+        # 手動存入 RAG
         if user_input.startswith("/remember "):
             content = user_input[10:].strip()
             memory.rag.add(content)
             print(f"[已記住：{content}]\n")
             continue
 
-        # 列出所有 RAG 知識
+        # 列出 RAG
         if user_input == "/list":
             items = memory.rag.list_all()
             if not items:
