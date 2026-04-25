@@ -3,6 +3,9 @@
 from openai import OpenAI
 from config import LLM_CONFIG
 from core.text_utils import fix_traditional
+from core.logger import setup_logger
+
+logger = setup_logger("LLMClient")
 
 
 class LLMClient:
@@ -14,6 +17,7 @@ class LLMClient:
         self.model = LLM_CONFIG["model"]
         self.temperature = LLM_CONFIG["temperature"]
         self.max_tokens = LLM_CONFIG["max_tokens"]
+        logger.info("初始化完成")
 
     def chat(self, messages: list[dict]) -> str:
         try:
@@ -24,7 +28,9 @@ class LLMClient:
                 max_tokens=self.max_tokens,
             )
             reply = response.choices[0].message.content.strip()
-            return fix_traditional(reply)  # ← 後處理在這裡
+            reply = fix_traditional(reply)
+            logger.debug(f"回應：{reply[:50]}...")
+            return reply
         except Exception as e:
-            print(f"[LLMClient ERROR] {e}")
+            logger.error(f"LLM 呼叫失敗：{e}")
             return ""
