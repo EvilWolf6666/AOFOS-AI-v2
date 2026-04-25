@@ -8,9 +8,9 @@ from faster_whisper import WhisperModel
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-VAD_THRESHOLD = 0.5       # 說話偵測靈敏度（0~1，越高越不靈敏）
-SILENCE_DURATION = 1.2    # 幾秒靜音後判定說話結束
-CHUNK_DURATION = 0.1      # 每次讀取的音訊長度（秒）
+VAD_THRESHOLD = 0.5       # 降低門檻，更容易觸發語音檢測
+SILENCE_DURATION = 1.5    # 縮短靜音判定時間，更快反應
+CHUNK_SIZE = 512          # Silero VAD 要求固定 512 samples
 
 
 class VoiceInput:
@@ -45,10 +45,10 @@ class VoiceInput:
         """
         print("🎙 聆聽中...")
 
-        chunk_size = int(SAMPLE_RATE * CHUNK_DURATION)
+        chunk_size = CHUNK_SIZE
         audio_buffer = []
         silence_chunks = 0
-        silence_limit = int(SILENCE_DURATION / CHUNK_DURATION)
+        silence_limit = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE)
         is_speaking = False
 
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32") as stream:
@@ -56,6 +56,15 @@ class VoiceInput:
                 chunk, _ = stream.read(chunk_size)
                 chunk_mono = chunk[:, 0] if chunk.ndim > 1 else chunk.flatten()
                 tensor = torch.from_numpy(chunk_mono)
+
+                # 音量門檻過濾（過濾底噪）
+                rms = float(torch.sqrt(torch.mean(tensor ** 2)))
+                if rms < 0.02:
+                    if is_speaking:
+                        silence_chunks += 1
+                        if silence_chunks >= silence_limit:
+                            break
+                    continue
 
                 # VAD 偵測
                 confidence = self.vad_model(tensor, SAMPLE_RATE).item()
