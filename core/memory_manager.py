@@ -69,16 +69,12 @@ class MemoryManager:
         return context
 
     # ── 記憶壓縮 ─────────────────────────────────
-
-    def _compress_oldest(self):
-        to_compress = self.working_memory[:12]
-        self.working_memory = self.working_memory[12:]
-
+    def _compress(self, turns: list[dict]):
+        """把指定的對話輪次壓縮成摘要並儲存"""
         dialogue_text = "\n".join(
             f"{'邪狼' if m['role'] == 'user' else '奧狐'}：{m['content']}"
-            for m in to_compress
+            for m in turns
         )
-
         prompt = [{
             "role": "user",
             "content": (
@@ -88,42 +84,22 @@ class MemoryManager:
                 f"{dialogue_text}"
             )
         }]
-
         summary = self.llm.chat(prompt)
-
         if self.compressed_memory:
             self.compressed_memory = f"{self.compressed_memory}\n{summary}"
         else:
             self.compressed_memory = summary
-
         self.save_memory()
+        return summary
+
+    def _compress_oldest(self):
+        to_compress = self.working_memory[:12]
+        self.working_memory = self.working_memory[12:]
+        summary = self._compress(to_compress)
         print(f"[Memory] 已壓縮記憶：{summary[:50]}...")
 
     def compress_on_exit(self):
         if not self.working_memory:
             return
-
-        dialogue_text = "\n".join(
-            f"{'邪狼' if m['role'] == 'user' else '奧狐'}：{m['content']}"
-            for m in self.working_memory
-        )
-
-        prompt = [{
-            "role": "user",
-            "content": (
-                "請用繁體中文，將以下對話摘要成3到5句話，"
-                "保留重要資訊（人名、事件、關係、重要決定），"
-                "去掉閒聊細節。只輸出摘要，不要說明。\n\n"
-                f"{dialogue_text}"
-            )
-        }]
-
-        summary = self.llm.chat(prompt)
-
-        if self.compressed_memory:
-            self.compressed_memory = f"{self.compressed_memory}\n{summary}"
-        else:
-            self.compressed_memory = summary
-
-        self.save_memory()
+        self._compress(self.working_memory)
         print("[Memory] 對話已儲存。")
