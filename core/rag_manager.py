@@ -11,6 +11,7 @@ logger = setup_logger("RAGManager")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "chroma_db")
 COLLECTION_NAME = "aofos_memory"
 TOP_K = 3
+SIMILARITY_THRESHOLD = 0.7  # 低於這個分數的結果直接丟掉
 
 
 class RAGManager:
@@ -42,9 +43,14 @@ class RAGManager:
         self.collection.upsert(**upsert_kwargs)
         logger.debug(f"新增知識：{text[:40]}...")
 
-    # ── 查詢知識 ──────────────────────────────────
+    # ── 查詢知識（含相似度門檻）─────────────────
 
     def query(self, text: str) -> list[str]:
+        """
+        查詢最相關的知識，只回傳相似度超過門檻的結果。
+        ChromaDB 回傳的 distance 是越小越相似（0 = 完全相同）。
+        轉換成相似度：similarity = 1 - distance
+        """
         count = self.collection.count()
         if count == 0:
             return []
@@ -52,10 +58,24 @@ class RAGManager:
         results = self.collection.query(
             query_texts=[text],
             n_results=min(TOP_K, count),
+            include=["documents", "distances"],
         )
+
         docs = results["documents"][0] if results["documents"] else []
-        logger.debug(f"查詢：{text[:30]}，結果：{len(docs)} 筆")
-        return docs
+        distances = results["distances"][0] if results["distances"] else []
+
+        # 過濾低相似度結果
+        filtered = []
+        for doc, distance in zip(docs, distances):
+            similarity = 1 - distance
+            if similarity >= SIMILARITY_THRESHOLD:
+                filtered.append(doc)
+                logger.debug(f"RAG 命中（相似度 {similarity:.2f}）：{doc[:30]}...")
+            else:
+                logger.debug(f"RAG 過濾（相似度 {similarity:.2f}）：{doc[:30]}...")
+
+        logger.debug(f"查詢：{text[:30]}，命中：{len(filtered)}/{len(docs)} 筆")
+        return filtered
 
     # ── 刪除知識 ──────────────────────────────────
 

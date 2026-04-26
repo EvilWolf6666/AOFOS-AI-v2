@@ -4,6 +4,9 @@ import json
 import os
 from core.llm_client import LLMClient
 from core.rag_manager import RAGManager
+from core.logger import setup_logger
+
+logger = setup_logger("MemoryManager")
 
 MEMORY_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "memory.json")
 MAX_WORKING_MEMORY = 10
@@ -25,10 +28,14 @@ class MemoryManager:
             with open(MEMORY_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 self.compressed_memory = data.get("compressed_memory", "")
+            logger.info("記憶載入完成。")
+        else:
+            logger.info("無歷史記憶，從零開始。")
 
     def save_memory(self):
         with open(MEMORY_PATH, "w", encoding="utf-8") as f:
             json.dump({"compressed_memory": self.compressed_memory}, f, ensure_ascii=False, indent=2)
+        logger.debug("記憶已存檔。")
 
     # ── 對話管理 ─────────────────────────────────
 
@@ -43,7 +50,7 @@ class MemoryManager:
         """
         組裝完整 context：
         1. 壓縮記憶（如果有）
-        2. RAG 查詢結果（如果有相關知識）
+        2. RAG 查詢結果（只注入相似度夠高的）
         3. 當前對話
         """
         context = []
@@ -55,7 +62,7 @@ class MemoryManager:
                 "content": f"[過去對話摘要]\n{self.compressed_memory}"
             })
 
-        # RAG 查詢
+        # RAG 選擇性注入（相似度門檻在 RAGManager 內處理）
         if user_input:
             rag_results = self.rag.query(user_input)
             if rag_results:
@@ -64,11 +71,15 @@ class MemoryManager:
                     "role": "system",
                     "content": f"[相關記憶]\n{rag_text}"
                 })
+                logger.debug(f"注入 {len(rag_results)} 筆 RAG 記憶。")
+            else:
+                logger.debug("無相關 RAG 記憶，跳過注入。")
 
         context.extend(self.working_memory)
         return context
 
     # ── 記憶壓縮 ─────────────────────────────────
+
     def _compress(self, turns: list[dict]):
         """把指定的對話輪次壓縮成摘要並儲存"""
         dialogue_text = "\n".join(
@@ -96,10 +107,10 @@ class MemoryManager:
         to_compress = self.working_memory[:12]
         self.working_memory = self.working_memory[12:]
         summary = self._compress(to_compress)
-        print(f"[Memory] 已壓縮記憶：{summary[:50]}...")
+        logger.info(f"已壓縮記憶：{summary[:50]}...")
 
     def compress_on_exit(self):
         if not self.working_memory:
             return
         self._compress(self.working_memory)
-        print("[Memory] 對話已儲存。")
+        logger.info("對話已儲存。")
