@@ -17,7 +17,7 @@ PLUGIN_DEVELOPER = "EvilWolf"
 
 class VTubeClient:
     def __init__(self):
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None  # type: ignore
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.auth_token: Optional[str] = None
         self._loop = asyncio.new_event_loop()
 
@@ -44,8 +44,8 @@ class VTubeClient:
                 "pluginDeveloper": PLUGIN_DEVELOPER,
             }
         }
-        await self.ws.send(json.dumps(req))  # type: ignore
-        resp = json.loads(await self.ws.recv())  # type: ignore
+        await self.ws.send(json.dumps(req))
+        resp = json.loads(await self.ws.recv())
         self.auth_token = resp["data"].get("authenticationToken", "")
 
         # 第二步：用 token 認證
@@ -60,8 +60,8 @@ class VTubeClient:
                 "authenticationToken": self.auth_token,
             }
         }
-        await self.ws.send(json.dumps(auth))  # type: ignore
-        resp = json.loads(await self.ws.recv())  # type: ignore
+        await self.ws.send(json.dumps(auth))
+        resp = json.loads(await self.ws.recv())
         authenticated = resp["data"].get("authenticated", False)
         if not authenticated:
             logger.warning("認證失敗，請在 VTube Studio 裡按允許。")
@@ -72,6 +72,9 @@ class VTubeClient:
 
     def set_mouth(self, value: float):
         """控制嘴型開合，value 範圍 0.0（閉嘴）~ 1.0（全開）"""
+        if self.ws is None:
+            logger.debug("未連線，跳過嘴型控制。")
+            return
         self._loop.run_until_complete(self._inject_param("MouthOpen", value))
 
     async def _inject_param(self, param_id: str, value: float):
@@ -88,13 +91,16 @@ class VTubeClient:
                 ]
             }
         }
-        await self.ws.send(json.dumps(req))  # type: ignore
-        await self.ws.recv()  # type: ignore
+        await self.ws.send(json.dumps(req))
+        await self.ws.recv()
 
     # ── 表情控制 ──────────────────────────────────
 
     def play_expression(self, expression_name: str):
         """觸發指定表情"""
+        if self.ws is None:
+            logger.debug("未連線，跳過表情控制。")
+            return
         self._loop.run_until_complete(self._play_expression(expression_name))
 
     async def _play_expression(self, expression_name: str):
@@ -108,12 +114,12 @@ class VTubeClient:
                 "active": True,
             }
         }
-        await self.ws.send(json.dumps(req))  # type: ignore
-        await self.ws.recv()  # type: ignore
+        await self.ws.send(json.dumps(req))
+        await self.ws.recv()
 
     # ── 斷線 ─────────────────────────────────────
 
     def disconnect(self):
         if self.ws:
-            self._loop.run_until_complete(self.ws.close())  # type: ignore
+            self._loop.run_until_complete(self.ws.close())
         logger.info("已斷線。")

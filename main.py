@@ -5,6 +5,7 @@ from typing import Optional
 from core.llm_client import LLMClient
 from core.persona import Persona
 from core.memory_manager import MemoryManager
+from core.behavior_scorer import BehaviorScorer
 from core.logger import setup_logger
 
 logger = setup_logger("Main")
@@ -15,6 +16,7 @@ def main():
     llm = LLMClient()
     persona = Persona()
     memory = MemoryManager(llm)
+    scorer = BehaviorScorer(llm)
 
     # ── VTube Studio 串接（可選）─────────────────
     vtube = None
@@ -96,6 +98,7 @@ def main():
         if reply:
             print(f"\n奧狐：{reply}\n")
             logger.debug(f"奧狐回應：{reply[:50]}...")
+            scorer.check(reply)
             memory.add_turn(user_input, reply)
 
             # VTube 嘴型

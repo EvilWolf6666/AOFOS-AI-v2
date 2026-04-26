@@ -19,7 +19,7 @@ class LLMClient:
         self.max_tokens = LLM_CONFIG["max_tokens"]
         logger.info("初始化完成")
 
-    def chat(self, messages: list[dict]) -> str:
+    def chat(self, messages: list) -> str:
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -27,7 +27,7 @@ class LLMClient:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
-            reply = response.choices[0].message.content.strip()
+            reply = (response.choices[0].message.content or "").strip()
             reply = fix_traditional(reply)
             logger.debug(f"回應：{reply[:50]}...")
             return reply
