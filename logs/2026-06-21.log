@@ -1,0 +1,5 @@
+14:56:08 [INFO] LLMClient — 初始化完成
+14:57:22 [INFO] RAGManager — RAG 初始化完成。
+14:57:22 [INFO] MemoryManager — 記憶載入完成。
+14:57:27 [WARNING] Main — VTube 未連線，跳過：[WinError 1225] 遠端電腦拒絕網路連線。
+15:07:27 [INFO] VTubeClient — 已斷線。
