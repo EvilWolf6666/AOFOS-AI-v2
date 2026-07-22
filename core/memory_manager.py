@@ -10,6 +10,7 @@ logger = setup_logger("MemoryManager")
 
 MEMORY_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "memory.json")
 MAX_WORKING_MEMORY = 10
+MAX_SUMMARY_SENTENCES = 8  # Compressed Memory 上限句數，避免無限累積
 
 
 class MemoryManager:
@@ -81,27 +82,84 @@ class MemoryManager:
     # ── 記憶壓縮 ─────────────────────────────────
 
     def _compress(self, turns: list[dict]):
-        """把指定的對話輪次壓縮成摘要並儲存"""
+        """
+        把指定的對話輪次與既有摘要重新整合：
+        - 新摘要覆寫 compressed_memory（不疊加），長度受控（MAX_SUMMARY_SENTENCES）
+        - 舊摘要中「沒出現在新摘要裡」的內容，無論原因是被新對話取代、
+          還是純粹因句數上限排不進去，統一轉存 RAG（不區分原因，
+          因為後續查詢邏輯不需要這個區分，且強行區分容易讓 LLM
+          誤把「沒被新對話提到」的內容當成可以悄悄省略，而非保留或轉存）
+        """
         dialogue_text = "\n".join(
             f"{'邪狼' if m['role'] == 'user' else '奧狐'}：{m['content']}"
             for m in turns
         )
+
+        existing_block = f"[之前的摘要]\n{self.compressed_memory}\n\n" if self.compressed_memory else ""
+
         prompt = [{
             "role": "user",
             "content": (
-                "請用繁體中文，將以下對話摘要成3到5句話，"
-                "保留重要資訊（人名、事件、關係、重要決定），"
-                "去掉閒聊細節。只輸出摘要，不要說明。\n\n"
-                f"{dialogue_text}"
+                "你要幫忙整理「奧狐」的近期記憶摘要。\n\n"
+                f"{existing_block}[新對話]\n{dialogue_text}\n\n"
+                "請完成兩件事，並嚴格遵守以下規則：\n"
+                "規則：「之前的摘要」中的每一條資訊，預設都要「保留」在新摘要裡，"
+                "除非新對話明確更新、推翻、或讓它過時（例如某件事後來解決了、狀態變了），"
+                "或受限於新摘要的句數上限而排不進去。"
+                "新對話沒有提到的舊資訊，不代表它不重要，原則上不可以省略，"
+                "只有在真的擠不進新摘要時才可以不保留。\n\n"
+                f"1. 輸出整合後的新摘要，不超過 {MAX_SUMMARY_SENTENCES} 句話，"
+                "包含：未被取代的舊資訊（照規則保留）+ 新對話中重要的新資訊。"
+                "若空間不足，優先保留人名、關係、近況、重要決定，次要內容可精簡或不放入新摘要。"
+                "每一句話結束後換行，一行一句，不要把多句擠在同一行。\n"
+                "2. 列出「之前的摘要」中，沒有出現在新摘要裡的所有舊資訊"
+                "（無論原因是被新對話取代、還是因為句數上限排不進去，只要新摘要裡沒有，就列出來；"
+                "若新摘要完整保留了之前摘要的所有內容，就寫「無」）。\n\n"
+                "請只用以下格式輸出，不要其他說明文字：\n"
+                "摘要：<新摘要內容>\n"
+                "淘汰：<沒出現在新摘要裡的舊資訊，或「無」>"
             )
         }]
-        summary = self.llm.chat(prompt)
-        if self.compressed_memory:
-            self.compressed_memory = f"{self.compressed_memory}\n{summary}"
-        else:
-            self.compressed_memory = summary
+
+        result = self.llm.chat(prompt)
+        new_summary, discarded = self._parse_compress_result(result)
+
+        self.compressed_memory = new_summary
         self.save_memory()
-        return summary
+
+        if discarded and discarded != "無":
+            try:
+                self.rag.add(discarded)
+                logger.debug(f"舊記憶已轉存 RAG：{discarded[:50]}...")
+            except Exception as e:
+                logger.warning(f"舊記憶轉存 RAG 失敗（不影響主流程）：{e}")
+
+        return new_summary
+
+    def _parse_compress_result(self, result: str) -> tuple[str, str]:
+        """解析 LLM 回傳的『摘要 / 淘汰』結果"""
+        try:
+            lines = result.strip().splitlines()
+            summary_line_idx = next(
+                i for i, l in enumerate(lines) if l.strip().startswith("摘要：")
+            )
+            discard_line_idx = next(
+                (i for i, l in enumerate(lines) if l.strip().startswith("淘汰：")),
+                None,
+            )
+
+            if discard_line_idx is not None:
+                summary = "\n".join(lines[summary_line_idx:discard_line_idx]).replace("摘要：", "", 1).strip()
+                discarded = "\n".join(lines[discard_line_idx:]).replace("淘汰：", "", 1).strip()
+            else:
+                summary = "\n".join(lines[summary_line_idx:]).replace("摘要：", "", 1).strip()
+                discarded = "無"
+
+            return summary, discarded
+        except Exception as e:
+            logger.warning(f"壓縮結果解析失敗：{e}，原始結果：{result}")
+            # 解析失敗時，保底直接用原始輸出當摘要，避免記憶遺失，且不寫入 RAG（避免存入格式錯亂內容）
+            return result.strip(), "無"
 
     def _compress_oldest(self):
         to_compress = self.working_memory[:12]
