@@ -21,6 +21,12 @@ Agent(中央控制核心 / Single Control Point)
 可以直接掛進 Pipeline，不必屆時因為卡在舊架構裡而被迫重寫一次。
 此例外已於 2026-07-18 對齊確認，應同步記錄進《AOFOS-決策脈絡歸檔.md》
 「六、Agent Layer 現況說明」一節，避免日後回顧時誤判為自相矛盾。
+
+【2026-07-22 追加】語音模式退出處理：
+core/voice_input.py 的 VoiceInput.listen() 在使用者按下退出鍵（預設 ESC）時
+會拋出 VoiceModeExit，職責上屬於「輸入取得」這件事本身的異常狀況，
+所以在 _get_input() 這一層 catch，不下放給 Pipeline
+（Pipeline 只處理「拿到輸入之後」的流程，不該認識輸入取得階段的例外）。
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from core.memory_manager import MemoryManager
 from core.logger import setup_logger
 from core.agent.state import AgentState
 from core.agent.pipeline import Pipeline
+from core.voice_input import VoiceModeExit
 
 logger = setup_logger("Agent")
 
@@ -71,13 +78,41 @@ class Agent:
             except Exception as e:
                 logger.warning(f"VTube 嘴型控制失敗：{e}")
 
+    # ── 語音模組清理（新增）─────────────────────────────────────────────
+
+    def _close_voice_input(self) -> None:
+        """
+        關閉 VoiceInput 的背景鍵盤監聽 thread。
+        呼叫時機：使用者按退出鍵離開語音模式 / 程式整體結束時，
+        避免背景 thread 沒被停掉就留著（即使是 daemon thread，養成隨手清理的習慣較好）。
+        """
+        if self.state.voice_input:
+            try:
+                self.state.voice_input.close()
+            except Exception as e:
+                logger.warning(f"VoiceInput 關閉時發生例外（不影響流程）：{e}")
+
     # ── 輸入取得 ─────────────────────────────────────────────────────
 
     def _get_input(self) -> str:
         if self.state.mode == "t":
             return input("你：").strip()
+
         # 語音模式：voice_input 一定已在切換時被惰性建立
-        text = self.state.voice_input.listen()  # type: ignore[union-attr]
+        try:
+            text = self.state.voice_input.listen()  # type: ignore[union-attr]
+        except VoiceModeExit:
+            print("[已退出語音模式，切回文字模式]\n")
+            # 注意：這裡刻意不呼叫 _close_voice_input()。
+            # voice_input 實例跨模式切換是持續存在的（見 state.py switch_to_voice()
+            # 的惰性初始化設計，避免重複載入 Whisper/VAD 模型），
+            # 若在這裡把鍵盤監聽 thread 關掉，下次 /mode v 會沿用同一個已關閉監聽的
+            # 舊實例（switch_to_voice 判斷 voice_input is not None 就不重建），
+            # ESC 會從此失效。背景監聽 thread 留著跨模式常駐是刻意行為，
+            # 真正該關閉的時機只有整個程式結束時（見 run() 的 quit 分支）。
+            self.state.switch_to_text()
+            return ""  # 交給 run() 迴圈的 `if not user_input: continue` 自然跳過這輪
+
         return text.strip() if text else ""
 
     # ── 主迴圈 ───────────────────────────────────────────────────────
@@ -102,6 +137,7 @@ class Agent:
                 if result.should_exit:
                     if self.vtube:
                         self.vtube.disconnect()
+                    self._close_voice_input()  # 新增：結束程式前一併清理背景 thread
                     break
                 continue
 
