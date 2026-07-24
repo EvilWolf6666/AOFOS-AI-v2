@@ -10,6 +10,9 @@ venv/
 # 資料檔（個人記憶不上傳）
 data/
 
+# 環境變數 / API金鑰
+.env
+
 # VSCode
 .vscode/
 
