@@ -2,7 +2,6 @@
 # 語音輸入模組 — 麥克風收音 + VAD 偵測 + Whisper 辨識
 
 import threading
-import logging
 
 import sounddevice as sd
 import numpy as np
@@ -10,7 +9,9 @@ import torch
 from faster_whisper import WhisperModel
 from pynput import keyboard
 
-logger = logging.getLogger("voice_input")
+from core.logger import setup_logger
+
+logger = setup_logger("VoiceInput")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -19,7 +20,7 @@ SILENCE_DURATION = 1.5    # 縮短靜音判定時間，更快反應
 RMS_GATE = 0.02           # 原本寫死在 listen() 內部的 magic number，集中管理方便校準
 CHUNK_SIZE = 512          # Silero VAD 要求固定 512 samples
 
-DEBUG_PRINT_RMS = True   # 【開關】要看 rms 數值校準麥克風時，改成 True 即可
+DEBUG_PRINT_RMS = False   # 【開關】要看 rms 數值校準麥克風時，改成 True 即可
 
 
 class VoiceModeExit(Exception):
@@ -103,7 +104,7 @@ class VoiceInput:
                 # 音量門檻過濾（過濾底噪）
                 rms = float(torch.sqrt(torch.mean(tensor ** 2)))
                 if DEBUG_PRINT_RMS:
-                    logger.debug(f"rms={rms:.4f}")
+                    print(f"[debug] rms={rms:.4f}")
 
                 if rms < RMS_GATE:
                     if is_speaking:
