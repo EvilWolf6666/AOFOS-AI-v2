@@ -27,9 +27,29 @@ core/voice_input.py 的 VoiceInput.listen() 在使用者按下退出鍵（預設
 會拋出 VoiceModeExit，職責上屬於「輸入取得」這件事本身的異常狀況，
 所以在 _get_input() 這一層 catch，不下放給 Pipeline
 （Pipeline 只處理「拿到輸入之後」的流程，不該認識輸入取得階段的例外）。
+
+【2026-07-25 追加】主動對話觸發（文字模式，靜默計時版）：
+input() 是無法中斷的 OS 層級阻塞呼叫，故用背景執行緒扛住它，主執行緒
+改用 queue.get(timeout=...) 同時達成「等輸入」與「等靜默計時」不互相卡住。
+這是 kimjammer/Neuro（獨立執行緒 + 共用狀態物件）架構原則的最小實例，
+未來若加入螢幕事件、聊天室訊息等第二個以上的觸發源，會需要仲裁機制
+避免多執行緒同時判定觸發（設計原則已記錄於《決策脈絡歸檔》十一之1，
+參考 Lumi_Nox 的 speech_output_arbiter 三態仲裁），現階段僅單一觸發源，
+不存在競態，故不現在建置仲裁層。
+
+已知技術限制：input() 卡住的背景執行緒無法被主動中斷（不像 VoiceInput
+監聽迴圈逐 chunk 檢查旗標那樣可中斷）。此執行緒用 daemon=True 確保
+不會阻止主程式退出，但絕對不能對它呼叫 join()——它只有使用者打字才會
+結束，quit 情境下這不會發生，join() 會讓程式卡死。詳見 _close_text_input_thread()。
+
+新增 /proactive on / /proactive off 指令，供開發測試階段手動暫停主動
+觸發（見 state.proactive_enabled），避免測試時被反覆觸發打擾。
 """
 
 from __future__ import annotations
+
+import queue
+import threading
 
 from core.llm_client import LLMClient
 from core.persona import Persona
@@ -40,6 +60,11 @@ from core.agent.pipeline import Pipeline
 from core.voice_input import VoiceModeExit
 
 logger = setup_logger("Agent")
+
+# ── 主動對話觸發：靜默閾值（秒）───────────────────────────────
+# 暫定預設值，未經實測校準。與 VAD_THRESHOLD 等參數同樣性質，
+# 屬於「先用合理起始值、依實際使用感受調整」的參數，非最終定案。
+SILENCE_THRESHOLD_SECONDS = 30
 
 
 class Agent:
@@ -78,7 +103,7 @@ class Agent:
             except Exception as e:
                 logger.warning(f"VTube 嘴型控制失敗：{e}")
 
-    # ── 語音模組清理（新增）─────────────────────────────────────────────
+    # ── 語音模組清理 ─────────────────────────────────────────────────
 
     def _close_voice_input(self) -> None:
         """
@@ -92,11 +117,37 @@ class Agent:
             except Exception as e:
                 logger.warning(f"VoiceInput 關閉時發生例外（不影響流程）：{e}")
 
+    # ── 文字輸入背景執行緒清理 ───────────────────────────────────────
+
+    def _close_text_input_thread(self) -> None:
+        """
+        清理文字模式的背景輸入執行緒參照。
+
+        重要限制：input() 是 OS 層級阻塞呼叫，卡在裡面的執行緒無法被
+        主動中斷（不像 VoiceInput 監聽迴圈逐 chunk 檢查旗標、天生可中斷）。
+        因此這裡能做的只有：
+        1. 清掉 state 上的 thread/queue 參照，避免任何後續程式碼誤用舊參照
+        2. 依賴 daemon=True 讓它不阻擋主程式退出
+
+        刻意不做、且不能做的事：不呼叫 thread.join()。join() 會卡住等待
+        該執行緒自然結束，但它只有使用者打字才會結束，quit 情境下這不會
+        發生，join() 會讓 quit 指令卡死整個程式。這條殘留的背景執行緒
+        會隨主程式行程結束被 OS 一併回收，不會有資源外洩，只是無法
+        「乾淨結束」，只能「放它去」——這是 input() 本身的限制，非疏漏。
+        """
+        if self.state.text_input_thread is not None:
+            logger.debug(
+                "背景文字輸入執行緒尚未取得輸入，"
+                "隨主程式結束交由 daemon thread 機制回收（無法主動中斷 input()）"
+            )
+        self.state.text_input_thread = None
+        self.state.text_input_queue = None
+
     # ── 輸入取得 ─────────────────────────────────────────────────────
 
     def _get_input(self) -> str:
         if self.state.mode == "t":
-            return input("你：").strip()
+            return self._get_text_input_with_timeout()
 
         # 語音模式：voice_input 一定已在切換時被惰性建立
         try:
@@ -115,13 +166,66 @@ class Agent:
 
         return text.strip() if text else ""
 
+    def _get_text_input_with_timeout(self) -> str:
+        """
+        文字模式輸入，同時支援主動對話的靜默觸發。
+
+        原理：input() 無法中斷，故用背景執行緒扛住它，主執行緒改用
+        queue.get(timeout=...) 等待——逾時代表靜默超過閾值，觸發主動對話；
+        沒逾時代表拿到真正輸入。
+
+        跨輪次沿用同一條輸入執行緒（尚未拿到輸入時不重建），避免重複開
+        執行緒同時等 stdin 導致輸入歸屬不可預期（此坑於 asyncio 方案討論
+        時已確認過，thread 版本必須同樣避開）。
+        """
+        if (
+            self.state.text_input_thread is None
+            or not self.state.text_input_thread.is_alive()
+        ):
+            self.state.text_input_queue = queue.Queue()
+            self.state.text_input_thread = threading.Thread(
+                target=self._blocking_input_worker,
+                args=(self.state.text_input_queue,),
+                daemon=True,
+            )
+            self.state.text_input_thread.start()
+
+        try:
+            user_input = self.state.text_input_queue.get(
+                timeout=SILENCE_THRESHOLD_SECONDS
+            )
+            # 這條執行緒的 input() 已返回、生命週期結束，
+            # 下一輪需要重新建立新的，故清空參照。
+            self.state.text_input_thread = None
+            self.state.text_input_queue = None
+            return user_input.strip()
+        except queue.Empty:
+            # 靜默超過閾值。先檢查是否被手動暫停（開發測試用）。
+            if self.state.proactive_enabled:
+                self._trigger_proactive_message()
+            return ""  # 交給 run() 的 `if not user_input: continue`
+
+    @staticmethod
+    def _blocking_input_worker(q: "queue.Queue[str]") -> None:
+        text = input("你：")
+        q.put(text)
+
+    # ── 主動對話觸發 ─────────────────────────────────────────────────
+
+    def _trigger_proactive_message(self) -> None:
+        result = self.pipeline.handle_proactive_trigger()
+        if result.reply:
+            print(f"\n奧狐：{result.reply}\n")
+            logger.debug(f"奧狐主動發起：{result.reply[:50]}...")
+            self._drive_vtube_on_reply()
+
     # ── 主迴圈 ───────────────────────────────────────────────────────
 
     def run(self) -> None:
         print("=== 奧狐 AOFOS 啟動 ===")
         print("[記憶已載入]" if self.memory.compressed_memory else "[首次啟動，無歷史記憶]")
         print("模式：t = 文字輸入，v = 語音輸入（預設文字）")
-        print("指令：/mode t、/mode v、quit\n")
+        print("指令：/mode t、/mode v、/proactive on、/proactive off、quit\n")
 
         while self.state.running:
             user_input = self._get_input()
@@ -137,7 +241,8 @@ class Agent:
                 if result.should_exit:
                     if self.vtube:
                         self.vtube.disconnect()
-                    self._close_voice_input()  # 新增：結束程式前一併清理背景 thread
+                    self._close_voice_input()
+                    self._close_text_input_thread()
                     break
                 continue
 
