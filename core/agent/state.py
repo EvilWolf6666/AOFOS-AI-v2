@@ -13,6 +13,8 @@ God Object 的其中一個成因是「狀態」與「決策」混在同一個物
 """
 
 from __future__ import annotations
+import queue
+import threading
 from typing import Optional, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,12 +29,24 @@ class AgentState:
         mode: 目前輸入模式，"t"（文字）或 "v"（語音）
         voice_input: VoiceInput 實例，語音模式下才會被建立（惰性初始化，維持原行為）
         running: 主迴圈是否應該繼續執行
+        text_input_thread: 文字模式下扛住阻塞 input() 的背景執行緒
+            （2026-07-25 新增，供主動對話靜默觸發使用）
+        text_input_queue: 上述執行緒與主執行緒之間傳遞輸入結果的佇列
+        proactive_enabled: 主動對話觸發手動開關（開發測試用，預設開啟，
+            可用 /proactive off 暫停，避免測試時被無限觸發打擾）
     """
 
     def __init__(self, mode: str = "t") -> None:
         self.mode: str = mode
         self.voice_input: Optional["VoiceInput"] = None
         self.running: bool = True
+
+        # ── 主動對話觸發：文字模式背景輸入執行緒狀態 ──────────────────
+        self.text_input_thread: Optional[threading.Thread] = None
+        self.text_input_queue: Optional["queue.Queue[str]"] = None
+
+        # ── 主動對話觸發：開發測試用手動開關 ──────────────────────────
+        self.proactive_enabled: bool = True
 
     def switch_to_text(self) -> None:
         self.mode = "t"
