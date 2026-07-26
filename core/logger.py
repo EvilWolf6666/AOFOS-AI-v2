@@ -1,5 +1,5 @@
 # core/logger.py
-# 統一 Logging 系統 — 所有模組都從這裡取得 logger
+# 統一 Logging 系統 — 所有模組從這裡取得 logger
 
 import logging
 import os
@@ -12,9 +12,8 @@ LOG_LEVEL = logging.DEBUG
 
 def setup_logger(name: str) -> logging.Logger:
     """
-    建立並回傳指定名稱的 logger。
-    每個模組呼叫一次，傳入模組名稱即可。
-    同時輸出到：終端機（彩色）+ logs/ 資料夾（純文字）
+    建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 logs/ 資料夾（純文字）。
+    各模組呼叫一次、傳入模組名稱即可。
     """
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -24,7 +23,7 @@ def setup_logger(name: str) -> logging.Logger:
 
     logger.setLevel(LOG_LEVEL)
 
-    # ── 終端機 handler（彩色）────────────────────
+    # 終端機 handler（彩色）
     console_handler = colorlog.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(colorlog.ColoredFormatter(
@@ -38,7 +37,7 @@ def setup_logger(name: str) -> logging.Logger:
         }
     ))
 
-    # ── 檔案 handler（純文字）────────────────────
+    # 檔案 handler（純文字，每日一份）
     log_filename = datetime.now().strftime("%Y-%m-%d") + ".log"
     file_handler = logging.FileHandler(
         os.path.join(LOG_DIR, log_filename),

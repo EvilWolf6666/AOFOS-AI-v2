@@ -1,4 +1,5 @@
 # core/llm_client.py
+# 透過 OpenAI 相容 API 連接 LM Studio 本機模型
 
 from openai import OpenAI
 from config import LLM_CONFIG
