@@ -15,20 +15,16 @@ logger = setup_logger("VoiceInput")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-VAD_THRESHOLD = 0.5       # 降低門檻，更容易觸發語音檢測
-SILENCE_DURATION = 1.5    # 縮短靜音判定時間，更快反應
-RMS_GATE = 0.02           # 原本寫死在 listen() 內部的 magic number，集中管理方便校準
+VAD_THRESHOLD = 0.5       # 語音判定信心值門檻
+SILENCE_DURATION = 1.5    # 靜音多久（秒）判定為說完
+RMS_GATE = 0.02           # 音量門檻，過濾底噪；麥克風增益不同時需一併校準
 CHUNK_SIZE = 512          # Silero VAD 要求固定 512 samples
 
-DEBUG_PRINT_RMS = False   # 【開關】要看 rms 數值校準麥克風時，改成 True 即可
+DEBUG_PRINT_RMS = False   # 校準麥克風時開啟，印出即時 rms 數值
 
 
 class VoiceModeExit(Exception):
-    """
-    使用者在語音模式中按下退出鍵（預設 ESC）時拋出。
-    外層（agent/pipeline）應該 catch 這個例外，用來切回文字模式或結束程式，
-    而不是強制關閉終端機。
-    """
+    """使用者按下退出鍵（預設 ESC）時拋出，呼叫端需 catch 並切回文字模式或結束程式。"""
     pass
 
 
@@ -54,8 +50,7 @@ class VoiceInput:
          self.VADIterator,
          self.collect_chunks) = self.vad_utils
 
-        # 【新增】背景鍵盤監聽：整個 VoiceInput 生命週期只啟動一次，
-        # 不放在 listen() 裡面重複開，避免每輪對話都疊加監聽器造成洩漏。
+        # 背景鍵盤監聽：整個 VoiceInput 生命週期只啟動一次，不放在 listen() 裡重複建立
         self.exit_key = exit_key
         self._exit_event = threading.Event()
         self._key_listener = keyboard.Listener(on_press=self._on_key_press)
@@ -70,19 +65,13 @@ class VoiceInput:
 
     def listen(self) -> str:
         """
-        開始收音，偵測到說話後錄音，
-        靜音超過 SILENCE_DURATION 秒後停止，
-        回傳辨識出的文字。
-
-        若使用者按下退出鍵（預設 ESC），拋出 VoiceModeExit，
-        呼叫端須自行 catch 並決定後續行為（切回文字模式 / 結束程式）。
+        收音、偵測語音、靜音超過 SILENCE_DURATION 秒後停止並回傳辨識文字。
+        按下退出鍵時拋出 VoiceModeExit，由呼叫端決定後續行為。
         """
         print("🎙 聆聽中...（按 ESC 可退出語音模式）")
 
-        # 每次開始聆聽前重置 VAD 內部狀態，避免上一輪殘留狀態污染這一輪判斷
-        self.vad_model.reset_states()
-        # 每次開始聆聽前清空退出旗標，避免上一輪殘留的按鍵事件影響這一輪
-        self._exit_event.clear()
+        self.vad_model.reset_states()  # 重置 VAD 內部狀態，避免上一輪殘留污染這一輪判斷
+        self._exit_event.clear()       # 清空上一輪殘留的退出旗標
 
         chunk_size = CHUNK_SIZE
         audio_buffer = []
@@ -92,7 +81,6 @@ class VoiceInput:
 
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32") as stream:
             while True:
-                # 每個 chunk（約32ms）檢查一次退出旗標，反應夠即時
                 if self._exit_event.is_set():
                     print("\n⏹ 偵測到退出鍵，結束語音模式聆聽。")
                     raise VoiceModeExit("使用者按下退出鍵，要求離開語音模式")
@@ -101,7 +89,6 @@ class VoiceInput:
                 chunk_mono = chunk[:, 0] if chunk.ndim > 1 else chunk.flatten()
                 tensor = torch.from_numpy(chunk_mono)
 
-                # 音量門檻過濾（過濾底噪）
                 rms = float(torch.sqrt(torch.mean(tensor ** 2)))
                 if DEBUG_PRINT_RMS:
                     print(f"[debug] rms={rms:.4f}")
@@ -113,7 +100,6 @@ class VoiceInput:
                             break
                     continue
 
-                # VAD 偵測
                 confidence = self.vad_model(tensor, SAMPLE_RATE).item()
 
                 if confidence > VAD_THRESHOLD:
@@ -129,7 +115,6 @@ class VoiceInput:
         if not audio_buffer:
             return ""
 
-        # 合併音訊並辨識
         audio_np = np.concatenate(audio_buffer)
         segments, _ = self.whisper.transcribe(
             audio_np,
@@ -141,8 +126,5 @@ class VoiceInput:
         return text
 
     def close(self):
-        """
-        程式結束或切換模式時呼叫，停止背景鍵盤監聽 thread。
-        建議在 agent.py 的關閉流程（或 /mode t 切換離開語音模式時）呼叫一次。
-        """
+        """停止背景鍵盤監聽 thread，於程式結束或切換模式時呼叫。"""
         self._key_listener.stop()

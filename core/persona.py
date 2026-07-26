@@ -1,4 +1,5 @@
 # core/persona.py
+# 載入固定人格 prompt，組裝送給 LLM 的完整 messages
 
 import os
 

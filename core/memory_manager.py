@@ -1,4 +1,5 @@
 # core/memory_manager.py
+# 記憶系統：Working Memory（近期對話）+ Compressed Memory（摘要）+ RAG（長期知識）
 
 import json
 import os
@@ -48,22 +49,15 @@ class MemoryManager:
             self._compress_oldest()
 
     def get_context(self, user_input: str = "") -> list[dict]:
-        """
-        組裝完整 context：
-        1. 壓縮記憶（如果有）
-        2. RAG 查詢結果（只注入相似度夠高的）
-        3. 當前對話
-        """
+        """組裝 context：Compressed Memory（若有）→ RAG 查詢結果（若有相關）→ 當前對話。"""
         context = []
 
-        # 壓縮記憶
         if self.compressed_memory:
             context.append({
                 "role": "system",
                 "content": f"[過去對話摘要]\n{self.compressed_memory}"
             })
 
-        # RAG 選擇性注入（相似度門檻在 RAGManager 內處理）
         if user_input:
             rag_results = self.rag.query(user_input)
             if rag_results:
@@ -83,12 +77,9 @@ class MemoryManager:
 
     def _compress(self, turns: list[dict]):
         """
-        把指定的對話輪次與既有摘要重新整合：
-        - 新摘要覆寫 compressed_memory（不疊加），長度受控（MAX_SUMMARY_SENTENCES）
-        - 舊摘要中「沒出現在新摘要裡」的內容，無論原因是被新對話取代、
-          還是純粹因句數上限排不進去，統一轉存 RAG（不區分原因，
-          因為後續查詢邏輯不需要這個區分，且強行區分容易讓 LLM
-          誤把「沒被新對話提到」的內容當成可以悄悄省略，而非保留或轉存）
+        將指定對話輪次與既有摘要整合覆寫（非疊加），長度受 MAX_SUMMARY_SENTENCES 限制。
+        舊摘要中沒出現在新摘要裡的內容（不論是被取代還是排不進句數上限），
+        一律轉存 RAG，不區分原因——避免 LLM 誤以為「沒被提到」等於可以直接省略。
         """
         dialogue_text = "\n".join(
             f"{'邪狼' if m['role'] == 'user' else '奧狐'}：{m['content']}"
@@ -137,7 +128,7 @@ class MemoryManager:
         return new_summary
 
     def _parse_compress_result(self, result: str) -> tuple[str, str]:
-        """解析 LLM 回傳的『摘要 / 淘汰』結果"""
+        """解析 LLM 回傳的『摘要 / 淘汰』結果。"""
         try:
             lines = result.strip().splitlines()
             summary_line_idx = next(
@@ -158,7 +149,7 @@ class MemoryManager:
             return summary, discarded
         except Exception as e:
             logger.warning(f"壓縮結果解析失敗：{e}，原始結果：{result}")
-            # 解析失敗時，保底直接用原始輸出當摘要，避免記憶遺失，且不寫入 RAG（避免存入格式錯亂內容）
+            # 保底：解析失敗時直接用原始輸出當摘要（避免記憶遺失），不寫入 RAG（避免存入格式錯亂內容）
             return result.strip(), "無"
 
     def _compress_oldest(self):

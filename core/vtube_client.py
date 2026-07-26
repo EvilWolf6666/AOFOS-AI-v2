@@ -1,5 +1,6 @@
 # core/vtube_client.py
 # VTube Studio 串接模組 — 控制嘴型、表情
+# 內部用 asyncio，對外提供同步介面（run_until_complete 包裝）
 
 from __future__ import annotations
 from typing import Optional
@@ -24,7 +25,6 @@ class VTubeClient:
     # ── 連線與認證 ────────────────────────────────
 
     def connect(self):
-        """連線並完成認證，同步介面"""
         self._loop.run_until_complete(self._connect())
 
     async def _connect(self):
@@ -71,7 +71,7 @@ class VTubeClient:
     # ── 嘴型控制 ──────────────────────────────────
 
     def set_mouth(self, value: float):
-        """控制嘴型開合，value 範圍 0.0（閉嘴）~ 1.0（全開）"""
+        """控制嘴型開合，value 範圍 0.0（閉嘴）～ 1.0（全開）。"""
         if self.ws is None:
             logger.debug("未連線，跳過嘴型控制。")
             return
@@ -97,7 +97,7 @@ class VTubeClient:
     # ── 表情控制 ──────────────────────────────────
 
     def play_expression(self, expression_name: str):
-        """觸發指定表情"""
+        """觸發指定表情。"""
         if self.ws is None:
             logger.debug("未連線，跳過表情控制。")
             return
