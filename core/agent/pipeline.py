@@ -10,6 +10,14 @@ Pipeline 只負責呼叫順序，不重新定義組裝邏輯。
 
 /remember、/list 已停用且不在 is_command() 攔截範圍內，
 使用者輸入這兩個字串會直接落入 handle_turn() 當一般對話處理。
+
+【2026-07-30 變更】輪次收尾與記憶壓縮拆出為 finalize_turn()：
+原本 handle_turn() 內的 memory.add_turn() 會在 Working Memory 超長時
+直接觸發一次完整的 LLM 壓縮呼叫，而 handle_turn() 是在 Agent 印出回應
+「之前」被呼叫的——等於每累積約 5 輪，使用者就要多等一次 LLM 呼叫才看得到
+回應。現在 handle_turn() 只負責追加記憶，壓縮由 Agent 在輸出之後呼叫
+finalize_turn() 執行。職責邊界不變：流程順序仍由 Pipeline 定義，
+Agent 只是決定「何時進入收尾階段」。
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ class Pipeline:
     def is_command(self, user_input: str) -> bool:
         return user_input.lower() == "quit" or user_input in (
             "/mode t", "/mode v", "/proactive on", "/proactive off",
+            "/test on", "/test off", "/status",
         )
 
     def handle_command(self, user_input: str, state, voice_input_factory: Callable) -> TurnResult:
@@ -68,6 +77,45 @@ class Pipeline:
             state.proactive_enabled = True
             return TurnResult(system_message="[主動對話觸發已恢復]")
 
+        if user_input in ("/test on", "/test off"):
+            on = user_input == "/test on"
+            # 記憶隔離與推理參數是兩件不同的事，但施測時必須同時成立，
+            # 故由 Pipeline 統一協調，不讓任一模組去驅動另一個模組。
+            self.memory.set_test_mode(on)
+            self.llm.set_test_mode(on)
+            if on:
+                return TurnResult(system_message=(
+                    "[測試模式已開啟]\n"
+                    "  · RAG 已停用（不查詢、不寫入）\n"
+                    "  · 推理參數切為貪婪解碼（temperature=0、top_k=1），輸出可重現\n"
+                    "  · 記憶改用獨立測試檔，正式記憶檔完全未被改動\n"
+                    "  · Working Memory 已清空（僅存在記憶體、從不寫檔）\n"
+                    "  ⚠ 本次開機以來尚未壓縮的對話已直接丟棄，不會進入長期記憶\n"
+                    "  · 本設定不寫入 config，重開程式後自動回到正常模式"
+                ))
+            return TurnResult(system_message=(
+                "[測試模式已關閉]\n"
+                "  · RAG 已恢復\n"
+                "  · 推理參數已還原為日常設定\n"
+                "  · 記憶已切回正式檔\n"
+                "  · Working Memory 已清空\n"
+                "  ⚠ 測試期間尚未壓縮的對話已直接丟棄"
+            ))
+
+        if user_input == "/status":
+            return TurnResult(system_message=(
+                "[目前狀態]\n"
+                f"  · 模式：{'文字' if state.mode == 't' else '語音'}\n"
+                f"  · 主動對話觸發：{'開啟' if state.proactive_enabled else '關閉'}\n"
+                f"  · 測試模式：{'開啟' if self.memory.test_mode else '關閉'}\n"
+                f"  · 推理參數：temperature={self.llm.temperature} "
+                f"top_p={self.llm.top_p} freq_pen={self.llm.frequency_penalty} "
+                f"extra_body={self.llm.extra_body}\n"
+                f"  · RAG：{'啟用' if self.memory.rag.enabled else '停用'}\n"
+                f"  · 記憶檔：{self.memory.memory_path}\n"
+                f"  · Working Memory：{len(self.memory.working_memory)} 則"
+            ))
+
         # 不會走到這裡（呼叫前已經過 is_command() 過濾），保底防呆
         return TurnResult(system_message=None)
 
@@ -75,7 +123,8 @@ class Pipeline:
 
     def handle_turn(self, user_input: str) -> TurnResult:
         """
-        取記憶 context → 組 Prompt → 呼叫 LLM → 寫回記憶。
+        取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。
+        記憶壓縮不在此執行，見 finalize_turn()。
         VTube 驅動屬於輸出端的可選副作用，不在此決策。
         """
         context = self.memory.get_context(user_input)
@@ -87,6 +136,30 @@ class Pipeline:
 
         return TurnResult(reply=reply)
 
+    # ── 輪次收尾 ──────────────────────────────────────────────────
+
+    def finalize_turn(self) -> None:
+        """
+        輪次收尾：視 Working Memory 長度決定是否壓縮記憶。
+
+        必須由 Agent 在回應「已經輸出之後」呼叫，這是本方法存在的唯一理由——
+        壓縮是一次完整的 LLM 呼叫，放在輸出前會直接落在使用者等待的路徑上。
+
+        壓縮仍為同步執行，尖峰只是被移到下一次輸入之前，並未消失。
+        壓縮失敗不得中斷主流程：記憶壓縮是輔助功能，不該讓一次失敗拖垮對話。
+        """
+        try:
+            # 壓縮實測需 20～30 秒，期間畫面完全沒有動靜，看起來像當機
+            # （實測時使用者因此連按 Enter，誤以為程式卡住）。
+            # 在背景執行緒方案落地之前，至少要讓使用者知道發生了什麼事。
+            if self.memory.needs_compress():
+                print("[整理記憶中，約需 20～30 秒，請稍候……]")
+            self.memory.maybe_compress()
+        except Exception as e:
+            # 這裡不用 logger 是因為 Pipeline 目前不持有 logger；
+            # 真正的錯誤細節已由 MemoryManager 內部記錄。
+            print(f"[記憶壓縮失敗，不影響本輪對話：{e}]")
+
     # ── 主動對話觸發 ──────────────────────────────────────────────
 
     def handle_proactive_trigger(self) -> TurnResult:
@@ -96,11 +169,15 @@ class Pipeline:
 
         該 system 訊息只存在於這次呼叫，不透過 add_turn() 寫入 Working Memory，
         避免情境說明過期後仍卡在對話歷史裡。
+
+        與 handle_turn() 相同，此處只追加記憶不壓縮，壓縮由 Agent 在輸出後
+        呼叫 finalize_turn() 執行。
         """
         context = self.memory.get_context("")
         context.append({
             "role": "system",
-            "content": "[目前情境]\n邪狼已經一段時間沒有回應，妳可以主動找話題延續對話。",
+            "content": "[目前情境]\n邪狼已經一段時間沒有回應，妳可以主動找話題延續對話，"
+            "如果妳剛才已經問過類似的話，這次換個不同的方向。",
         })
         messages = self.persona.build_messages(context, "")
         reply = self.llm.chat(messages)
