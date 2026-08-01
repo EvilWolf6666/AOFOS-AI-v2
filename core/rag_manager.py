@@ -8,7 +8,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K, TEST_CONFIG, TEST_MODE
-from core.diagnostics import RagStats   # 診斷腳手架，清理時連同下方呼叫點一併移除
+from core.short_time_test import RagStats   # 診斷腳手架，清理時連同下方呼叫點一併移除
 from core.logger import setup_logger, timed
 
 logger = setup_logger("RAGManager")

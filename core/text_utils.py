@@ -2,7 +2,7 @@
 
 import opencc
 
-from core.diagnostics import log_opencc_diff   # 診斷腳手架，清理時連同下方呼叫一併移除
+from core.short_time_test import log_opencc_diff   # 診斷腳手架，清理時連同下方呼叫一併移除
 
 _converter = opencc.OpenCC("s2t")  # 純簡體字→繁體字，不替換詞彙
 

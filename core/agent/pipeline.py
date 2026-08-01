@@ -8,8 +8,13 @@ Pipeline（流程控制層）
 
 Prompt 組裝的優先順序由 persona.build_messages() 決定，此處只負責呼叫順序。
 
-註：/remember、/list 已停用且不在 is_command() 攔截範圍內，輸入這兩個字串
-會落入 handle_turn() 當一般對話處理（預期行為，非 bug）。
+指令一律登記於 _commands（見 __init__），is_command() 與 handle_command() 共用
+同一份來源。新增指令只需加一個 handler 並登記一行——這是刻意的結構：先前兩處
+各有一份清單，漏改任一邊都會靜默失效（漏 A 則指令被當對話送給 LLM，看起來像
+正常回話；漏 B 則什麼都不印，看起來像當機）。
+
+註：/remember、/list 已停用且不在 _commands 內，輸入這兩個字串會落入
+handle_turn() 當一般對話處理（預期行為，非 bug）。
 """
 
 from __future__ import annotations
@@ -38,78 +43,103 @@ class Pipeline:
         self.persona = persona
         self.memory = memory
 
+        # 指令的唯一來源。key 一律小寫，比對前經 _key() 正規化。
+        self._commands = {
+            "quit":           self._cmd_quit,
+            "/mode t":        self._cmd_mode_text,
+            "/mode v":        self._cmd_mode_voice,
+            "/proactive on":  self._cmd_proactive_on,
+            "/proactive off": self._cmd_proactive_off,
+            "/test on":       self._cmd_test_on,
+            "/test off":      self._cmd_test_off,
+            "/status":        self._cmd_status,
+        }
+
     # ── 指令分流 ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _key(user_input: str) -> str:
+        return user_input.strip().lower()
+
     def is_command(self, user_input: str) -> bool:
-        return user_input.lower() == "quit" or user_input in (
-            "/mode t", "/mode v", "/proactive on", "/proactive off",
-            "/test on", "/test off", "/status",
-        )
+        return self._key(user_input) in self._commands
 
     def handle_command(self, user_input: str, state, voice_input_factory: Callable) -> TurnResult:
-        """處理系統指令，回傳結果讓 Agent 決定後續動作（此處不直接操作 VTube 等模組）。"""
-        if user_input.lower() == "quit":
-            self.memory.compress_on_exit()
-            state.stop()
-            return TurnResult(should_exit=True, system_message="掰掰。")
+        """
+        處理系統指令，回傳結果讓 Agent 決定後續動作（此處不直接操作 VTube 等模組）。
 
-        if user_input == "/mode t":
-            state.switch_to_text()
-            return TurnResult(system_message="[切換為文字模式]")
+        刻意不用 .get() 做保底：呼叫端必定先經 is_command() 過濾，走到這裡卻找不到
+        handler 代表分流被繞過，應以 KeyError 大聲失敗，而非靜默回傳空結果。
+        """
+        return self._commands[self._key(user_input)](state, voice_input_factory)
 
-        if user_input == "/mode v":
-            state.switch_to_voice(voice_input_factory)
-            return TurnResult(system_message="[切換為語音模式]")
+    # ── 指令 handler（簽名統一為 (state, voice_input_factory)）─────
 
-        if user_input == "/proactive off":
-            state.proactive_enabled = False
-            return TurnResult(system_message="[主動對話觸發已暫停]")
+    def _cmd_quit(self, state, _factory) -> TurnResult:
+        self.memory.compress_on_exit()
+        state.stop()
+        return TurnResult(should_exit=True, system_message="掰掰。")
 
-        if user_input == "/proactive on":
-            state.proactive_enabled = True
-            return TurnResult(system_message="[主動對話觸發已恢復]")
+    def _cmd_mode_text(self, state, _factory) -> TurnResult:
+        state.switch_to_text()
+        return TurnResult(system_message="[切換為文字模式]")
 
-        if user_input in ("/test on", "/test off"):
-            on = user_input == "/test on"
-            # 記憶隔離與推理參數是兩件不同的事，但施測時必須同時成立，
-            # 故由 Pipeline 統一協調，不讓任一模組去驅動另一個模組。
-            self.memory.set_test_mode(on)
-            self.llm.set_test_mode(on)
-            if on:
-                return TurnResult(system_message=(
-                    "[測試模式已開啟]\n"
-                    "  · RAG 已停用（不查詢、不寫入）\n"
-                    "  · 推理參數切為貪婪解碼（temperature=0、top_k=1），輸出可重現\n"
-                    "  · 記憶改用獨立測試檔，正式記憶檔完全未被改動\n"
-                    "  · Working Memory 已清空（僅存在記憶體、從不寫檔）\n"
-                    "  ⚠ 本次開機以來尚未壓縮的對話已直接丟棄，不會進入長期記憶\n"
-                    "  · 本設定不寫入 config，重開程式後自動回到正常模式"
-                ))
-            return TurnResult(system_message=(
-                "[測試模式已關閉]\n"
-                "  · RAG 已恢復\n"
-                "  · 推理參數已還原為日常設定\n"
-                "  · 記憶已切回正式檔\n"
-                "  · Working Memory 已清空\n"
-                "  ⚠ 測試期間尚未壓縮的對話已直接丟棄"
-            ))
+    def _cmd_mode_voice(self, state, voice_input_factory) -> TurnResult:
+        state.switch_to_voice(voice_input_factory)
+        return TurnResult(system_message="[切換為語音模式]")
 
-        if user_input == "/status":
-            return TurnResult(system_message=(
-                "[目前狀態]\n"
-                f"  · 模式：{'文字' if state.mode == 't' else '語音'}\n"
-                f"  · 主動對話觸發：{'開啟' if state.proactive_enabled else '關閉'}\n"
-                f"  · 測試模式：{'開啟' if self.memory.test_mode else '關閉'}\n"
-                f"  · 推理參數：temperature={self.llm.temperature} "
-                f"top_p={self.llm.top_p} freq_pen={self.llm.frequency_penalty} "
-                f"extra_body={self.llm.extra_body}\n"
-                f"  · RAG：{'啟用' if self.memory.rag.enabled else '停用'}\n"
-                f"  · 記憶檔：{self.memory.memory_path}\n"
-                f"  · Working Memory：{len(self.memory.working_memory)} 則"
-            ))
+    def _cmd_proactive_on(self, state, _factory) -> TurnResult:
+        state.proactive_enabled = True
+        return TurnResult(system_message="[主動對話觸發已恢復]")
 
-        # 呼叫前已經過 is_command() 過濾，走到這裡代表兩處清單不同步，保底防呆
-        return TurnResult(system_message=None)
+    def _cmd_proactive_off(self, state, _factory) -> TurnResult:
+        state.proactive_enabled = False
+        return TurnResult(system_message="[主動對話觸發已暫停]")
+
+    def _cmd_test_on(self, _state, _factory) -> TurnResult:
+        self._set_test_mode(True)
+        return TurnResult(system_message=(
+            "[測試模式已開啟]\n"
+            "  · RAG 已停用（不查詢、不寫入）\n"
+            "  · 推理參數切為貪婪解碼（temperature=0、top_k=1），輸出可重現\n"
+            "  · 記憶改用獨立測試檔，正式記憶檔完全未被改動\n"
+            "  · Working Memory 已清空（僅存在記憶體、從不寫檔）\n"
+            "  ⚠ 本次開機以來尚未壓縮的對話已直接丟棄，不會進入長期記憶\n"
+            "  · 本設定不寫入 config，重開程式後自動回到正常模式"
+        ))
+
+    def _cmd_test_off(self, _state, _factory) -> TurnResult:
+        self._set_test_mode(False)
+        return TurnResult(system_message=(
+            "[測試模式已關閉]\n"
+            "  · RAG 已恢復\n"
+            "  · 推理參數已還原為日常設定\n"
+            "  · 記憶已切回正式檔\n"
+            "  · Working Memory 已清空\n"
+            "  ⚠ 測試期間尚未壓縮的對話已直接丟棄"
+        ))
+
+    def _set_test_mode(self, on: bool) -> None:
+        """
+        記憶隔離與推理參數是兩件不同的事，但施測時必須同時成立，
+        故由 Pipeline 統一協調，不讓任一模組去驅動另一個模組。
+        """
+        self.memory.set_test_mode(on)
+        self.llm.set_test_mode(on)
+
+    def _cmd_status(self, state, _factory) -> TurnResult:
+        return TurnResult(system_message=(
+            "[目前狀態]\n"
+            f"  · 模式：{'文字' if state.mode == 't' else '語音'}\n"
+            f"  · 主動對話觸發：{'開啟' if state.proactive_enabled else '關閉'}\n"
+            f"  · 測試模式：{'開啟' if self.memory.test_mode else '關閉'}\n"
+            f"  · 推理參數：temperature={self.llm.temperature} "
+            f"top_p={self.llm.top_p} freq_pen={self.llm.frequency_penalty} "
+            f"extra_body={self.llm.extra_body}\n"
+            f"  · RAG：{'啟用' if self.memory.rag.enabled else '停用'}\n"
+            f"  · 記憶檔：{self.memory.memory_path}\n"
+            f"  · Working Memory：{len(self.memory.working_memory)} 則"
+        ))
 
     # ── 正常對話輪次 ──────────────────────────────────────────────
 
