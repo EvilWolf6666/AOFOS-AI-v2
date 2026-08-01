@@ -1,6 +1,5 @@
 # core/logger.py
-# 統一 Logging 系統 — 所有模組從這裡取得 logger
-# 同時提供延遲量測工具 timed()
+# 統一 Logging 系統 — 所有模組從這裡取得 logger；並提供延遲量測工具 timed()
 
 import json
 import logging
@@ -21,10 +20,7 @@ _timing_logger = None
 
 
 def setup_logger(name: str) -> logging.Logger:
-    """
-    建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 logs/ 資料夾（純文字）。
-    各模組呼叫一次、傳入模組名稱即可。
-    """
+    """建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 logs/（純文字，每日一份）。"""
     os.makedirs(LOG_DIR, exist_ok=True)
 
     logger = logging.getLogger(name)
@@ -34,7 +30,6 @@ def setup_logger(name: str) -> logging.Logger:
     logger.setLevel(LOG_LEVEL)
     logger.propagate = False  # 避免日後有人加了 root handler 造成重複輸出
 
-    # 終端機 handler（彩色）
     console_handler = colorlog.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(colorlog.ColoredFormatter(
@@ -48,7 +43,6 @@ def setup_logger(name: str) -> logging.Logger:
         }
     ))
 
-    # 檔案 handler（純文字，每日一份）
     log_filename = datetime.now().strftime("%Y-%m-%d") + ".log"
     file_handler = logging.FileHandler(
         os.path.join(LOG_DIR, log_filename),
@@ -97,9 +91,9 @@ def timed(stage: str, **extra):
         with timed("LLM呼叫", model=self.model):
             response = client.chat.completions.create(...)
 
-    stage 名稱請保持穩定，否則日後無法跨次比較。
-    extra 會一併寫進 jsonl，用來標註模型名稱等脈絡。
-    即使區塊內拋出例外也會記錄（並標記 ok=False），避免失敗案例從統計中消失。
+    stage 名稱請保持穩定，否則日後無法跨次比較；extra 會一併寫進 jsonl，
+    用來標註模型名稱等脈絡。區塊內拋出例外時同樣會記錄（標記 ok=False），
+    避免失敗案例從統計中消失。
     """
     if not TIMING_CONFIG.get("enabled", False):
         yield

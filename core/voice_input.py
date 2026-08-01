@@ -9,18 +9,18 @@ import torch
 from faster_whisper import WhisperModel
 from pynput import keyboard
 
+from config import VOICE_CONFIG
 from core.logger import setup_logger
 
 logger = setup_logger("VoiceInput")
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
-VAD_THRESHOLD = 0.5       # 語音判定信心值門檻
-SILENCE_DURATION = 1.5    # 靜音多久（秒）判定為說完
-RMS_GATE = 0.02           # 音量門檻，過濾底噪；麥克風增益不同時需一併校準
-CHUNK_SIZE = 512          # Silero VAD 要求固定 512 samples
-
-DEBUG_PRINT_RMS = False   # 校準麥克風時開啟，印出即時 rms 數值
+SAMPLE_RATE = VOICE_CONFIG["sample_rate"]
+CHANNELS = VOICE_CONFIG["channels"]
+VAD_THRESHOLD = VOICE_CONFIG["vad_threshold"]
+SILENCE_DURATION = VOICE_CONFIG["silence_duration"]
+RMS_GATE = VOICE_CONFIG["rms_gate"]
+CHUNK_SIZE = VOICE_CONFIG["chunk_size"]
+DEBUG_PRINT_RMS = VOICE_CONFIG["debug_print_rms"]
 
 
 class VoiceModeExit(Exception):
@@ -70,7 +70,7 @@ class VoiceInput:
         """
         print("🎙 聆聽中...（按 ESC 可退出語音模式）")
 
-        self.vad_model.reset_states()  # 重置 VAD 內部狀態，避免上一輪殘留污染這一輪判斷
+        self.vad_model.reset_states()  # ⚠️ 必須重置，否則上一輪殘留狀態會污染本輪判斷
         self._exit_event.clear()       # 清空上一輪殘留的退出旗標
 
         chunk_size = CHUNK_SIZE
@@ -93,6 +93,7 @@ class VoiceInput:
                 if DEBUG_PRINT_RMS:
                     print(f"[debug] rms={rms:.4f}")
 
+                # 先用音量門檻過濾底噪，未過門檻不送進 VAD（省一次模型推論）
                 if rms < RMS_GATE:
                     if is_speaking:
                         silence_chunks += 1
@@ -126,5 +127,5 @@ class VoiceInput:
         return text
 
     def close(self):
-        """停止背景鍵盤監聽 thread，於程式結束或切換模式時呼叫。"""
+        """停止背景鍵盤監聽 thread，於程式結束時呼叫（切換模式時不呼叫，見 Agent._get_input）。"""
         self._key_listener.stop()

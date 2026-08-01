@@ -12,7 +12,7 @@ from core.text_utils import fix_traditional
 
 logger = setup_logger("LLMClient")
 
-# LM Studio 專屬、非 OpenAI 標準的參數，需透過 extra_body 送出。
+# LM Studio 專屬、非 OpenAI 標準的參數，需透過 extra_body 送出；
 # 直接當具名參數傳會被 SDK 丟掉或報錯。
 _EXTRA_BODY_KEYS = ("top_k", "repeat_penalty", "min_p")
 
@@ -54,7 +54,7 @@ class LLMClient:
         if self.seed is None:
             logger.warning("seed 未固定，同一顆模型的多次輸出會有隨機差異，不適合做對照組比較")
 
-        # 載入層參數無法由本程式設定，只能記錄。目的是讓每一份 log 都能還原當時環境。
+        # 載入層參數無法由本程式設定，只能記錄，讓每份 log 都能還原當時環境
         logger.info(f"LM Studio 載入層參數（需人工於 GUI 對齊）：{LMSTUDIO_LOAD_PARAMS}")
 
         self._log_available_models()
@@ -77,19 +77,14 @@ class LLMClient:
 
     def _verify_loaded_model(self) -> None:
         """
-        查詢「實際已載入」的模型與其 context 長度，在提問之前就給出結論。
+        查驗「實際已載入」的模型與其 context 長度，在提問之前就給出結論。
 
-        存在理由是兩個實際踩過的坑：
-
-        1. JIT（即時模型載入）若因記憶體不足等原因載入失敗，LM Studio 不會報錯，
-           會直接沿用當前已載入的模型回應。你會拿到看起來完全正常的答案，
-           但那是錯的模型——整批實驗數據靜默作廢。
-           2026-07-31 實測：JIT 嘗試在 aofos_v3 仍常駐（保留模型在記憶體中為開啟）
-           時載入第二顆 4.92GB 模型，兩顆合計約 10GB 超過可用記憶體，系統卡死重開；
-           重試後實際回應的仍是 aofos_v3。因此已關閉 JIT，改為人工 Eject 後載入。
-
-        2. JIT 自動載入時使用「該模型自己記住的載入設定」，而非上次在 GUI 手動設的
-           那一組，context 長度與 GPU 卸載層數可能被靜默改掉。
+        存在理由是兩個實際踩過的坑（詳見《決策脈絡歸檔》十六章）：
+          1. JIT 載入失敗時 LM Studio 不報錯，會沿用當前已載入的模型回應——
+             回答看起來完全正常，但那是錯的模型，整批實驗數據靜默作廢。
+             （JIT 現已關閉，改為人工 Eject 後載入，此查驗仍作為第二道防線。）
+          2. JIT 自動載入時使用模型自己記住的載入設定，而非上次 GUI 手動設的那組，
+             context 長度與 GPU 卸載層數可能被靜默改掉。
 
         任何失敗都只記 warning，不中斷程式（API 路徑隨 LM Studio 版本可能變動）。
         GPU 卸載層數此 API 不提供，仍需人工確認。
@@ -119,7 +114,6 @@ class LLMClient:
         if self.model not in ids:
             logger.error(
                 f"⚠ config 指定 model=\"{self.model}\"，但 LM Studio 實際載入的是 {ids}。"
-                f"若 JIT 開啟，LM Studio 可能直接改用已載入的模型且不報錯——"
                 f"此時取得的回應不屬於你指定的模型，不可用於任何比較。"
                 f"請 Eject 後手動載入正確模型再重跑。"
             )
@@ -144,13 +138,10 @@ class LLMClient:
 
     def set_test_mode(self, on: bool) -> None:
         """
-        切換評測用推理參數（貪婪解碼）。由 Pipeline 的 /test 指令呼叫。
+        切換為評測用推理參數（貪婪解碼），由 Pipeline 的 /test 指令呼叫。
+        參數內容與選用理由見 config.TEST_CONFIG["llm_overrides"]。
 
-        存在理由：對照組比較需要可重現的輸出。固定 seed 的路走不通（API 與 GUI
-        兩邊都試過皆無效），改用 temperature=0 + top_k=1 直接消除取樣隨機性。
-        詳見 config.TEST_CONFIG["llm_overrides"] 的說明。
-
-        本切換不寫入 config，重開程式即回到日常參數。
+        不寫入 config，重開程式即回到日常參數。
         """
         if on == self.test_mode:
             return
@@ -192,15 +183,12 @@ class LLMClient:
 
     def chat(self, messages: list, purpose: str = "dialogue") -> str:
         """
-        purpose 只影響計時紀錄的標籤與輸出長度上限，不影響請求的其他內容。
+        purpose 只影響計時標籤與輸出長度上限，不影響請求的其他內容。
 
-        存在理由：_compress() 內部也會呼叫本方法，若兩者在計時紀錄中同名，
-        就無法分辨「這次 LLM 呼叫是回應使用者，還是在壓縮記憶」——
-        而這正是判斷 _compress 是否落在延遲路徑上所需的資訊。
-        新增呼叫點時記得傳入對應的 purpose，否則會被歸類成 dialogue。
+        存在理由：_compress() 內部也呼叫本方法，兩者在計時紀錄中同名就無法分辨
+        「這次呼叫是回應使用者，還是在壓縮記憶」——而這正是判斷 _compress 是否
+        落在延遲路徑上所需的資訊。新增呼叫點時記得傳入對應 purpose。
         """
-        # 不同用途的輸出長度需求差異很大：對話 300 token 綽綽有餘，
-        # 但記憶壓縮要一次輸出摘要＋淘汰清單，截斷會造成靜默資料遺失。
         max_tokens = self.max_tokens_by_purpose.get(purpose, self.max_tokens)
 
         try:
@@ -217,14 +205,13 @@ class LLMClient:
                     extra_body=self.extra_body,
                 )
 
-            # 回應會帶回實際產生輸出的 model id，是唯一可信的「到底跑了哪顆」證據。
+            # 回應帶回的 model id 是唯一可信的「到底跑了哪顆」證據
             actual = getattr(response, "model", None)
             if not self._logged_actual_model:
                 logger.info(f"實際回應模型：{actual}")
                 self._logged_actual_model = True
 
-            # 不一致代表 LM Studio 用了別顆模型。這會讓整批實驗數據失效，
-            # 故每次都警告，不只警告一次。
+            # 不一致代表 LM Studio 用了別顆模型，整批實驗數據失效，故每次都警告
             if actual and actual != self.model:
                 logger.error(
                     f"⚠ 實際回應模型（{actual}）與 config 指定（{self.model}）不一致，"
@@ -233,8 +220,8 @@ class LLMClient:
 
             usage = getattr(response, "usage", None)
             if usage is not None:
-                # completion_tokens 貼齊上限時，輸出極可能是被截斷而非自然結束。
-                # 對 compress 而言這代表「淘汰：」那段可能整段消失。
+                # completion_tokens 貼齊上限時，輸出極可能是被截斷而非自然結束；
+                # 對 compress 而言這代表「淘汰：」那段可能整段消失
                 if usage.completion_tokens >= max_tokens:
                     logger.warning(
                         f"輸出可能被截斷（purpose={purpose}，"
@@ -255,7 +242,7 @@ class LLMClient:
             return reply
 
         except Exception as e:
-            # 回傳 "" 的行為維持不變，但這裡必須夠醒目：
-            # 施測時一個失敗的呼叫看起來會跟「模型答得很差」一模一樣。
+            # 回傳 "" 但必須夠醒目：施測時一個失敗的呼叫看起來會跟
+            # 「模型答得很差」一模一樣
             logger.error(f"LLM 呼叫失敗（purpose={purpose}，本輪回傳空字串，勿當作模型表現）：{e}")
             return ""

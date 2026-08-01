@@ -5,7 +5,13 @@ import json
 import os
 from datetime import datetime
 
-from config import TEST_CONFIG, TEST_MODE
+from config import (
+    COMPRESS_BATCH_SIZE,
+    MAX_SUMMARY_SENTENCES,
+    MAX_WORKING_MEMORY,
+    TEST_CONFIG,
+    TEST_MODE,
+)
 from core.llm_client import LLMClient
 from core.logger import setup_logger, timed
 from core.rag_manager import RAGManager
@@ -15,10 +21,6 @@ logger = setup_logger("MemoryManager")
 _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 NORMAL_MEMORY_PATH = os.path.join(_PROJECT_ROOT, "data", "memory.json")
 TEST_MEMORY_PATH = os.path.join(_PROJECT_ROOT, TEST_CONFIG["memory_path"])
-
-MAX_WORKING_MEMORY = 10
-MAX_SUMMARY_SENTENCES = 8   # Compressed Memory 上限句數，避免無限累積
-COMPRESS_BATCH_SIZE = 12    # 觸發壓縮時一次取出的訊息則數（user/assistant 各算一則）
 
 
 class MemoryManager:
@@ -39,14 +41,15 @@ class MemoryManager:
 
     def set_test_mode(self, on: bool) -> None:
         """
-        執行期切換測試模式。
-
-        會做三件事：把目前記憶存回「現在這個」檔案 → 切換路徑與 RAG 開關 →
+        執行期切換測試模式：存回目前記憶 → 切換路徑與 RAG 開關 →
         清空 Working Memory 並從新路徑重新載入。
 
-        Working Memory 必須清空：切換的目的就是隔離，殘留的對話會直接
-        污染下一次施測的 context。這一點對呼叫端是可見的副作用，
-        指令回應中會明講，避免使用者以為只是換個檔案。
+        Working Memory 必須清空（切換的目的就是隔離，殘留對話會污染下一次施測的
+        context），這是對呼叫端可見的副作用，指令回應中會明講。
+
+        進入測試模式時一併清掉上一次的測試記憶檔：施測協定為「每題重開程式 +
+        /test on」，測試記憶若跨題殘留，第 N 題會被前 N-1 題壓縮出的摘要污染。
+        自動清空以避免依賴人工每題手動刪檔（12 題 × 2 組共 24 次，漏一次整批作廢）。
 
         本切換刻意不寫回 config：不持久化才不會有「測完忘記關」的風險。
         """
@@ -59,11 +62,6 @@ class MemoryManager:
         self.memory_path = TEST_MEMORY_PATH if on else NORMAL_MEMORY_PATH
         self.rag.set_enabled(not (on and TEST_CONFIG.get("disable_rag", True)))
 
-        # 進入測試模式時清掉上一次的測試記憶。
-        # 施測協定是「每題重開程式 + /test on」，若測試記憶檔跨題殘留，
-        # 第 2 題會載入第 1 題壓縮出的摘要、第 3 題載入前兩題的……每一題都被
-        # 前面所有題污染。改成自動清空，不依賴人工每題手動刪檔（12 題 × 2 組
-        # 要刪 24 次，漏一次整批作廢）。
         if on and os.path.exists(TEST_MEMORY_PATH):
             try:
                 os.remove(TEST_MEMORY_PATH)
@@ -100,11 +98,10 @@ class MemoryManager:
 
     def _backup_memory(self, reason: str) -> str | None:
         """
-        在即將以不可信內容覆寫 compressed_memory 前，先把現有內容另存一份。
+        在即將以不可信內容覆寫 compressed_memory 前，先另存一份現有內容。
 
         存在理由：_parse_compress_result() 解析失敗時會直接用 LLM 原始輸出當摘要，
-        等於用一段格式不明的文字覆蓋掉原本正常的長期記憶，且不可逆。
-        保留備份不改變既有行為，只是讓這件事變成可回復的。
+        等於用一段格式不明的文字覆蓋掉正常的長期記憶，且原本不可逆。
         """
         if not self.compressed_memory:
             return None
@@ -126,14 +123,7 @@ class MemoryManager:
     # ── 對話管理 ─────────────────────────────────
 
     def add_turn(self, user_input: str, assistant_reply: str):
-        """
-        只把這一輪追加進 Working Memory，不觸發壓縮。
-
-        【2026-07-30 變更】原本壓縮判斷寫在這裡，而 add_turn() 是在
-        Pipeline.handle_turn() 內部、回應印給使用者「之前」被呼叫的，
-        因此每累積約 5 輪就會有一次完整的 LLM 呼叫卡在顯示路徑上。
-        壓縮改由 maybe_compress() 負責，時機交給呼叫端決定。
-        """
+        """只追加進 Working Memory，不觸發壓縮（壓縮時機交給呼叫端，見 maybe_compress）。"""
         self.working_memory.append({"role": "user", "content": user_input})
         self.working_memory.append({"role": "assistant", "content": assistant_reply})
 
@@ -143,13 +133,12 @@ class MemoryManager:
 
     def maybe_compress(self) -> bool:
         """
-        視 Working Memory 長度決定是否壓縮。回傳是否真的執行了壓縮。
+        視 Working Memory 長度決定是否壓縮，回傳是否真的執行了壓縮。
 
-        呼叫時機應在回應已經輸出之後，避免壓縮的耗時落在使用者等待的路徑上。
-        目前仍是同步執行——尖峰只是被移到「下一次輸入之前」，沒有消失。
-        若實測後認為仍不可接受，再評估改為背景執行；但那會引入併發寫入
-        compressed_memory 的風險（本欄位是整份覆寫而非追加，競態的後果是
-        記憶被寫壞或遺失，且無徵兆），屆時需要一併處理。
+        ⚠️ 應在回應已經輸出之後呼叫，避免壓縮耗時落在使用者等待的路徑上。
+        目前仍是同步執行，尖峰只是被移到「下一次輸入之前」，並未消失。
+        若改為背景執行，需一併處理併發寫入 compressed_memory 的風險
+        （本欄位是整份覆寫而非追加，競態的後果是記憶被寫壞且無徵兆）。
         """
         if self.needs_compress():
             self._compress_oldest()
@@ -188,27 +177,18 @@ class MemoryManager:
     def _compress(self, turns: list[dict]):
         """
         將指定對話輪次與既有摘要整合覆寫（非疊加），長度受 MAX_SUMMARY_SENTENCES 限制。
-        舊摘要中沒出現在新摘要裡的內容（不論是被取代還是排不進句數上限），
-        一律轉存 RAG，不區分原因——避免 LLM 誤以為「沒被提到」等於可以直接省略。
 
-        【2026-07-25 追加規則二】
-        實測發現：主動對話觸發產生的輪次（U 為空字串、A 內容通常很短）
-        送進這裡壓縮時，壓縮 LLM 傾向直接把 A 的內容整句複製進新摘要，
-        而不是改寫成概括描述。這造成一句閒聊話被逐字寫進 compressed_memory，
-        下次載入時又原封不動出現在 [過去對話摘要] 裡，變成一個強力錨點，
-        讓後續主動觸發的輸出持續複述同一句話，形成自我強化的迴圈。
+        舊摘要中沒出現在新摘要裡的內容一律轉存 RAG，不區分原因（被取代或排不進
+        句數上限）——區分只增加 LLM 誤判風險，兩者最終都存進同一個地方。
 
-        根本問題不是「U 為空」這個情境本身，而是 _compress() 的 prompt
-        從未明確禁止逐字複製——不論輪次來源是主動觸發還是一般對話，只要
-        內容很簡短，壓縮 LLM 都可能傾向照抄而非改寫。故沒有針對「U 是否
-        為空」做特殊分流處理，而是加一條通用規則，同時covers兩種情境。
-        若後續實測發現一般對話（U 有內容）完全沒有這個傾向、只有主動觸發
-        情境會如此，屆時再考慮針對主動觸發輪次做更精準的處理（例如只記
-        次數不記全文），現階段先驗證這條通用規則是否已足夠。
+        prompt 的三條規則各自對應一個實測踩過的失敗模式，改動前請先看
+        《決策脈絡歸檔》五之2：
+          規則一 未提及內容預設保留 → 防資訊無聲消失
+          規則二 禁止逐字複製對話原文 → 防記憶變成自我強化的複述錨點
+          規則三 禁止推測填充 → 防取捨順序被讀成必填欄位模板
 
-        【計時】本方法整體與其內部的 LLM 呼叫分開記錄。
-        內部呼叫以 purpose="compress" 標記，才能與回應使用者的對話呼叫區分——
-        判斷本方法是否落在延遲路徑上需要這項資訊。
+        內部 LLM 呼叫以 purpose="compress" 標記，才能與回應使用者的對話呼叫
+        在計時紀錄中區分開來。
         """
         with timed("記憶壓縮(整體)"):
             dialogue_text = "\n".join(
@@ -263,10 +243,8 @@ class MemoryManager:
             self.compressed_memory = new_summary
             self.save_memory()
 
-            # 明確記錄淘汰結果。
-            # 「RAG 沒有新增資料」有兩種完全不同的原因：本來就沒東西被淘汰，
-            # 或是有東西被淘汰但寫入失敗。沒有這行 log 就無法區分，
-            # 只能靠翻 rag_stats.json 反推，而那份檔案本身也可能因為同樣的原因不存在。
+            # 明確記錄淘汰結果：「RAG 沒有新增資料」有兩種完全不同的原因
+            # （本來就沒東西被淘汰 / 有東西被淘汰但寫入失敗），沒有這行 log 無法區分
             if discarded and discarded != "無":
                 logger.info(f"本次壓縮淘汰內容（將轉存 RAG）：{discarded[:80]}")
                 try:
@@ -300,9 +278,8 @@ class MemoryManager:
 
             return summary, discarded
         except Exception as e:
-            # 保底：解析失敗時直接用原始輸出當摘要（避免記憶遺失），不寫入 RAG（避免存入格式錯亂內容）。
-            # 此行為維持不變，但覆寫前先備份——原本這一步是不可逆的，
-            # 一次解析失敗就會用一段格式不明的文字永久取代正常的長期記憶。
+            # 保底：解析失敗時用原始輸出當摘要（避免記憶遺失），不寫入 RAG
+            # （避免存入格式錯亂內容）。覆寫前先備份，讓這一步變成可回復的。
             backup_path = self._backup_memory("parse_fail")
             logger.error(
                 f"壓縮結果解析失敗：{e}。將以原始輸出覆寫記憶"
@@ -322,8 +299,7 @@ class MemoryManager:
             return
 
         # 測試模式下不壓縮：評測不需要摘要，而壓縮是一次完整的 LLM 呼叫
-        # （實測 17～25 秒）。12 題 × 2 組等於白等 8 分鐘，且壓縮結果會寫進
-        # 測試記憶檔，成為下一題的污染源。兩個理由都指向同一個結論：跳過。
+        # （實測 17～25 秒）；且壓縮結果會寫進測試記憶檔，成為下一題的污染源。
         if self.test_mode:
             logger.info("測試模式：跳過離開時的記憶壓縮。")
             return

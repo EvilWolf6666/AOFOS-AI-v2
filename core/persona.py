@@ -15,6 +15,7 @@ class Persona:
             return f.read().strip()
 
     def build_messages(self, conversation_history: list[dict], user_input: str) -> list[dict]:
+        """順序固定：人格 system → 記憶 context → 本輪輸入。"""
         messages = [{"role": "system", "content": self.system_prompt}]
         messages.extend(conversation_history)
         messages.append({"role": "user", "content": user_input})
