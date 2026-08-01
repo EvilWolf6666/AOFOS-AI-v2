@@ -1,23 +1,15 @@
+# core/agent/pipeline.py
 """
 Pipeline（流程控制層）
 
-決定一筆輸入該怎麼被處理：系統指令（quit / mode 切換 / 主動對話開關）
-還是正常對話輪次；正常對話輪次的處理順序固定為：
-取得記憶 context → 組裝 Prompt → 呼叫 LLM → 寫回記憶。
+決定一筆輸入該怎麼被處理：系統指令，還是正常對話輪次。
+正常輪次的處理順序固定為：取記憶 context → 組裝 Prompt → 呼叫 LLM → 寫回記憶，
+輪次收尾（記憶壓縮）另由 finalize_turn() 負責，由 Agent 在輸出之後呼叫。
 
-Prompt 組裝的優先順序由 persona.build_messages() 內部決定，
-Pipeline 只負責呼叫順序，不重新定義組裝邏輯。
+Prompt 組裝的優先順序由 persona.build_messages() 決定，此處只負責呼叫順序。
 
-/remember、/list 已停用且不在 is_command() 攔截範圍內，
-使用者輸入這兩個字串會直接落入 handle_turn() 當一般對話處理。
-
-【2026-07-30 變更】輪次收尾與記憶壓縮拆出為 finalize_turn()：
-原本 handle_turn() 內的 memory.add_turn() 會在 Working Memory 超長時
-直接觸發一次完整的 LLM 壓縮呼叫，而 handle_turn() 是在 Agent 印出回應
-「之前」被呼叫的——等於每累積約 5 輪，使用者就要多等一次 LLM 呼叫才看得到
-回應。現在 handle_turn() 只負責追加記憶，壓縮由 Agent 在輸出之後呼叫
-finalize_turn() 執行。職責邊界不變：流程順序仍由 Pipeline 定義，
-Agent 只是決定「何時進入收尾階段」。
+註：/remember、/list 已停用且不在 is_command() 攔截範圍內，輸入這兩個字串
+會落入 handle_turn() 當一般對話處理（預期行為，非 bug）。
 """
 
 from __future__ import annotations
@@ -39,7 +31,7 @@ class TurnResult:
 
 
 class Pipeline:
-    """不持有模組的建立/連線責任（那是 Agent 的職責），只負責呼叫順序與分流邏輯。"""
+    """不負責模組的建立與連線（那是 Agent 的職責），只負責呼叫順序與分流邏輯。"""
 
     def __init__(self, llm, persona, memory) -> None:
         self.llm = llm
@@ -55,7 +47,7 @@ class Pipeline:
         )
 
     def handle_command(self, user_input: str, state, voice_input_factory: Callable) -> TurnResult:
-        """處理系統指令，回傳結果讓 Agent 決定後續動作（Pipeline 不直接操作 VTube 等模組）。"""
+        """處理系統指令，回傳結果讓 Agent 決定後續動作（此處不直接操作 VTube 等模組）。"""
         if user_input.lower() == "quit":
             self.memory.compress_on_exit()
             state.stop()
@@ -116,17 +108,13 @@ class Pipeline:
                 f"  · Working Memory：{len(self.memory.working_memory)} 則"
             ))
 
-        # 不會走到這裡（呼叫前已經過 is_command() 過濾），保底防呆
+        # 呼叫前已經過 is_command() 過濾，走到這裡代表兩處清單不同步，保底防呆
         return TurnResult(system_message=None)
 
     # ── 正常對話輪次 ──────────────────────────────────────────────
 
     def handle_turn(self, user_input: str) -> TurnResult:
-        """
-        取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。
-        記憶壓縮不在此執行，見 finalize_turn()。
-        VTube 驅動屬於輸出端的可選副作用，不在此決策。
-        """
+        """取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。壓縮見 finalize_turn()。"""
         context = self.memory.get_context(user_input)
         messages = self.persona.build_messages(context, user_input)
         reply = self.llm.chat(messages)
@@ -140,24 +128,21 @@ class Pipeline:
 
     def finalize_turn(self) -> None:
         """
-        輪次收尾：視 Working Memory 長度決定是否壓縮記憶。
+        視 Working Memory 長度決定是否壓縮記憶。
 
-        必須由 Agent 在回應「已經輸出之後」呼叫，這是本方法存在的唯一理由——
-        壓縮是一次完整的 LLM 呼叫，放在輸出前會直接落在使用者等待的路徑上。
+        ⚠️ 必須由 Agent 在回應「已經輸出之後」呼叫，這是本方法存在的唯一理由——
+        壓縮是一次完整的 LLM 呼叫（實測 20～30 秒），放在輸出前會直接落在
+        使用者等待的路徑上。目前仍為同步執行，尖峰只是被移到下一次輸入之前。
 
-        壓縮仍為同步執行，尖峰只是被移到下一次輸入之前，並未消失。
-        壓縮失敗不得中斷主流程：記憶壓縮是輔助功能，不該讓一次失敗拖垮對話。
+        壓縮失敗不得中斷主流程：它是輔助功能，不該讓一次失敗拖垮對話。
         """
         try:
-            # 壓縮實測需 20～30 秒，期間畫面完全沒有動靜，看起來像當機
-            # （實測時使用者因此連按 Enter，誤以為程式卡住）。
-            # 在背景執行緒方案落地之前，至少要讓使用者知道發生了什麼事。
+            # 壓縮期間畫面完全沒有動靜，看起來像當機（實測時使用者因此連按 Enter）
             if self.memory.needs_compress():
                 print("[整理記憶中，約需 20～30 秒，請稍候……]")
             self.memory.maybe_compress()
         except Exception as e:
-            # 這裡不用 logger 是因為 Pipeline 目前不持有 logger；
-            # 真正的錯誤細節已由 MemoryManager 內部記錄。
+            # 此處不用 logger：Pipeline 不持有 logger，錯誤細節已由 MemoryManager 記錄
             print(f"[記憶壓縮失敗，不影響本輪對話：{e}]")
 
     # ── 主動對話觸發 ──────────────────────────────────────────────
@@ -165,13 +150,10 @@ class Pipeline:
     def handle_proactive_trigger(self) -> TurnResult:
         """
         無使用者輸入時觸發：U 內容固定為空字串（符合 LoRA 訓練資料格式規則，
-        不偽裝成使用者發言），另外附加一則臨時 system 訊息說明目前是主動觸發情境。
+        不偽裝成使用者發言），另附一則臨時 system 訊息說明目前是主動觸發情境。
 
-        該 system 訊息只存在於這次呼叫，不透過 add_turn() 寫入 Working Memory，
-        避免情境說明過期後仍卡在對話歷史裡。
-
-        與 handle_turn() 相同，此處只追加記憶不壓縮，壓縮由 Agent 在輸出後
-        呼叫 finalize_turn() 執行。
+        該 system 訊息只存在於這次呼叫，不寫入 Working Memory，避免情境說明
+        過期後仍卡在對話歷史裡。與 handle_turn() 相同，此處只追加記憶不壓縮。
         """
         context = self.memory.get_context("")
         context.append({

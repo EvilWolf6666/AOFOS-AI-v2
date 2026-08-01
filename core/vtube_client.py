@@ -1,5 +1,5 @@
 # core/vtube_client.py
-# VTube Studio 串接模組 — 控制嘴型、表情
+# VTube Studio 串接 — 控制嘴型、表情
 # 內部用 asyncio，對外提供同步介面（run_until_complete 包裝）
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ class VTubeClient:
         logger.info("連線成功。")
 
     async def _authenticate(self):
-        # 第一步：請求 token
+        """VTube Studio 認證為兩步：先取 token，再用 token 認證。"""
         req = {
             "apiName": "VTubeStudioPublicAPI",
             "apiVersion": "1.0",
@@ -48,7 +48,6 @@ class VTubeClient:
         resp = json.loads(await self.ws.recv())
         self.auth_token = resp["data"].get("authenticationToken", "")
 
-        # 第二步：用 token 認證
         auth = {
             "apiName": "VTubeStudioPublicAPI",
             "apiVersion": "1.0",
@@ -62,8 +61,7 @@ class VTubeClient:
         }
         await self.ws.send(json.dumps(auth))
         resp = json.loads(await self.ws.recv())
-        authenticated = resp["data"].get("authenticated", False)
-        if not authenticated:
+        if not resp["data"].get("authenticated", False):
             logger.warning("認證失敗，請在 VTube Studio 裡按允許。")
         else:
             logger.info("認證成功。")
