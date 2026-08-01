@@ -1,4 +1,4 @@
-# core/diagnostics.py
+# core/short_time_test.py
 """
 暫時性診斷腳手架集中處。
 
