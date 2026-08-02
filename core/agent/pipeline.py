@@ -2,7 +2,7 @@
 """
 Pipeline（流程控制層）
 
-決定一筆輸入該怎麼被處理：系統指令，還是正常對話輪次。
+決定一個事件該怎麼被處理：系統指令、正常對話輪次，還是環境事件。
 正常輪次的處理順序固定為：取記憶 context → 組裝 Prompt → 呼叫 LLM → 寫回記憶，
 輪次收尾（記憶壓縮）另由 finalize_turn() 負責，由 Agent 在輸出之後呼叫。
 
@@ -18,7 +18,11 @@ handle_turn() 當一般對話處理（預期行為，非 bug）。
 """
 
 from __future__ import annotations
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
+
+from config import EVENT_CONFIG
+from core.agent.events import Event, OBSERVATION
+from core.short_time_test import dump_observation_messages
 
 
 class TurnResult:
@@ -43,16 +47,18 @@ class Pipeline:
         self.persona = persona
         self.memory = memory
 
-        # 指令的唯一來源。key 一律小寫，比對前經 _key() 正規化。
+        # 指令的唯一來源。key 一律小寫、以空白分段，比對前經 _key() 正規化。
+        # 值為 (handler, takes_arg)；takes_arg=True 者允許在指令後接參數。
         self._commands = {
-            "quit":           self._cmd_quit,
-            "/mode t":        self._cmd_mode_text,
-            "/mode v":        self._cmd_mode_voice,
-            "/proactive on":  self._cmd_proactive_on,
-            "/proactive off": self._cmd_proactive_off,
-            "/test on":       self._cmd_test_on,
-            "/test off":      self._cmd_test_off,
-            "/status":        self._cmd_status,
+            "quit":            (self._cmd_quit, False),
+            "/mode t":         (self._cmd_mode_text, False),
+            "/mode v":         (self._cmd_mode_voice, False),
+            "/proactive on":   (self._cmd_proactive_on, False),
+            "/proactive off":  (self._cmd_proactive_off, False),
+            "/proactive test": (self._cmd_proactive_test, True),
+            "/test on":        (self._cmd_test_on, False),
+            "/test off":       (self._cmd_test_off, False),
+            "/status":         (self._cmd_status, False),
         }
 
     # ── 指令分流 ──────────────────────────────────────────────────
@@ -61,42 +67,109 @@ class Pipeline:
     def _key(user_input: str) -> str:
         return user_input.strip().lower()
 
+    def _resolve(self, user_input: str) -> Optional[Tuple[Callable, str]]:
+        """
+        找出對應的 handler 與參數字串，找不到回傳 None。
+
+        由長至短逐段比對，因為指令 key 本身就含空白（"/mode t"、"/proactive on"），
+        單純取第一段會讓 "/proactive test 3" 誤命中不存在的 "/proactive"。
+        完整比對優先，確保 "/proactive test" 不會被當成別的指令加參數。
+
+        ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫。目前唯一的參數是情境編號，
+        不受影響；日後若加入大小寫敏感的參數，需改由原始輸入取。
+        """
+        key = self._key(user_input)
+        parts = key.split()
+
+        for i in range(len(parts), 0, -1):
+            entry = self._commands.get(" ".join(parts[:i]))
+            if entry is None:
+                continue
+            handler, takes_arg = entry
+            arg = " ".join(parts[i:])
+            if takes_arg or not arg:
+                return handler, arg
+        return None
+
     def is_command(self, user_input: str) -> bool:
-        return self._key(user_input) in self._commands
+        return self._resolve(user_input) is not None
 
     def handle_command(self, user_input: str, state, voice_input_factory: Callable) -> TurnResult:
         """
         處理系統指令，回傳結果讓 Agent 決定後續動作（此處不直接操作 VTube 等模組）。
 
-        刻意不用 .get() 做保底：呼叫端必定先經 is_command() 過濾，走到這裡卻找不到
+        刻意不做保底回傳：呼叫端必定先經 is_command() 過濾，走到這裡卻找不到
         handler 代表分流被繞過，應以 KeyError 大聲失敗，而非靜默回傳空結果。
         """
-        return self._commands[self._key(user_input)](state, voice_input_factory)
+        resolved = self._resolve(user_input)
+        if resolved is None:
+            raise KeyError(user_input)
+        handler, arg = resolved
+        return handler(state, voice_input_factory, arg)
 
-    # ── 指令 handler（簽名統一為 (state, voice_input_factory)）─────
+    # ── 指令 handler（簽名統一為 (state, voice_input_factory, arg)）─
 
-    def _cmd_quit(self, state, _factory) -> TurnResult:
+    def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
         self.memory.compress_on_exit()
         state.stop()
         return TurnResult(should_exit=True, system_message="掰掰。")
 
-    def _cmd_mode_text(self, state, _factory) -> TurnResult:
+    def _cmd_mode_text(self, state, _factory, _arg) -> TurnResult:
         state.switch_to_text()
         return TurnResult(system_message="[切換為文字模式]")
 
-    def _cmd_mode_voice(self, state, voice_input_factory) -> TurnResult:
+    def _cmd_mode_voice(self, state, voice_input_factory, _arg) -> TurnResult:
         state.switch_to_voice(voice_input_factory)
         return TurnResult(system_message="[切換為語音模式]")
 
-    def _cmd_proactive_on(self, state, _factory) -> TurnResult:
+    def _cmd_proactive_on(self, state, _factory, _arg) -> TurnResult:
         state.proactive_enabled = True
-        return TurnResult(system_message="[主動對話觸發已恢復]")
+        return TurnResult(system_message="[已開啟：會對環境事件作出反應]")
 
-    def _cmd_proactive_off(self, state, _factory) -> TurnResult:
+    def _cmd_proactive_off(self, state, _factory, _arg) -> TurnResult:
         state.proactive_enabled = False
-        return TurnResult(system_message="[主動對話觸發已暫停]")
+        return TurnResult(system_message="[已關閉：環境事件將被忽略]")
 
-    def _cmd_test_on(self, _state, _factory) -> TurnResult:
+    def _cmd_proactive_test(self, state, _factory, arg) -> TurnResult:
+        """
+        手動注入一則測試用 observation 事件（腳手架，清理條件見
+        config.EVENT_CONFIG["test_observations"]）。
+
+        用法：/proactive test        依序循環取下一則
+              /proactive test 3     指定第 3 則
+
+        指定編號的用途是變數隔離：每次開機只讓她開口一次，才能確保多次比較之間
+        working memory 皆為空、唯一變動的是情境文字。靠空打指令推進循環位置，
+        每推進一次就先污染一次記憶。
+
+        只推事件進佇列，不直接呼叫 LLM——走的必須是與真實 producer 完全相同的
+        路徑，否則測不到分流本身是否正確。
+        """
+        observations = EVENT_CONFIG["test_observations"]
+        if not observations:
+            return TurnResult(system_message="[未設定測試情境]")
+
+        if arg:
+            if not arg.isdigit() or not (1 <= int(arg) <= len(observations)):
+                return TurnResult(
+                    system_message=f"[編號需為 1～{len(observations)} 的整數]"
+                )
+            index = int(arg) - 1
+        else:
+            index = state.observation_test_index % len(observations)
+            state.observation_test_index += 1
+
+        description = observations[index]
+        state.event_queue.put(
+            Event(source="test", kind=OBSERVATION, payload=description)
+        )
+
+        note = "" if state.proactive_enabled else "\n  ⚠ proactive 目前關閉，此事件會被忽略"
+        return TurnResult(system_message=(
+            f"[注入測試事件 {index + 1}/{len(observations)}] {description}{note}"
+        ))
+
+    def _cmd_test_on(self, _state, _factory, _arg) -> TurnResult:
         self._set_test_mode(True)
         return TurnResult(system_message=(
             "[測試模式已開啟]\n"
@@ -108,7 +181,7 @@ class Pipeline:
             "  · 本設定不寫入 config，重開程式後自動回到正常模式"
         ))
 
-    def _cmd_test_off(self, _state, _factory) -> TurnResult:
+    def _cmd_test_off(self, _state, _factory, _arg) -> TurnResult:
         self._set_test_mode(False)
         return TurnResult(system_message=(
             "[測試模式已關閉]\n"
@@ -127,11 +200,12 @@ class Pipeline:
         self.memory.set_test_mode(on)
         self.llm.set_test_mode(on)
 
-    def _cmd_status(self, state, _factory) -> TurnResult:
+    def _cmd_status(self, state, _factory, _arg) -> TurnResult:
         return TurnResult(system_message=(
             "[目前狀態]\n"
             f"  · 模式：{'文字' if state.mode == 't' else '語音'}\n"
-            f"  · 主動對話觸發：{'開啟' if state.proactive_enabled else '關閉'}\n"
+            f"  · 環境事件反應：{'開啟' if state.proactive_enabled else '關閉'}\n"
+            f"  · 佇列待處理事件：{state.event_queue.qsize()} 則\n"
             f"  · 測試模式：{'開啟' if self.memory.test_mode else '關閉'}\n"
             f"  · 推理參數：temperature={self.llm.temperature} "
             f"top_p={self.llm.top_p} freq_pen={self.llm.frequency_penalty} "
@@ -175,26 +249,36 @@ class Pipeline:
             # 此處不用 logger：Pipeline 不持有 logger，錯誤細節已由 MemoryManager 記錄
             print(f"[記憶壓縮失敗，不影響本輪對話：{e}]")
 
-    # ── 主動對話觸發 ──────────────────────────────────────────────
+    # ── 環境事件輪次 ──────────────────────────────────────────────
 
-    def handle_proactive_trigger(self) -> TurnResult:
+    def handle_observation(self, description: str) -> TurnResult:
         """
-        無使用者輸入時觸發：U 內容固定為空字串（符合 LoRA 訓練資料格式規則，
-        不偽裝成使用者發言），另附一則臨時 system 訊息說明目前是主動觸發情境。
+        環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話，故 user 欄位
+        填 EVENT_CONFIG["user_placeholder"]（符合 LoRA 訓練資料的 U/A 交替格式
+        規則，且不偽裝成使用者發言），情境改由一則臨時 system 訊息帶入。
 
         該 system 訊息只存在於這次呼叫，不寫入 Working Memory，避免情境說明
         過期後仍卡在對話歷史裡。與 handle_turn() 相同，此處只追加記憶不壓縮。
+
+        ⚠️ user_placeholder 與 prompt_suffix 皆由 config 帶入，不寫死在此：
+        訓練端格式一旦定案（空 prompt 能否訓練、兩個 system 如何合併），
+        推理端必須跟著改，屆時只動 config 一處。
         """
-        context = self.memory.get_context("")
+        placeholder = EVENT_CONFIG["user_placeholder"]
+        suffix = EVENT_CONFIG["observation_prompt_suffix"]
+
+        context = self.memory.get_context(placeholder)
         context.append({
             "role": "system",
-            "content": "[目前情境]\n邪狼已經一段時間沒有回應，妳可以主動找話題延續對話，"
-            "如果妳剛才已經問過類似的話，這次換個不同的方向。",
+            "content": f"[目前情境]\n{description}" + (f"\n{suffix}" if suffix else ""),
         })
-        messages = self.persona.build_messages(context, "")
+        messages = self.persona.build_messages(context, placeholder)
+
+        dump_observation_messages(messages)  # 腳手架，見 core/short_time_test.py
+
         reply = self.llm.chat(messages)
 
         if reply:
-            self.memory.add_turn("", reply)
+            self.memory.add_turn(placeholder, reply)
 
         return TurnResult(reply=reply)
