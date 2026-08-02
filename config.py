@@ -107,9 +107,6 @@ LMSTUDIO_LOAD_PARAMS = {
 # 對話行為參數
 # ─────────────────────────────────────────────────────────────
 
-# 主動對話的靜默觸發閾值（秒）。暫定值，尚未實測校準。
-SILENCE_THRESHOLD_SECONDS = 30
-
 # 記憶
 MAX_WORKING_MEMORY = 10      # Working Memory 保留輪數（超過 ×2 則觸發壓縮）
 MAX_SUMMARY_SENTENCES = 8    # Compressed Memory 上限句數，避免無限累積
@@ -128,6 +125,43 @@ VOICE_CONFIG = {
     "rms_gate": 0.02,          # 音量門檻，過濾底噪；換麥克風需一併校準
     "chunk_size": 512,         # Silero VAD 要求固定 512 samples
     "debug_print_rms": False,  # 校準麥克風時開啟，印出即時 rms 數值
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# 事件驅動
+# ─────────────────────────────────────────────────────────────
+# observation 事件（環境狀態變化，沒有人在說話）的注入參數。
+# 對應 core/agent/pipeline.py 的 handle_observation()。
+
+EVENT_CONFIG = {
+    # observation 輪次的 user 欄位內容。
+    #
+    # ⚠️ 訓練端與推理端的結構必須一致。若 LLaMA-Factory 無法以空 prompt 訓練、
+    #    訓練資料改用最小開場白，這裡要同步換成同一句話，否則模型學到的是
+    #    「看到某句話 → 主動說話」，而推理時那句話根本不存在。
+    #    此為目前唯一需要改動的位置。
+    "user_placeholder": "",
+
+    # 附在情境描述之後的引導句。
+    #
+    # ⚠️ 過渡期產物。LoRA 訓練資料的格式是 system 只放情境、A 直接反應，
+    #    不含引導句。相應訓練資料就緒後應設為空字串 ""，讓推理端結構與
+    #    訓練端一致；在那之前模型沒有此情境的訓練基礎，需要靠它說明要做什麼。
+    "observation_prompt_suffix": "妳可以針對這件事說點什麼。",
+
+    # ⚠️ 腳手架：/proactive test 的循環取用清單。
+    #    目的：在真實事件來源建立前，驗證 observation 的注入路徑與分流是否正確，
+    #         並觀察「情境不同時輸出是否仍重複」（重複的根因假設）。
+    #    刪除條件：第一個真實 producer（視窗事件 / 遊戲事件 / 聊天室）建立後，
+    #             刪除本項 + pipeline._cmd_proactive_test + _commands 該行
+    #             + state.observation_test_index。
+    "test_observations": [
+        "邪狼正在玩 Minecraft，剛剛掉進岩漿死了。",
+        "邪狼已經在同一個畫面停留很久，沒有任何動作。",
+        "邪狼把視窗切到瀏覽器，正在看影片。",
+        "邪狼剛剛打贏了一場很難的戰鬥。",
+    ],
 }
 
 
@@ -192,10 +226,15 @@ TIMING_CONFIG = {
 #
 # 註：TIMING_CONFIG 不屬於腳手架（延遲量測是長期需求），但評測結束後
 #     應決定它是「保留常駐」還是「預設關閉」。
+#
+# 註：EVENT_CONFIG["test_observations"] 亦為腳手架，但依附於 observation 注入
+#     機制，故留在 EVENT_CONFIG 內、不搬進 short_time_test.py——清理條件與
+#     清理動作寫在該項目上方。
 
 DIAGNOSTICS = {
-    "log_opencc_changes": True,   # 釐清異體字來自模型輸出還是 opencc s2t
-    "rag_stats": True,            # 追蹤淘汰內容轉存 RAG 後的命中率
+    "log_opencc_changes": True,        # 釐清異體字來自模型輸出還是 opencc s2t
+    "rag_stats": True,                 # 追蹤淘汰內容轉存 RAG 後的命中率
+    "dump_observation_messages": True, # 印出 observation 輪次送出的完整 messages
 }
 
 

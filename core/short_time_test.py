@@ -24,6 +24,12 @@
      輸出：data/rag_stats.json
      目的：追蹤 _compress 淘汰內容轉存 RAG 後是否查得到（命中率）
      刪除條件：命中率問題釐清後
+
+  3. dump_observation_messages()
+     呼叫點：core/agent/pipeline.py handle_observation()
+     目的：確認 observation 輪次實際送出的 messages——情境 system 訊息的位置與
+           內容、以及 working memory 內累積的空 U 對是否造成逐字複製
+     刪除條件：空 U 複製問題釐清後
 """
 
 from __future__ import annotations
@@ -136,3 +142,28 @@ class RagStats:
         except Exception as e:
             # 診斷工具不得成為新的故障點
             logger.warning(f"RAG 統計寫入失敗（不影響主流程）：{e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. observation 輪次 messages 傾印
+# ══════════════════════════════════════════════════════════════
+
+def dump_observation_messages(messages: list) -> None:
+    """
+    印出 observation 輪次送進 LLM 的完整 messages。
+
+    要看的三件事：
+      · [目前情境] system 訊息落在陣列的哪個位置、與人格 prompt 的相對順序
+      · working memory 裡是否已累積 content 為空的 user 訊息，以及其後的
+        assistant 內容是否就是被複製的那一句
+      · 情境描述是否真的存在於送出內容中（排除組裝過程被吃掉的可能）
+
+    直接 print 而非 logger：需要完整多行 JSON，logger 的單行格式不利閱讀。
+    """
+    if not DIAGNOSTICS.get("dump_observation_messages"):
+        return
+
+    print("\n" + "─" * 64)
+    print("[DUMP] observation messages（共 %d 則）" % len(messages))
+    print(json.dumps(messages, ensure_ascii=False, indent=2))
+    print("─" * 64 + "\n")
