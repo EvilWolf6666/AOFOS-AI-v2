@@ -7,13 +7,13 @@ Agent 狀態容器。
 """
 
 from __future__ import annotations
-import queue
 import threading
 from typing import Optional, Callable, TYPE_CHECKING
 
+from core.agent.event_queue import EventQueue
+
 if TYPE_CHECKING:
     from core.voice_input import VoiceInput
-    from core.agent.events import Event
 
 
 class AgentState:
@@ -25,11 +25,17 @@ class AgentState:
         voice_input: VoiceInput 實例，語音模式下才惰性建立
         running: 主迴圈是否應繼續執行
         event_queue: 所有事件來源共用的單一佇列。多 producer 寫入，
-            Agent 在唯一取用點讀出——該取用點即為未來仲裁層的位置。
+            Agent 在唯一取用點讀出——該取用點即為仲裁層的位置。
+            同來源的 observation 會互相覆蓋（環境狀態是當前值不是事件流），
+            utterance 不覆蓋。見 core/agent/event_queue.py
         text_input_thread: 扛住阻塞 input() 的背景執行緒。每取得一次輸入即結束，
             下一輪重建；queue 則長駐不重建。
         proactive_enabled: 是否對 observation 事件作出反應。預設關閉，
             需 /proactive on 手動開啟。執行期狀態、不持久化。
+        last_speech_at: 奧狐上次輸出的時間（time.monotonic），供仲裁層計算冷卻。
+            初始為 0.0 表示尚未發言過，任何事件皆可通過冷卻檢查。
+            ⚠️ 用 monotonic 而非 time.time()：後者會受系統時間調整影響，
+            校時或跨時區可能讓冷卻瞬間失效或永久卡住。
         observation_test_index: /proactive test 的循環取用位置（腳手架，
             清理條件見 config.EVENT_CONFIG）
     """
@@ -40,11 +46,12 @@ class AgentState:
         self.running: bool = True
 
         # 長駐，不隨輪次重建——多個 producer 需要一個穩定的寫入目標
-        self.event_queue: "queue.Queue[Event]" = queue.Queue()
+        self.event_queue = EventQueue()
         self.text_input_thread: Optional[threading.Thread] = None
 
         self.proactive_enabled: bool = False
         self.observation_test_index: int = 0
+        self.last_speech_at: float = 0.0
 
     def switch_to_text(self) -> None:
         self.mode = "t"

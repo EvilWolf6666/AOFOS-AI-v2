@@ -23,6 +23,7 @@ from typing import Callable, Optional, Tuple
 from config import EVENT_CONFIG
 from core.agent.events import Event, OBSERVATION
 from core.short_time_test import dump_observation_messages
+from core import console
 
 
 class TurnResult:
@@ -41,6 +42,10 @@ class TurnResult:
 
 class Pipeline:
     """不負責模組的建立與連線（那是 Agent 的職責），只負責呼叫順序與分流邏輯。"""
+
+    # 壓縮期間畫面完全沒有動靜，看起來像當機（實測時使用者因此連按 Enter）。
+    # 抽成常數是因為兩條路徑都要用（輪次收尾與離場），分開寫會在改秒數時漏一邊。
+    COMPRESS_WAIT_MESSAGE = "[整理記憶中，約需 20～30 秒，請稍候……]"
 
     def __init__(self, llm, persona, memory) -> None:
         self.llm = llm
@@ -110,6 +115,13 @@ class Pipeline:
     # ── 指令 handler（簽名統一為 (state, voice_input_factory, arg)）─
 
     def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
+        # 離場壓縮同樣是一次完整的 LLM 呼叫（實測 17～25 秒），且 quit 之後
+        # 使用者更傾向認為程式已經在關了，卡住不動的誤判機率比一般輪次更高。
+        # ⚠️ compress_on_exit() 不檢查 needs_compress()，只要 working_memory
+        # 非空就壓縮——講兩句話就退出也會等，故條件只看「有沒有東西要壓」。
+        if self.memory.working_memory and not self.memory.test_mode:
+            console.emit(self.COMPRESS_WAIT_MESSAGE)
+
         self.memory.compress_on_exit()
         state.stop()
         return TurnResult(should_exit=True, system_message="掰掰。")
@@ -205,7 +217,7 @@ class Pipeline:
             "[目前狀態]\n"
             f"  · 模式：{'文字' if state.mode == 't' else '語音'}\n"
             f"  · 環境事件反應：{'開啟' if state.proactive_enabled else '關閉'}\n"
-            f"  · 佇列待處理事件：{state.event_queue.qsize()} 則\n"
+            f"  · 佇列待處理事件：{self._queue_summary(state)}\n"
             f"  · 測試模式：{'開啟' if self.memory.test_mode else '關閉'}\n"
             f"  · 推理參數：temperature={self.llm.temperature} "
             f"top_p={self.llm.top_p} freq_pen={self.llm.frequency_penalty} "
@@ -214,6 +226,18 @@ class Pipeline:
             f"  · 記憶檔：{self.memory.memory_path}\n"
             f"  · Working Memory：{len(self.memory.working_memory)} 則"
         ))
+
+    @staticmethod
+    def _queue_summary(state) -> str:
+        """佇列內容摘要。只印數量看不出是哪個 producer 在累積事件。"""
+        events = state.event_queue.snapshot()
+        if not events:
+            return "0 則"
+        by_source: dict[str, int] = {}
+        for e in events:
+            by_source[e.source] = by_source.get(e.source, 0) + 1
+        detail = "、".join(f"{k}×{v}" for k, v in by_source.items())
+        return f"{len(events)} 則（{detail}）"
 
     # ── 正常對話輪次 ──────────────────────────────────────────────
 
@@ -241,35 +265,56 @@ class Pipeline:
         壓縮失敗不得中斷主流程：它是輔助功能，不該讓一次失敗拖垮對話。
         """
         try:
-            # 壓縮期間畫面完全沒有動靜，看起來像當機（實測時使用者因此連按 Enter）
             if self.memory.needs_compress():
-                print("[整理記憶中，約需 20～30 秒，請稍候……]")
+                console.emit(self.COMPRESS_WAIT_MESSAGE)
             self.memory.maybe_compress()
         except Exception as e:
             # 此處不用 logger：Pipeline 不持有 logger，錯誤細節已由 MemoryManager 記錄
-            print(f"[記憶壓縮失敗，不影響本輪對話：{e}]")
+            console.emit(f"[記憶壓縮失敗，不影響本輪對話：{e}]")
 
     # ── 環境事件輪次 ──────────────────────────────────────────────
 
     def handle_observation(self, description: str) -> TurnResult:
         """
         環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話，故 user 欄位
-        填 EVENT_CONFIG["user_placeholder"]（符合 LoRA 訓練資料的 U/A 交替格式
-        規則，且不偽裝成使用者發言），情境改由一則臨時 system 訊息帶入。
+        填 EVENT_CONFIG["user_placeholder"]（不偽裝成使用者發言），情境改由
+        EVENT_CONFIG["observation_role"] 指定的角色帶入。與 handle_turn() 相同，
+        此處只追加記憶不壓縮。
 
-        該 system 訊息只存在於這次呼叫，不寫入 Working Memory，避免情境說明
-        過期後仍卡在對話歷史裡。與 handle_turn() 相同，此處只追加記憶不壓縮。
+        ⚠️ role 現行值為 "tool"，不是 "system"。LM Studio 有 role 白名單擋在
+        chat_template 之前，"observation" 與 "ipython" 皆送不出去；白名單內的
+        "tool" 會被 jinja 渲染成 <|start_header_id|>ipython，與訓練端
+        LLaMA-Factory 的 format_observation 輸出一致。見《決策脈絡歸檔》二十二之4。
 
-        ⚠️ user_placeholder 與 prompt_suffix 皆由 config 帶入，不寫死在此：
-        訓練端格式一旦定案（空 prompt 能否訓練、兩個 system 如何合併），
-        推理端必須跟著改，屆時只動 config 一處。
+        情境訊息只存在於這次呼叫，不寫入 Working Memory。
+        ⚠️ 已知會造成兩個症狀（連續觸發時模型照抄前一組回應、`_compress` 讀不到
+        情境導致摘要抓不到事件）。待 observation 類訓練資料就緒後重新評估——
+        模型學到「U 空時看情境說話」可能即可壓過複製傾向，故不預先修。
+        見《決策脈絡歸檔》二十之7 之5、二十二之7。
+
+        情境訊息一律 append 在歷史「之後」、緊鄰生成點。prompt cache 是 token
+        序列的最長共同前綴比對，變動內容排在最尾端時，分岔點之後只需重算情境與
+        空 user；若前移到歷史之前，整段歷史都會被牽連重算，且代價隨對話變長而
+        增大。訓練端只能把 system 放在最前面、無法表達此結構，這正是情境必須走
+        observation role 的原因，見《決策脈絡歸檔》二十二之3。
+
+        ⚠️ placeholder、suffix、role 皆由 config 帶入，不寫死在此：訓練端格式
+        若再變動，推理端只需改 config 一處。
+
+        ⚠️ **observation 輪次不查 RAG——這是目前的實際行為，但尚未確認是否應該
+        如此**（2026-08-03 程式碼審查 I-2 提出）。傳給 get_context() 的是空的
+        placeholder，該方法的 `if user_input:` 因此跳過 RAG 查詢，即使
+        description 本身（例如「邪狼剛才在 VS Code 待了快 40 分鐘」）其實是
+        可用的檢索字串。暫不改動的理由：RAG 查詢實測約 2 秒，加在這條本來就慢的
+        路徑上，而「observation 需不需要長期記憶」尚未被驗證，屬 ① 類。
+        改動前請先確認收益，不要當成 bug 直接「修好」。
         """
         placeholder = EVENT_CONFIG["user_placeholder"]
         suffix = EVENT_CONFIG["observation_prompt_suffix"]
 
         context = self.memory.get_context(placeholder)
         context.append({
-            "role": "system",
+            "role": EVENT_CONFIG["observation_role"],
             "content": f"[目前情境]\n{description}" + (f"\n{suffix}" if suffix else ""),
         })
         messages = self.persona.build_messages(context, placeholder)
