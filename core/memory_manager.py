@@ -238,6 +238,17 @@ class MemoryManager:
             }]
 
             result = self.llm.chat(prompt, purpose="compress")
+
+            # ⚠️ llm_client.chat() 在任何例外時回傳 ""（刻意設計，見該檔）。
+            # 空字串會讓 _parse_compress_result 的 next() 拋 StopIteration、
+            # 落入保底分支並回傳 ("", "無")，接著把 compressed_memory 覆寫成
+            # 空字串並寫回磁碟——長期記憶就此消失，而使用者只會看到
+            # finalize_turn 印的一行「壓縮失敗」，不會知道記憶被清空了。
+            # 故必須在覆寫之前擋掉，且回傳 None 讓呼叫端知道本次沒有結果。
+            if not result.strip():
+                logger.error("壓縮呼叫回傳空內容，本次壓縮放棄（記憶維持原狀）")
+                return None
+
             new_summary, discarded = self._parse_compress_result(result)
 
             self.compressed_memory = new_summary
@@ -289,9 +300,26 @@ class MemoryManager:
             return result.strip(), "無"
 
     def _compress_oldest(self):
+        """
+        ⚠️ 「先壓縮、後裁切」的順序不可對調。先裁切的話，壓縮失敗時那批對話
+        已經從 working_memory 移除、而摘要也沒產生——兩邊都不在了，且沒有
+        任何徵兆（使用者只看到一行「壓縮失敗」）。
+
+        壓縮失敗時 working_memory 會持續超長，下一次 finalize_turn 會再試一次。
+        這是正確的：重試比靜默清空好，而 LLM 連續失敗代表 LM Studio 掛了，
+        那本來就是更該被看見的事。
+        """
         to_compress = self.working_memory[:COMPRESS_BATCH_SIZE]
-        self.working_memory = self.working_memory[COMPRESS_BATCH_SIZE:]
         summary = self._compress(to_compress)
+
+        if summary is None:
+            logger.error(
+                "壓縮未產生有效摘要，Working Memory 不裁切、既有摘要不覆寫"
+                "（下次觸發時會重試）"
+            )
+            return
+
+        self.working_memory = self.working_memory[COMPRESS_BATCH_SIZE:]
         logger.info(f"已壓縮記憶：{summary[:50]}...")
 
     def compress_on_exit(self):
@@ -304,5 +332,16 @@ class MemoryManager:
             logger.info("測試模式：跳過離開時的記憶壓縮。")
             return
 
-        self._compress(self.working_memory)
+        if self._compress(self.working_memory) is None:
+            # ⚠️ 這裡和 _compress_oldest 不同：程式即將結束，沒有「下次重試」。
+            # working_memory 只存在記憶體中，此刻壓縮失敗就等於本次對話
+            # 完全不會進入長期記憶。必須大聲說明後果，否則使用者會以為
+            # 只是「摘要沒更新」。
+            logger.error(
+                f"離場壓縮失敗，本次對話的 {len(self.working_memory)} 則訊息"
+                "不會寫入長期記憶（僅存在記憶體，程式結束後消失）。"
+                "既有摘要未被覆寫。"
+            )
+            return
+
         logger.info("對話已儲存。")

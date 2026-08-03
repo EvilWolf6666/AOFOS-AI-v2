@@ -145,10 +145,30 @@ EVENT_CONFIG = {
 
     # 附在情境描述之後的引導句。
     #
-    # ⚠️ 過渡期產物。LoRA 訓練資料的格式是 system 只放情境、A 直接反應，
-    #    不含引導句。相應訓練資料就緒後應設為空字串 ""，讓推理端結構與
-    #    訓練端一致；在那之前模型沒有此情境的訓練基礎，需要靠它說明要做什麼。
-    "observation_prompt_suffix": "妳可以針對這件事說點什麼。",
+    # ⚠️ 過渡期產物，最終應維持空字串——LoRA 訓練資料的格式是 system 只放情境、
+    #    A 直接反應，不含引導句，推理端結構需與訓練端一致。
+    # ⚠️ 2026-08-02 起設為空字串進行對照。先前值「妳可以針對這件事說點什麼。」
+    #    疑似把情境框成「有人在跟妳講話」——情境為「邪狼切去看影片」時，回應為
+    #    「又來干擾我了」，把邪狼自己的行為誤讀成對她的互動。若空字串下方向轉
+    #    正常，此項可直接刪除；舊值與三則對照結果記於《決策脈絡歸檔》二十二之5 供還原。
+    "observation_prompt_suffix": "",
+
+    # 情境訊息的 role 名稱。現行值 "tool"。
+    #
+    # ⚠️ 不要改成 "system"、"observation" 或 "ipython"，三者都會壞：
+    #      "system"       訓練端表達不出來（LLaMA-Factory 的 _encode 只在序列
+    #                     最前面插入一次 system，放不進對話中段）
+    #      "observation"  LM Studio 有 role 白名單（user/assistant/system/tool）
+    #                     擋在 chat_template 之前，直接回 400
+    #      "ipython"      同上，也被白名單擋掉
+    #
+    # "tool" 之所以正確：它在白名單內，且模型的 jinja chat_template 會把
+    # role == "tool" 渲染成 <|start_header_id|>ipython——與訓練端
+    # LLaMA-Factory format_observation 的輸出完全一致。實測 "system" 652 tokens
+    # vs "tool" 655 tokens，僅差 header 名稱，中文未被 escape。
+    #
+    # 完整查證過程（含三層推翻）見《決策脈絡歸檔》二十二之4。改動前務必先讀。
+    "observation_role": "tool",
 
     # ⚠️ 腳手架：/proactive test 的循環取用清單。
     #    目的：在真實事件來源建立前，驗證 observation 的注入路徑與分流是否正確，
@@ -162,6 +182,75 @@ EVENT_CONFIG = {
         "邪狼把視窗切到瀏覽器，正在看影片。",
         "邪狼剛剛打贏了一場很難的戰鬥。",
     ],
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# 事件仲裁
+# ─────────────────────────────────────────────────────────────
+# 所有事件在 Agent 的唯一取用點（event_queue.get()）之後、分流之前經此判斷。
+#
+# ⚠️ 仲裁邏輯必須集中於單一位置。分散到各 producer 內部各自決定要不要發言，
+#    會造成多來源同時輸出（Lumi_Nox 失效案例，見《決策脈絡歸檔》十一之1、十一之3）。
+
+ARBITRATION_CONFIG = {
+    # 奧狐發言後多久內不再處理環境事件（秒）。
+    #
+    # 使用者輸入不受此限制——冷卻只擋 observation，不擋人說話。
+    # 下限來自實測：一次推理 8～15 秒，冷卻若短於此，佇列會積壓。
+    "observation_cooldown_seconds": 30,
+
+    # ⚠️ 尚未實作、位置已預留的兩項（① 類，TTS 接入主迴圈後才存在）：
+    #      · 奧狐正在說話時使用者插話 → QUEUE / INTERRUPT 的選擇
+    #      · 中斷與靜音通道
+    #    目前文字模式為同步阻塞，輸出期間不可能有新輸入，故兩者皆不存在。
+    #    實作時一律加在 Agent._arbitrate()，不得下放到 producer。
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# 事件來源：前景視窗監看
+# ─────────────────────────────────────────────────────────────
+# 第一個真實 producer。選它而非螢幕畫面（VL）的理由見《決策脈絡歸檔》二十之7 之8：
+# 成本近乎為零、錯誤率為零、不依賴模型路線，且它知道的事（他在用什麼程式）
+# 永遠不會被 VL 取代。
+#
+# ⚠️ 「畫面上發生什麼」需要 VL，屬另一個 producer，待模型路線定案。兩者互補不重疊。
+
+WINDOW_WATCHER_CONFIG = {
+    "enabled": True,
+
+    # 輪詢間隔（秒）。Win32 API 呼叫成本極低，但過密無意義——
+    # 人切換視窗的頻率遠低於每秒一次。
+    "poll_interval_seconds": 2.0,
+
+    # 同一程式停留多久後推一次「久無切換」事件（秒）。
+    # 推過一次後需再次達到此門檻才會再推，不會每輪都推。
+    "idle_threshold_seconds": 600,
+
+    # 不值得產生事件的程式（小寫比對）。使用者在這些程式之間切換屬於
+    # 操作噪音，不是「他改去做別的事」。
+    "ignored_processes": [
+        "explorer.exe",
+        "searchhost.exe",
+        "shellexperiencehost.exe",
+        "textinputhost.exe",
+        "lockapp.exe",
+    ],
+
+    # 程式名 → 人類可讀名稱。找不到時退回程式名本身（不隱藏未知程式，
+    # 否則新遊戲會靜默變成「未知」而沒人發現需要補這張表）。
+    "process_display_names": {
+        "code.exe": "VS Code",
+        "chrome.exe": "瀏覽器",
+        "msedge.exe": "瀏覽器",
+        "firefox.exe": "瀏覽器",
+        "javaw.exe": "Minecraft",
+        "steam.exe": "Steam",
+        "lmstudio.exe": "LM Studio",
+        "windowsterminal.exe": "終端機",
+        "powershell.exe": "終端機",
+    },
 }
 
 
