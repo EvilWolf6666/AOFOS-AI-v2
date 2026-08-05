@@ -16,6 +16,10 @@ logger = setup_logger("RAGManager")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "chroma_db")
 COLLECTION_NAME = "aofos_memory"
 
+# 知識來源。寫入 metadata，供查詢端區分統計；缺這個欄位的資料視為 SOURCE_EVICT。
+SOURCE_EVICT = "compress_evict"   # _compress 整合覆寫時被擠出摘要、轉存進來的
+SOURCE_SEED = "seed"              # 人工撰寫的世界觀，由 tools/seed_rag.py 灌入
+
 
 class RAGManager:
     def __init__(self):
@@ -65,7 +69,8 @@ class RAGManager:
 
     # ── 新增知識 ──────────────────────────────────
 
-    def add(self, text: str, doc_id: str = None, metadata: dict = None):
+    def add(self, text: str, doc_id: str = None, metadata: dict = None,
+            source: str = SOURCE_EVICT):
         if not self.enabled:
             logger.debug("TEST_MODE：略過 RAG 寫入。")
             return
@@ -73,18 +78,23 @@ class RAGManager:
         if doc_id is None:
             doc_id = str(uuid.uuid4())
 
-        upsert_kwargs = {
-            "documents": [text],
-            "ids": [doc_id],
-        }
-        if metadata:
-            upsert_kwargs["metadatas"] = [metadata]
+        meta = dict(metadata) if metadata else {}
+        meta["source"] = source
 
         with timed("RAG寫入"):
-            self.collection.upsert(**upsert_kwargs)
+            self.collection.upsert(
+                documents=[text],
+                ids=[doc_id],
+                metadatas=[meta],
+            )
 
-        logger.debug(f"新增知識：{text[:40]}...")
-        self._stats.record_write()
+        logger.debug(f"新增知識（{source}）：{text[:40]}...")
+
+        # 只計入 SOURCE_EVICT。種子資料是人工照「會被怎麼問」的措辭寫的，命中率
+        # 天然偏高；混進來會稀釋掉這個計數器唯一要量的東西——摘要式書面語 vs
+        # 口語提問的措辭落差是否讓淘汰內容命不中門檻。
+        if source == SOURCE_EVICT:
+            self._stats.record_write()
 
     # ── 查詢知識（含相似度門檻）─────────────────
 
@@ -102,22 +112,30 @@ class RAGManager:
             results = self.collection.query(
                 query_texts=[text],
                 n_results=min(RAG_TOP_K, count),
-                include=["documents", "distances"],
+                include=["documents", "distances", "metadatas"],
             )
 
         docs = results["documents"][0] if results["documents"] else []
         distances = results["distances"][0] if results["distances"] else []
+        metas = results["metadatas"][0] if results.get("metadatas") else [None] * len(docs)
 
         filtered = []
-        for doc, distance in zip(docs, distances):
+        evict_hits = 0
+        for doc, distance, meta in zip(docs, distances, metas):
             similarity = 1 - distance
             if similarity >= RAG_SIMILARITY_THRESHOLD:
                 filtered.append(doc)
+                # 無 source 欄位者視為淘汰內容：這個欄位是後加的，早於它寫入的
+                # 資料只可能來自 _compress。
+                if (meta or {}).get("source", SOURCE_EVICT) == SOURCE_EVICT:
+                    evict_hits += 1
                 logger.debug(f"RAG 命中（相似度 {similarity:.2f}）：{doc[:30]}...")
             else:
                 logger.debug(f"RAG 過濾（相似度 {similarity:.2f}）：{doc[:30]}...")
 
-        self._stats.record_search(len(filtered))
+        # ⚠️ 判讀限制：分母是「所有非空查詢」，包含當下根本沒有相關淘汰內容可命中
+        # 的查詢，因此比例會系統性偏低。要看的是趨勢與 writes 的相對關係，不是絕對值。
+        self._stats.record_search(evict_hits)
 
         logger.debug(f"查詢：{text[:30]}，命中：{len(filtered)}/{len(docs)} 筆")
         return filtered
