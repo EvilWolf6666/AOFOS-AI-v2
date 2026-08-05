@@ -22,7 +22,7 @@ LLM_CONFIG = {
     #
     # ⚠️ 換模型流程：Eject 舊模型 → 載入新模型 → 於 GUI 重設載入層參數
     #    （見 LMSTUDIO_LOAD_PARAMS）→ 才改這一行。JIT 已關閉，順序顛倒會直接報錯。
-    "model": "aofos_v3",
+    "model": "aofos_v4_colab",
 
     # ── 標準 OpenAI 參數（以具名參數送出）──
     "temperature": 0.8,
