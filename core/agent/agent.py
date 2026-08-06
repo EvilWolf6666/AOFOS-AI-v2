@@ -31,7 +31,12 @@ from core.agent.pipeline import Pipeline
 from core.agent.events import Event, UTTERANCE, OBSERVATION
 from core.producers.window_watcher import WindowWatcher
 from core import console
-from core.voice_input import VoiceModeExit
+# ⚠️ 從 ctrl_stream_signal 取，不是從 voice_input 取。後者會在模組層級把整個
+# 語音棧（faster_whisper ~6s、torch ~4s）載進來，而文字模式完全用不到——
+# 實測 import core.voice_input 需 5.7 秒，且會讓下方 _voice_input_factory()
+# 的「惰性建立」失效（函式內的 import 只是查 sys.modules）。
+# 見《決策脈絡歸檔》三十二章。
+from core.ctrl_stream_signal import VoiceModeExit
 
 logger = setup_logger("Agent")
 
@@ -62,7 +67,13 @@ class Agent:
 
     @staticmethod
     def _voice_input_factory():
-        """惰性建立，文字模式使用者不必載入語音模型。"""
+        """惰性建立，文字模式使用者不必載入語音模型。
+
+        ⚠️ 這個惰性只有在**本檔沒有任何其他地方於模組層級 import
+        core.voice_input** 的前提下才成立——函式內的 import 遇到已載入的
+        模組只是查 sys.modules，一毛錢都省不到。2026-08-06 之前正是如此
+        （VoiceModeExit 從 voice_input 取），本 docstring 當時是假的。
+        """
         from core.voice_input import VoiceInput
         return VoiceInput(model_size="small", language="zh")
 

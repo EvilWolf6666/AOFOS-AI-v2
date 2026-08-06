@@ -341,7 +341,9 @@ TIMING_CONFIG = {
 #     清理動作寫在該項目上方。
 
 DIAGNOSTICS = {
-    "log_opencc_changes": True,        # 釐清異體字來自模型輸出還是 opencc s2t
+    # ⚠️ 目的已於 2026-08-06 更新：舊目的（釐清異體字來源）已達成且證偽，
+    #    現行目的是換模型後判斷 opencc 這一層還需不需要（《歸檔》三十二之9）。
+    "log_opencc_changes": True,
     "rag_stats": True,                 # 追蹤淘汰內容轉存 RAG 後的命中率
     "dump_observation_messages": True, # 印出 observation 輪次送出的完整 messages
 }

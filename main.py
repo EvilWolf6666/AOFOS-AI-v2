@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
-from dotenv import load_dotenv
-
-# ⚠️ 必須在 import Agent 之前執行：RAGManager 載入 sentence-transformers 時
-# 就會讀取 HF_TOKEN 等環境變數，晚一步就來不及。
-load_dotenv()
+# ⚠️ 必須排在所有其他 import 之前，且不可因為「看起來沒用到」而被移除。
+# config 頂部會 load_dotenv() 並設定 HF_HUB_OFFLINE，而 huggingface_hub 是在
+# import 當下把這些環境變數讀成模組常數——只要任何一個會連帶拉進 huggingface_hub
+# 的模組（sentence-transformers、faster-whisper）先被 import，設定就來不及了，
+# 而且不會報錯，只會靜默地變回連網。
+#
+# 這一行取代了原本寫在此處的 load_dotenv()：環境設定現已集中於 config.py，
+# 因為 tools/ 底下的腳本直接 import config、完全不經過 main.py（《歸檔》三十一之4）。
+import config  # noqa: F401
 
 from core.agent.agent import Agent  # noqa: E402
 

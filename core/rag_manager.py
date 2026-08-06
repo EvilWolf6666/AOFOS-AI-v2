@@ -4,15 +4,9 @@
 import os
 import uuid
 
-# ⚠️ config 必須排在 chromadb 之前。config 頂部會設定 HF_HUB_OFFLINE 與載入
-# .env，而 huggingface_hub 是在 import 當下把這些環境變數讀成模組常數——晚一步
-# 設定就不生效。目前 chromadb 是否會在 import 期間連帶拉進 huggingface_hub
-# 尚未查證，但把順序寫死成正確的，比依賴第三方套件的 import 鏈不變更可靠。
-# seed_rag.py 只 import 本模組、不 import config，所以這個順序是唯一的保障。
 from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K, TEST_CONFIG, TEST_MODE
 
-import chromadb
-from chromadb.utils import embedding_functions
+# ⚠️ chromadb 刻意不在此 import，見 _init_backend()。
 from core.short_time_test import RagStats   # 診斷腳手架，清理時連同下方呼叫點一併移除
 from core.logger import setup_logger, timed
 
@@ -55,9 +49,28 @@ class RAGManager:
             logger.warning("TEST_MODE 啟用：RAG 已停用（不查詢、不寫入、不初始化）")
 
     def _init_backend(self):
-        """建立 ChromaDB 連線與 embedding 函式。重複呼叫安全（已初始化則跳過）。"""
+        """建立 ChromaDB 連線與 embedding 函式。重複呼叫安全（已初始化則跳過）。
+
+        ⚠️ chromadb 在此 import 而非模組層級，這是刻意的：TEST_MODE 下本方法
+        永遠不會被呼叫，而 `import chromadb` 實測 2.8～7.4 秒（雜訊大，只能看
+        量級）。放在模組層級的話，即使 RAG 全程停用也照付這筆錢——那正是
+        本檔檔頭「測試模式下完全用不到，沒必要付這個成本」想避免的事，
+        原本卻只做到一半。見《決策脈絡歸檔》三十二之2。
+
+        ⚠️ 這裡的 import 必須排在 config 被載入之後才有意義（config 頂部設定
+        HF_HUB_OFFLINE，而 huggingface_hub 在 import 當下把它讀成模組常數）。
+        目前結構天然滿足：本方法只可能在 __init__ 或 set_enabled() 中被呼叫，
+        屆時模組層級的 `from config import ...` 早已執行完畢。
+
+        ⚠️ 真正吃掉十幾秒的 sentence-transformers 不在這裡，是 ChromaDB 於
+        SentenceTransformerEmbeddingFunction.__init__ 內部才載入的——那一層
+        原本就已經被本方法的惰性保護涵蓋，不需另外處理。
+        """
         if self.collection is not None:
             return
+
+        import chromadb
+        from chromadb.utils import embedding_functions
 
         self.client = chromadb.PersistentClient(path=DB_PATH)
         self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
