@@ -12,6 +12,13 @@ from pynput import keyboard
 from config import VOICE_CONFIG
 from core.logger import setup_logger
 
+# ⚠️ 其他模組若要 catch VoiceModeExit，請直接從 core.ctrl_stream_signal import，
+#    **不要**寫成 `from core.voice_input import VoiceModeExit`。後者雖然寫得出來、
+#    也會動，但會在模組層級把整個語音棧（faster_whisper ~6s、torch ~4s）一併載入，
+#    而且不會有任何徵兆。VoiceModeExit 之所以被搬出去就是為了避免這件事
+#    （見《決策脈絡歸檔》三十二章）。此處 import 僅供本檔 raise 使用。
+from core.ctrl_stream_signal import VoiceModeExit
+
 logger = setup_logger("VoiceInput")
 
 SAMPLE_RATE = VOICE_CONFIG["sample_rate"]
@@ -21,11 +28,6 @@ SILENCE_DURATION = VOICE_CONFIG["silence_duration"]
 RMS_GATE = VOICE_CONFIG["rms_gate"]
 CHUNK_SIZE = VOICE_CONFIG["chunk_size"]
 DEBUG_PRINT_RMS = VOICE_CONFIG["debug_print_rms"]
-
-
-class VoiceModeExit(Exception):
-    """使用者按下退出鍵（預設 ESC）時拋出，呼叫端需 catch 並切回文字模式或結束程式。"""
-    pass
 
 
 class VoiceInput:
