@@ -1,6 +1,26 @@
 # config.py
 # 統一設定檔 — 換模型 / 換 API / 調參數只改這裡
 
+# ── 環境變數：必須在任何 huggingface / chromadb 相關 import 之前生效 ──
+import os
+
+from dotenv import load_dotenv
+
+# 放在 config.py 而非 main.py 的理由：tools/ 底下的腳本直接 import config，
+# 完全不經過 main.py。原本 load_dotenv() 只寫在 main.py，導致 seed_rag 與
+# rag_probe 執行時 .env 從未被讀入、HF_TOKEN 一直是空的（2026-08-06 查證）。
+# config 是 main.py 與所有 tools 唯一的共同入口，放這裡才是單一來源。
+load_dotenv()
+
+# embedding 模型已在本機快取，啟動時不需要連網查版本。施測協定要求每題重啟程式，
+# 每次啟動都打一次 HuggingFace 是累積的延遲，網路不順時還會拖慢甚至卡住。
+#
+# 用 setdefault 而非直接指派：要換 embedding 模型時，命令列臨時設
+# HF_HUB_OFFLINE=0 就能恢復下載，不必回頭改這裡。
+#
+# ⚠️ 快取不存在時會直接報錯，而不是靜默改走下載——這是刻意的，失敗要大聲。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 # ─────────────────────────────────────────────────────────────
 # LLM 連線與推理參數
 # ─────────────────────────────────────────────────────────────
@@ -114,7 +134,7 @@ COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user
 
 # RAG
 RAG_TOP_K = 3
-RAG_SIMILARITY_THRESHOLD = 0.7   # 低於此分數的查詢結果直接丟棄
+RAG_SIMILARITY_THRESHOLD = 0.55   # 低於此分數的查詢結果直接丟棄
 
 # 語音輸入
 VOICE_CONFIG = {

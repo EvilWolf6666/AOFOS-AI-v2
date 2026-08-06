@@ -4,10 +4,15 @@
 import os
 import uuid
 
+# ⚠️ config 必須排在 chromadb 之前。config 頂部會設定 HF_HUB_OFFLINE 與載入
+# .env，而 huggingface_hub 是在 import 當下把這些環境變數讀成模組常數——晚一步
+# 設定就不生效。目前 chromadb 是否會在 import 期間連帶拉進 huggingface_hub
+# 尚未查證，但把順序寫死成正確的，比依賴第三方套件的 import 鏈不變更可靠。
+# seed_rag.py 只 import 本模組、不 import config，所以這個順序是唯一的保障。
+from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K, TEST_CONFIG, TEST_MODE
+
 import chromadb
 from chromadb.utils import embedding_functions
-
-from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K, TEST_CONFIG, TEST_MODE
 from core.short_time_test import RagStats   # 診斷腳手架，清理時連同下方呼叫點一併移除
 from core.logger import setup_logger, timed
 
@@ -19,6 +24,19 @@ COLLECTION_NAME = "aofos_memory"
 # 知識來源。寫入 metadata，供查詢端區分統計；缺這個欄位的資料視為 SOURCE_EVICT。
 SOURCE_EVICT = "compress_evict"   # _compress 整合覆寫時被擠出摘要、轉存進來的
 SOURCE_SEED = "seed"              # 人工撰寫的世界觀，由 tools/seed_rag.py 灌入
+
+# 退場機制。RAG 是唯一沒有下一層可退的記憶層——Working Memory 會滾掉、
+# Compressed Memory 靠 _compress 整合覆寫，而 RAG 進來就永遠在。過期的知識
+# （例如「她看不到畫面」在 VL 接上之後）留在庫裡會與新事實一起被召回，變成
+# 矛盾注入，且沒有任何訊號提示該刪它。見《歸檔》二十九之3、三十之2。
+#
+# ⚠️ 只做「寫入欄位 + 查詢過濾」這一半。下線的 setter、觸發條件與介面刻意不做：
+#    欄位已經在每一列上，之後補寫 setter 不需要資料遷移；而現在做要猜「什麼時候
+#    算過期」的規格，猜錯的成本是重做。
+#
+# ⚠️ 不用「失效時間戳」是因為時點形狀不對——過期是由能力變化觸發（VL 接上那天），
+#    不是由日期觸發。布林值猜不錯，時間戳會猜錯。
+RETIRED_FIELD = "retired"
 
 
 class RAGManager:
@@ -70,7 +88,17 @@ class RAGManager:
     # ── 新增知識 ──────────────────────────────────
 
     def add(self, text: str, doc_id: str = None, metadata: dict = None,
-            source: str = SOURCE_EVICT):
+            source: str = SOURCE_EVICT, answer: str = None):
+        """寫入一筆知識。
+
+        `text` 是拿去比對的索引文本，`answer` 是實際要注入模型的內容。
+        兩者分開的理由：使用者的查詢永遠是問句，索引文本若也是問句，兩邊
+        同分佈，相似度的絕對值才有意義（實測 0.437 → 0.760）。但問句不該
+        被注入模型，所以答案另存 metadata。見《歸檔》三十之1。
+
+        `answer` 省略時（`_compress` 淘汰內容即是）查詢端會退回傳 `text` 本身，
+        故淘汰路徑的呼叫端一行都不用改。
+        """
         if not self.enabled:
             logger.debug("TEST_MODE：略過 RAG 寫入。")
             return
@@ -80,6 +108,9 @@ class RAGManager:
 
         meta = dict(metadata) if metadata else {}
         meta["source"] = source
+        meta[RETIRED_FIELD] = False
+        if answer:
+            meta["answer"] = answer
 
         with timed("RAG寫入"):
             self.collection.upsert(
@@ -99,7 +130,16 @@ class RAGManager:
     # ── 查詢知識（含相似度門檻）─────────────────
 
     def query(self, text: str) -> list[str]:
-        """查詢最相關的知識，只回傳相似度超過 RAG_SIMILARITY_THRESHOLD 的結果。"""
+        """查詢最相關的知識，回傳實際要注入的內容（有 answer 者回 answer）。
+
+        ⚠️ RAG_SIMILARITY_THRESHOLD 的職責是**地板不是閘門**。實測 recall@3 與
+        MRR 都是滿分——排序本身已經正確，門檻的工作只剩「擋掉整個查詢與知識庫
+        無關的情況」（例如問天氣）。當成閘門用會砍掉已經排對的結果，這正是
+        0.7 造成 0/15 的原因。見《歸檔》三十之1。
+
+        ⚠️ 依 answer 去重：一個答案可掛多個問句，不去重的話三個同義問句會佔滿
+        TOP_K，實際只回到一則知識，recall 反而下降。故多取候選再去重。
+        """
         if not self.enabled:
             return []
 
@@ -111,8 +151,12 @@ class RAGManager:
         with timed("RAG查詢"):
             results = self.collection.query(
                 query_texts=[text],
-                n_results=min(RAG_TOP_K, count),
+                # 多取候選：同一答案可能掛多個問句，去重後才湊得滿 TOP_K
+                n_results=min(RAG_TOP_K * 3, count),
                 include=["documents", "distances", "metadatas"],
+                # 已下線的知識在檢索階段就排除，不是撈回來再過濾——一旦進了
+                # 上下文就很難保證不以某種形式洩漏進回答裡
+                where={RETIRED_FIELD: False},
             )
 
         docs = results["documents"][0] if results["documents"] else []
@@ -120,18 +164,30 @@ class RAGManager:
         metas = results["metadatas"][0] if results.get("metadatas") else [None] * len(docs)
 
         filtered = []
+        seen = set()
         evict_hits = 0
         for doc, distance, meta in zip(docs, distances, metas):
             similarity = 1 - distance
-            if similarity >= RAG_SIMILARITY_THRESHOLD:
-                filtered.append(doc)
-                # 無 source 欄位者視為淘汰內容：這個欄位是後加的，早於它寫入的
-                # 資料只可能來自 _compress。
-                if (meta or {}).get("source", SOURCE_EVICT) == SOURCE_EVICT:
-                    evict_hits += 1
-                logger.debug(f"RAG 命中（相似度 {similarity:.2f}）：{doc[:30]}...")
-            else:
+            if similarity < RAG_SIMILARITY_THRESHOLD:
                 logger.debug(f"RAG 過濾（相似度 {similarity:.2f}）：{doc[:30]}...")
+                continue
+
+            meta = meta or {}
+            # 沒有 answer 的是 _compress 淘汰內容，索引文本本身就是要注入的內容
+            payload = meta.get("answer") or doc
+            if payload in seen:
+                continue
+            seen.add(payload)
+            filtered.append(payload)
+
+            # 無 source 欄位者視為淘汰內容：該欄位是後加的，早於它寫入的
+            # 資料只可能來自 _compress。
+            if meta.get("source", SOURCE_EVICT) == SOURCE_EVICT:
+                evict_hits += 1
+            logger.debug(f"RAG 命中（相似度 {similarity:.2f}）：{payload[:30]}...")
+
+            if len(filtered) >= RAG_TOP_K:
+                break
 
         # ⚠️ 判讀限制：分母是「所有非空查詢」，包含當下根本沒有相關淘汰內容可命中
         # 的查詢，因此比例會系統性偏低。要看的是趨勢與 writes 的相對關係，不是絕對值。
