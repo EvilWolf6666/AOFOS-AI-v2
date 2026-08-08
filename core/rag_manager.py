@@ -7,7 +7,6 @@ import uuid
 from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K, TEST_CONFIG, TEST_MODE
 
 # ⚠️ chromadb 刻意不在此 import，見 _init_backend()。
-from core.short_time_test import RagStats   # 診斷腳手架，清理時連同下方呼叫點一併移除
 from core.logger import setup_logger, timed
 
 logger = setup_logger("RAGManager")
@@ -15,7 +14,8 @@ logger = setup_logger("RAGManager")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "chroma_db")
 COLLECTION_NAME = "aofos_memory"
 
-# 知識來源。寫入 metadata，供查詢端區分統計；缺這個欄位的資料視為 SOURCE_EVICT。
+# 知識來源。寫入 metadata，供 tools/seed_rag.py 的整份同步辨識哪些是種子
+# （檔案裡刪掉的段落要一併從庫裡移除，而淘汰內容不能被那個動作波及）。
 SOURCE_EVICT = "compress_evict"   # _compress 整合覆寫時被擠出摘要、轉存進來的
 SOURCE_SEED = "seed"              # 人工撰寫的世界觀，由 tools/seed_rag.py 灌入
 
@@ -40,7 +40,6 @@ class RAGManager:
         self.client = None
         self.collection = None
         self.embedding_fn = None
-        self._stats = RagStats()
 
         self.enabled = not (TEST_MODE and TEST_CONFIG.get("disable_rag", True))
         if self.enabled:
@@ -84,7 +83,6 @@ class RAGManager:
             # 固定，事後無法修改，換空間需刪除整個 data/chroma_db 資料夾重建。
             metadata={"hnsw:space": "cosine"},
         )
-        self._stats.load()
         logger.info(f"RAG 初始化完成（目前 {self.collection.count()} 筆）。")
 
     def set_enabled(self, enabled: bool):
@@ -134,12 +132,6 @@ class RAGManager:
 
         logger.debug(f"新增知識（{source}）：{text[:40]}...")
 
-        # 只計入 SOURCE_EVICT。種子資料是人工照「會被怎麼問」的措辭寫的，命中率
-        # 天然偏高；混進來會稀釋掉這個計數器唯一要量的東西——摘要式書面語 vs
-        # 口語提問的措辭落差是否讓淘汰內容命不中門檻。
-        if source == SOURCE_EVICT:
-            self._stats.record_write()
-
     # ── 查詢知識（含相似度門檻）─────────────────
 
     def query(self, text: str) -> list[str]:
@@ -158,7 +150,8 @@ class RAGManager:
 
         count = self.collection.count()
         if count == 0:
-            # 空集合不計入查詢統計，否則命中率會被大量必然落空的查詢稀釋
+            # 下方 n_results 取 min(TOP_K*3, count)，空集合會算出 0 而 ChromaDB
+            # 不接受 n_results=0
             return []
 
         with timed("RAG查詢"):
@@ -178,7 +171,6 @@ class RAGManager:
 
         filtered = []
         seen = set()
-        evict_hits = 0
         for doc, distance, meta in zip(docs, distances, metas):
             similarity = 1 - distance
             if similarity < RAG_SIMILARITY_THRESHOLD:
@@ -192,19 +184,10 @@ class RAGManager:
                 continue
             seen.add(payload)
             filtered.append(payload)
-
-            # 無 source 欄位者視為淘汰內容：該欄位是後加的，早於它寫入的
-            # 資料只可能來自 _compress。
-            if meta.get("source", SOURCE_EVICT) == SOURCE_EVICT:
-                evict_hits += 1
             logger.debug(f"RAG 命中（相似度 {similarity:.2f}）：{payload[:30]}...")
 
             if len(filtered) >= RAG_TOP_K:
                 break
-
-        # ⚠️ 判讀限制：分母是「所有非空查詢」，包含當下根本沒有相關淘汰內容可命中
-        # 的查詢，因此比例會系統性偏低。要看的是趨勢與 writes 的相對關係，不是絕對值。
-        self._stats.record_search(evict_hits)
 
         logger.debug(f"查詢：{text[:30]}，命中：{len(filtered)}/{len(docs)} 筆")
         return filtered

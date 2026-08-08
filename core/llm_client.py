@@ -14,6 +14,11 @@ logger = setup_logger("LLMClient")
 # 直接當具名參數傳會被 SDK 丟掉或報錯。
 _EXTRA_BODY_KEYS = ("top_k", "repeat_penalty", "min_p")
 
+# context 用量（prompt + max_tokens）達此比例即警告。
+# 不放進 config：這個值不會為了改變行為而被調整，只在換模型／context 變動時
+# 重新檢視一次（判準見《歸檔》十九之3）。
+_CONTEXT_WARN_RATIO = 0.85
+
 
 class LLMClient:
     def __init__(self):
@@ -32,6 +37,10 @@ class LLMClient:
         self.presence_penalty = LLM_CONFIG["presence_penalty"]
         self.seed = LLM_CONFIG.get("seed")
         self.max_tokens_by_purpose = LLM_CONFIG.get("max_tokens_by_purpose", {})
+
+        # 輸入側預算的分母。與 verify_lmstudio 取自同一處，故不會有兩份真相。
+        # 為 None 時（未來換後端而該欄位不存在）輸入側檢查自動停用，不報錯。
+        self.context_length = LMSTUDIO_LOAD_PARAMS.get("context_length")
 
         # 值為 None 的欄位不送出
         self.extra_body = {
@@ -156,9 +165,40 @@ class LLMClient:
                         f"輸出可能被截斷（purpose={purpose}，"
                         f"completion_tokens={usage.completion_tokens} 已達上限 {max_tokens}）"
                     )
+                # ── 輸入側預算 ──
+                # prompt 與本次允許的輸出必須「一起」裝進 context，故分子是兩者之和，
+                # 不是 prompt 單獨對 context 的佔比。compress 的 max_tokens 為 800，
+                # prompt 到 7400 就已無餘裕——用固定百分比會漏掉這種情形。
+                #
+                # ⚠️ 溢出的後果不是報錯，是 llama.cpp 靜默截掉 context 的「中間」段，
+                #    也就是 Compressed Memory 與早期對話（見 config.LMSTUDIO_LOAD_PARAMS
+                #    的 max_concurrent_predictions 註解）。整份記憶消失且無任何徵兆。
+                #
+                # ⚠️ usage.prompt_tokens 是否為「截斷前」的原始長度未經證實。若後端回報
+                #    的是截斷後的值，下方 needed > context 那條永遠不會觸發，實際發揮
+                #    作用的是 _CONTEXT_WARN_RATIO 那條。故該比例是主要機制而非備援，
+                #    調低它比等溢出更可靠。
+                if self.context_length:
+                    needed = usage.prompt_tokens + max_tokens
+                    if needed > self.context_length:
+                        logger.error(
+                            f"⚠ context 溢出（purpose={purpose}）："
+                            f"prompt={usage.prompt_tokens} + max_tokens={max_tokens} "
+                            f"= {needed} > context_length={self.context_length}。"
+                            f"摘要與早期對話可能已被靜默截掉，本次輸出不可信"
+                        )
+                    elif needed > self.context_length * _CONTEXT_WARN_RATIO:
+                        logger.warning(
+                            f"context 餘裕不足（purpose={purpose}）："
+                            f"{needed}/{self.context_length} "
+                            f"（{needed / self.context_length:.0%}），"
+                            f"剩餘 {self.context_length - needed} tokens"
+                        )
+
                 logger.debug(
                     f"token[{purpose}]：prompt={usage.prompt_tokens} "
-                    f"completion={usage.completion_tokens} total={usage.total_tokens}"
+                    f"completion={usage.completion_tokens} total={usage.total_tokens} "
+                    f"context={self.context_length}"
                 )
 
             reply = (response.choices[0].message.content or "").strip()

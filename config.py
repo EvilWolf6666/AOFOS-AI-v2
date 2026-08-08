@@ -54,7 +54,8 @@ LLM_CONFIG = {
     #    約 1 token/字，300 上限會讓「淘汰：」整段被截斷，而
     #    _parse_compress_result() 找不到該標記時不報錯、安靜回傳「無」——
     #    淘汰內容因此永遠寫不進 RAG，且無任何徵兆。
-    #    若 rag_stats.json 的 writes 長期為 0 或遠低於壓縮次數，優先懷疑這裡。
+    #    徵兆在 memory_manager._compress() 的 log：若長期只出現「本次壓縮無淘汰
+    #    內容」而從不出現「本次壓縮淘汰內容（將轉存 RAG）」，優先懷疑這裡。
     "max_tokens_by_purpose": {
         "compress": 800,
     },
@@ -344,7 +345,6 @@ DIAGNOSTICS = {
     # ⚠️ 目的已於 2026-08-06 更新：舊目的（釐清異體字來源）已達成且證偽，
     #    現行目的是換模型後判斷 opencc 這一層還需不需要（《歸檔》三十二之9）。
     "log_opencc_changes": True,
-    "rag_stats": True,                 # 追蹤淘汰內容轉存 RAG 後的命中率
     "dump_observation_messages": True, # 印出 observation 輪次送出的完整 messages
 }
 
