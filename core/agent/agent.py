@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Optional
 
-from config import ARBITRATION_CONFIG
+from config import ARBITRATION_CONFIG, PERSONA_CONFIG
 from core.llm_client import LLMClient
 from core.persona import Persona
 from core.memory_manager import MemoryManager
@@ -222,7 +222,10 @@ class Agent:
         """環境事件：沒有人在說話，情境走標記過的 context 區塊注入。"""
         result = self.pipeline.handle_observation(event.payload)
         if result.reply:
-            console.emit(f"\n奧狐：{result.reply}\n")
+            # printed=True 代表回應已在生成過程中逐段印出（串流），再印一次會出現兩遍。
+            # 格式與 Pipeline.REPLY_PREFIX / REPLY_TRAILING 對齊，改動需兩處同步。
+            if not result.printed:
+                console.emit(f"\n{PERSONA_CONFIG['name']}：{result.reply}\n")
             logger.debug(f"奧狐主動發起：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()
@@ -244,7 +247,8 @@ class Agent:
 
         result = self.pipeline.handle_turn(text)
         if result.reply:
-            console.emit(f"\n奧狐：{result.reply}\n")
+            if not result.printed:
+                console.emit(f"\n{PERSONA_CONFIG['name']}：{result.reply}\n")
             logger.debug(f"奧狐回應：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()
@@ -264,8 +268,10 @@ class Agent:
         console.emit("=== 奧狐 AOFOS 啟動 ===")
         console.emit("[記憶已載入]" if self.memory.compressed_memory else "[首次啟動，無歷史記憶]")
         console.emit("模式：t = 文字輸入，v = 語音輸入（預設文字）")
-        console.emit("指令：/mode t、/mode v、/proactive on、/proactive off、"
-                     "/proactive test、/test on、/test off、/status、quit")
+        # ⚠️ 這串字面清單與 Pipeline._commands 是兩份真相，改指令時必須同步。
+        #    2026-08-16 實際發生過：/proactive test 已隨腳手架刪除，這裡仍列著它，
+        #    照著打會靜默落入對話分支（奧狐會認真回答「/proactive test」這句話）。
+        console.emit("指令：" + "、".join(self.pipeline.command_names()) )
 
         # 測試模式會改變記憶與 RAG 行為，必須在畫面上持續可見，
         # 否則容易在忘記自己開著的情況下把測試資料當成正常對話。

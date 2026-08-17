@@ -72,6 +72,17 @@ LLM_CONFIG = {
     "top_k": 40,
     "repeat_penalty": 1.1,
     "min_p": 0.05,
+
+    # ── 串流輸出 ──
+    # True 時逐 token 印出。KPI（端到端 <500ms）不因此達成——3 tok/s 的生成速度下
+    # 第二個字就已超過——但等待期間的體感差異極大：關閉時整段生成完才印，
+    # 實測 4,748～15,474ms 之間畫面完全空白。
+    #
+    # ⚠️ 只影響「有接串流回呼的呼叫點」（目前僅 handle_turn / handle_observation）。
+    #    _compress() 沒有消費者要看它逐字吐，一律走非串流路徑。
+    #
+    # ⚠️ 施測時由 TEST_CONFIG["llm_overrides_stream"] 強制關閉，見該處說明。
+    "stream": True,
 }
 
 
@@ -137,6 +148,32 @@ COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user
 RAG_TOP_K = 3
 RAG_SIMILARITY_THRESHOLD = 0.55   # 低於此分數的查詢結果直接丟棄
 
+# 輸出後處理
+TEXT_CONFIG = {
+    # opencc 繁簡轉換（s2tw）是否啟用。
+    #
+    # ⚠️ 2026-08-16 設為 False：暫時關閉以觀察「不經這層時模型原生輸出長什麼樣」。
+    #    這一層存在的前提是「現行模型會吐簡體字」，而該前提從未在關閉狀態下被驗過。
+    #
+    # 判讀方式（🔴 直接看輸出，不要只看 diff 計數）：
+    #    關閉後跑一輪，輸出**有沒有簡體字**。
+    #      沒有 → 這層在現行模型上已無作用，換模型時可正式評估整層移除
+    #      有   → 這層還在做事，改回 True
+    #
+    # 🔴 為什麼不能只看 log_opencc_diff() 的計數：
+    #    「有 diff = opencc 有價值」這條判讀規則本身沒被驗證過。s2* 系列對
+    #    「已經是繁體」的輸入**不是 no-op**，diff 有可能正是它把本來就對的字改壞。
+    #    見《歸檔》一之14。
+    #
+    # ⚠️ 關閉是早退，不是移除——opencc 的 import 與 converter 建立一律保留。
+    #    後期要恢復只需把這裡改回 True，不必回頭動三個檔。
+    #
+    # 🔴 s2twp 永遠不可用：它會替換**用詞**（软件→軟體），而用詞是 LoRA 訓出來的。
+    #    後處理再改一次等於在權重之外偷偷覆寫她的說話方式，且不會出現在任何 log 裡，
+    #    所有 LoRA 版本比較都會被污染。
+    "opencc_enabled": False,
+}
+
 # 語音輸入
 VOICE_CONFIG = {
     "sample_rate": 16000,
@@ -176,33 +213,29 @@ EVENT_CONFIG = {
 
     # 情境訊息的 role 名稱。現行值 "tool"。
     #
-    # ⚠️ 不要改成 "system"、"observation" 或 "ipython"，三者都會壞：
-    #      "system"       訓練端表達不出來（LLaMA-Factory 的 _encode 只在序列
-    #                     最前面插入一次 system，放不進對話中段）
-    #      "observation"  LM Studio 有 role 白名單（user/assistant/system/tool）
-    #                     擋在 chat_template 之前，直接回 400
-    #      "ipython"      同上，也被白名單擋掉
+    # 🔴 2026-08-16：本項的原始理由已在 v4 上失效，值暫時不動、待定（《現況》P18）。
     #
-    # "tool" 之所以正確：它在白名單內，且模型的 jinja chat_template 會把
-    # role == "tool" 渲染成 <|start_header_id|>ipython——與訓練端
-    # LLaMA-Factory format_observation 的輸出完全一致。實測 "system" 652 tokens
-    # vs "tool" 655 tokens，僅差 header 名稱，中文未被 escape。
+    #   原理由：「模型的 chat_template 會把 role == "tool" 渲染成
+    #            <|start_header_id|>ipython，與訓練端 LLaMA-Factory 一致」
+    #   實測：  該敘述只在 aofos_v3 成立。v3 的 template 含 tool → ipython 映射分支；
+    #          v4 帶的是 Llama-3.0 風格簡化版，把 role 字串**原樣**插進 header，
+    #          因此 v4 上渲染出的是 <|start_header_id|>tool。
     #
-    # 完整查證過程（含三層推翻）見《決策脈絡歸檔》二十二之4。改動前務必先讀。
+    # ⚠️ "tool" 並不是 Llama-3.1 的合法 role（官方僅 system/user/assistant/ipython）。
+    #    它能送出去只因為 LM Studio 的白名單用的是 OpenAI 的 role 集合。
+    #    兩套定義交錯，交集裡沒有任何一個是兩邊都正確的：
+    #      "ipython" 過不了 LM Studio 白名單（400，2026-08-03 實測）
+    #      "tool"    過不了 v4 的 chat_template（渲染成模型沒見過的 header）
+    #
+    # ⚠️ 不要在讀完《歸檔》六之11 與 P18 之前改這個值。
+    #    改動前也不要照 v3 時代的推理（六之5）做決定——那份推理的前提已不成立。
     "observation_role": "tool",
 
-    # ⚠️ 腳手架：/proactive test 的循環取用清單。
-    #    目的：在真實事件來源建立前，驗證 observation 的注入路徑與分流是否正確，
-    #         並觀察「情境不同時輸出是否仍重複」（重複的根因假設）。
-    #    刪除條件：第一個真實 producer（視窗事件 / 遊戲事件 / 聊天室）建立後，
-    #             刪除本項 + pipeline._cmd_proactive_test + _commands 該行
-    #             + state.observation_test_index。
-    "test_observations": [
-        "邪狼正在玩 Minecraft，剛剛掉進岩漿死了。",
-        "邪狼已經在同一個畫面停留很久，沒有任何動作。",
-        "邪狼把視窗切到瀏覽器，正在看影片。",
-        "邪狼剛剛打贏了一場很難的戰鬥。",
-    ],
+    # 註：原有 "test_observations" 腳手架（/proactive test 的循環取用清單）已於
+    #     2026-08-16 移除，刪除條件（第一個真實 producer 建立）已由
+    #     WINDOW_WATCHER_CONFIG 於 2026-08-02 滿足。
+    #     手動注入情境的需求若日後再現，正確做法是新增一個 producer，
+    #     不是把腳手架加回來——走的路徑必須與真實事件相同。
 }
 
 
@@ -294,6 +327,17 @@ TEST_CONFIG = {
     "memory_path": "data/test_compressed_memory.txt",
     "disable_rag": True,
 
+    # 施測期間強制關閉串流。
+    #
+    # ⚠️ 「串流與非串流在貪婪解碼下逐字相同」是一個**尚未驗證的假設**——理論上
+    #    兩者走同一條 forward pass，差別只在傳輸方式；但本專案已有多次「理論上
+    #    成立、實際上另一層在動手腳」的紀錄（見《歸檔》一之14）。
+    #    在驗過之前，施測一律走已知的那條路徑，不拿 v1 題組去賭這個假設。
+    #
+    # 驗證方式（做完即可移除本項）：同一題以 stream=True / False 各跑一次，
+    # 貪婪解碼下應逐字相同。相同 → 本項可刪；不同 → 找出差在哪再說。
+    "disable_stream": True,
+
     # 評測專用推理參數：貪婪解碼（greedy decoding）。
     #
     # temperature=0 + top_k=1 直接取機率最高的 token，不經取樣，隨機性從源頭消失，
@@ -337,9 +381,7 @@ TIMING_CONFIG = {
 # 註：TIMING_CONFIG 不屬於腳手架（延遲量測是長期需求），但評測結束後
 #     應決定它是「保留常駐」還是「預設關閉」。
 #
-# 註：EVENT_CONFIG["test_observations"] 亦為腳手架，但依附於 observation 注入
-#     機制，故留在 EVENT_CONFIG 內、不搬進 short_time_test.py——清理條件與
-#     清理動作寫在該項目上方。
+# 註：EVENT_CONFIG["test_observations"] 已於 2026-08-16 移除（C4 結案）。
 
 DIAGNOSTICS = {
     # ⚠️ 目的已於 2026-08-06 更新：舊目的（釐清異體字來源）已達成且證偽，

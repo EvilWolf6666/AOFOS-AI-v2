@@ -2,6 +2,7 @@
 
 import opencc
 
+from config import TEXT_CONFIG
 from core.short_time_test import log_opencc_diff   # 診斷腳手架，清理時連同下方呼叫一併移除
 
 # ⚠️ s2tw 而非 s2t：兩者都只轉字形、不動詞彙，差別在採用哪套繁體字形標準——
@@ -28,10 +29,22 @@ def fix_traditional(text: str) -> str:
     本身的輸出品質**——若模型其實已經不吐簡體字，留著只是多一道無效轉換，
     還會讓人誤以為「有在把關」。
 
-    量測方式：開著 DIAGNOSTICS["log_opencc_changes"] 跑一輪固定評測題組，
-    看 opencc 是否完全不動作。完全不動作即代表這一層可以整個拿掉，
-    少一層後處理就少一個變數。
+    🔴 **量測方式已於 2026-08-16 改為「直接關掉這一層看輸出」**，
+    由 TEXT_CONFIG["opencc_enabled"] 控制（現為 False）。
+
+    原本的量測方式是「開著 DIAGNOSTICS['log_opencc_changes'] 看它有沒有動作」，
+    但那條判讀規則（有 diff = opencc 有價值）**本身沒有被驗證過**：s2* 系列對
+    「已經是繁體」的輸入不是 no-op，diff 有可能正是它把本來就對的字改壞。
+    直接看關掉後的輸出裡有沒有簡體字，才是在量真正要量的東西。見《歸檔》一之14。
+
+    ⚠️ 關閉走早退，不是移除——opencc 的 import 與 _converter 建立一律保留在
+    模組層級。恢復只需把 config 那個布林改回 True，不必回頭動三個檔案。
+    ⚠️ 早退時 log_opencc_diff() 一併不執行（沒有轉換就沒有 diff 可記），
+    這是預期行為，不是腳手架失效。
     """
+    if not TEXT_CONFIG["opencc_enabled"]:
+        return text
+
     converted = _converter.convert(text)
     log_opencc_diff(text, converted)   # 診斷腳手架
     return converted

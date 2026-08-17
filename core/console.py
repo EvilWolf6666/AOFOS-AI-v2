@@ -28,6 +28,7 @@ _CLEAR_LINE = "\r\033[K"
 
 _lock = threading.RLock()
 _prompt: str = ""          # 目前顯示中的提示字元，空字串表示沒有提示在等輸入
+_streaming: bool = False   # 是否正在逐 token 輸出（見 begin_stream）
 
 
 def set_prompt(prompt: str) -> None:
@@ -54,8 +55,17 @@ def emit(text: str = "", end: str = "\n") -> None:
 
     所有非 input() 的畫面輸出都應走這裡，包括背景執行緒。直接呼叫 print()
     會繞過鎖，重新產生本模組要解決的問題。
+
+    ⚠️ 串流期間（begin_stream 與 end_stream 之間）**不清行**，改為先斷行再印。
+    提示字元與已生成的回應在這裡有本質差異：提示可以清掉再重畫（它是可重建的），
+    但已經印出來的 token 是最終產物，清掉就真的沒了——後續 delta 只會接在
+    被清空的行上，使用者看到的是被腰斬的一句話。故串流內容一律只被推開，不被覆蓋。
     """
     with _lock:
+        if _streaming:
+            sys.stdout.write("\n" + text + end)
+            sys.stdout.flush()
+            return
         if _prompt:
             sys.stdout.write(_CLEAR_LINE)
         sys.stdout.write(text + end)
@@ -76,6 +86,66 @@ def input_with_prompt(prompt: str) -> str:
         return input(prompt)
     finally:
         clear_prompt()
+
+
+# ── 串流輸出 ─────────────────────────────────────────────────────
+#
+# 為什麼不直接用 emit() 逐 token 呼叫：emit() 每次都會清行並重畫提示，
+# 逐字呼叫等於每個 token 閃一次畫面。串流需要的是「開頭印一次前綴、中間只追加、
+# 結尾收一次」，這是不同的輸出形狀，不是 emit 的參數能表達的。
+#
+# ⚠️ 刻意不在串流全程持鎖。持鎖會讓背景執行緒的 log 卡住整段生成時間
+# （實測 4.7～15.5 秒），而那些 log 有些是要當場看的警告。改為逐次取鎖 +
+# _streaming 旗標，代價是 log 會把回應切成多行——可接受，因為字沒有消失。
+
+
+def begin_stream(prefix: str = "") -> None:
+    """
+    進入串流輸出狀態，印出前綴（例如「奧狐：」）。
+
+    必須與 end_stream() 成對呼叫，且 end_stream() 要放在 finally——中途例外
+    若沒還原 _streaming，之後所有 emit() 都會停在「只斷行不重畫提示」的模式，
+    輸入提示從此不再出現，而且看起來像當機。
+    """
+    global _streaming
+    with _lock:
+        if _prompt:
+            sys.stdout.write(_CLEAR_LINE)
+        _streaming = True
+        if prefix:
+            sys.stdout.write(prefix)
+        sys.stdout.flush()
+
+
+def write_stream(text: str) -> None:
+    """追加一段已生成的內容，不換行、不重畫。空字串直接略過，避免無謂 flush。"""
+    if not text:
+        return
+    with _lock:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+def end_stream(trailing: str = "\n") -> None:
+    """
+    結束串流輸出，補上收尾空白並在有提示等待中時重畫提示。
+
+    trailing 由呼叫端指定，用來讓串流與非串流兩條路徑的畫面**逐字元一致**。
+    ⚠️ 這不是排版偏好：格式不一致時，開關 stream 會讓畫面行距跳動，
+    而那看起來像程式出了問題，會誘使人去查一個不存在的 bug。
+
+    重複呼叫是安全的（第二次為 no-op），因為呼叫端多半寫在 finally，
+    而 finally 有可能與正常路徑重疊。
+    """
+    global _streaming
+    with _lock:
+        if not _streaming:
+            return
+        _streaming = False
+        sys.stdout.write(trailing)
+        if _prompt:
+            sys.stdout.write(_prompt)
+        sys.stdout.flush()
 
 
 # ── logging 橋接 ─────────────────────────────────────────────────
