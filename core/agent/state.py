@@ -36,8 +36,6 @@ class AgentState:
             初始為 0.0 表示尚未發言過，任何事件皆可通過冷卻檢查。
             ⚠️ 用 monotonic 而非 time.time()：後者會受系統時間調整影響，
             校時或跨時區可能讓冷卻瞬間失效或永久卡住。
-        observation_test_index: /proactive test 的循環取用位置（腳手架，
-            清理條件見 config.EVENT_CONFIG）
     """
 
     def __init__(self, mode: str = "t") -> None:
@@ -50,7 +48,6 @@ class AgentState:
         self.text_input_thread: Optional[threading.Thread] = None
 
         self.proactive_enabled: bool = False
-        self.observation_test_index: int = 0
         self.last_speech_at: float = 0.0
 
     def switch_to_text(self) -> None:

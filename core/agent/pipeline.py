@@ -20,7 +20,7 @@ handle_turn() 當一般對話處理（預期行為，非 bug）。
 from __future__ import annotations
 from typing import Callable, Optional, Tuple
 
-from config import EVENT_CONFIG
+from config import EVENT_CONFIG, PERSONA_CONFIG
 from core.agent.events import Event, OBSERVATION
 from core.short_time_test import dump_observation_messages
 from core import console
@@ -34,10 +34,43 @@ class TurnResult:
         should_exit: bool = False,
         reply: Optional[str] = None,
         system_message: Optional[str] = None,
+        printed: bool = False,
     ) -> None:
         self.should_exit = should_exit
         self.reply = reply
         self.system_message = system_message
+
+        # printed=True 代表 reply 已在生成過程中逐段印到畫面上，Agent 不可再印一次。
+        # ⚠️ Agent 的輸出點必須改為 `if result.reply and not result.printed:`，
+        #    否則串流開啟時每句話都會出現兩遍（一次逐字、一次整段）。
+        self.printed = printed
+
+
+class _StreamSink:
+    """
+    串流輸出的接收端：第一次真的收到內容時才開始串流輸出。
+
+    延遲到第一個片段才 begin_stream() 有兩個作用：
+      · 非串流路徑下（LLMClient 依設定決定不串流）回呼從未被呼叫，used 保持
+        False，Agent 照舊整段印出——**Pipeline 因此不需要自己判斷會不會串流**，
+        那個判斷留在 LLMClient 一處，不製造第二份真相
+      · 呼叫失敗回傳空字串時，畫面不會留下一個孤零零的前綴
+    """
+
+    def __init__(self, prefix: str, trailing: str = "\n") -> None:
+        self.prefix = prefix
+        self.trailing = trailing
+        self.used = False
+
+    def __call__(self, text: str) -> None:
+        if not self.used:
+            self.used = True
+            console.begin_stream(self.prefix)
+        console.write_stream(text)
+
+    def close(self) -> None:
+        if self.used:
+            console.end_stream(self.trailing)
 
 
 class Pipeline:
@@ -46,6 +79,13 @@ class Pipeline:
     # 壓縮期間畫面完全沒有動靜，看起來像當機（實測時使用者因此連按 Enter）。
     # 抽成常數是因為兩條路徑都要用（輪次收尾與離場），分開寫會在改秒數時漏一邊。
     COMPRESS_WAIT_MESSAGE = "[整理記憶中，約需 20～30 秒，請稍候……]"
+
+    # 串流輸出的前後綴，對齊 agent.py 既有的 emit(f"\n奧狐：{reply}\n") 格式
+    # （emit 自帶 end="\n"，故非串流路徑的實際輸出是前一空行 + 內容 + 後一空行）。
+    # ⚠️ 兩處必須逐字元一致，否則開關 stream 時畫面行距會跳動。
+    #    名字由 PERSONA_CONFIG["name"] 取，不寫死。
+    REPLY_PREFIX = f"\n{PERSONA_CONFIG['name']}："
+    REPLY_TRAILING = "\n\n"
 
     def __init__(self, llm, persona, memory) -> None:
         self.llm = llm
@@ -60,7 +100,6 @@ class Pipeline:
             "/mode v":         (self._cmd_mode_voice, False),
             "/proactive on":   (self._cmd_proactive_on, False),
             "/proactive off":  (self._cmd_proactive_off, False),
-            "/proactive test": (self._cmd_proactive_test, True),
             "/test on":        (self._cmd_test_on, False),
             "/test off":       (self._cmd_test_off, False),
             "/status":         (self._cmd_status, False),
@@ -76,12 +115,17 @@ class Pipeline:
         """
         找出對應的 handler 與參數字串，找不到回傳 None。
 
-        由長至短逐段比對，因為指令 key 本身就含空白（"/mode t"、"/proactive on"），
-        單純取第一段會讓 "/proactive test 3" 誤命中不存在的 "/proactive"。
-        完整比對優先，確保 "/proactive test" 不會被當成別的指令加參數。
+        由長至短逐段比對，因為指令 key 本身就含空白（"/mode t"、"/proactive on"）。
+        單純取第一段會讓 "/proactive on" 誤命中不存在的 "/proactive"；完整比對
+        優先，也確保多段指令不會被當成短指令加參數。
 
-        ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫。目前唯一的參數是情境編號，
-        不受影響；日後若加入大小寫敏感的參數，需改由原始輸入取。
+        ⚠️ takes_arg 機制目前**沒有任何使用者**——唯一用到它的 "/proactive test"
+        已於 2026-08-16 隨腳手架清理移除（C4）。保留的理由是刪除要同時改動
+        _commands 的值格式、本方法與 handle_command()，而留著的成本是一個 bool。
+        新增帶參數的指令時直接登記 takes_arg=True 即可。
+
+        ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫。日後若加入大小寫敏感的參數，
+        需改由原始輸入取。
         """
         key = self._key(user_input)
         parts = key.split()
@@ -95,6 +139,20 @@ class Pipeline:
             if takes_arg or not arg:
                 return handler, arg
         return None
+
+    def command_names(self) -> list[str]:
+        """
+        供啟動訊息列出可用指令。
+
+        ⚠️ 存在理由是消滅第三份真相：先前 agent.py 的啟動訊息把指令名稱寫成字面
+        字串，與 _commands 各自維護。2026-08-16 刪除 /proactive test 時該處沒跟著
+        改，使用者照著提示打會靜默落入對話分支——這與檔頭記載的 is_command /
+        handle_command 雙清單是同一個坑，只是跨了檔案所以更難察覺。
+
+        排序照登記順序（Python 3.7+ dict 有序），不另外排序：登記順序本身就是
+        依相關性分組的，字母序反而讓 /mode 與 /proactive 打散。
+        """
+        return list(self._commands.keys())
 
     def is_command(self, user_input: str) -> bool:
         return self._resolve(user_input) is not None
@@ -142,51 +200,13 @@ class Pipeline:
         state.proactive_enabled = False
         return TurnResult(system_message="[已關閉：環境事件將被忽略]")
 
-    def _cmd_proactive_test(self, state, _factory, arg) -> TurnResult:
-        """
-        手動注入一則測試用 observation 事件（腳手架，清理條件見
-        config.EVENT_CONFIG["test_observations"]）。
-
-        用法：/proactive test        依序循環取下一則
-              /proactive test 3     指定第 3 則
-
-        指定編號的用途是變數隔離：每次開機只讓她開口一次，才能確保多次比較之間
-        working memory 皆為空、唯一變動的是情境文字。靠空打指令推進循環位置，
-        每推進一次就先污染一次記憶。
-
-        只推事件進佇列，不直接呼叫 LLM——走的必須是與真實 producer 完全相同的
-        路徑，否則測不到分流本身是否正確。
-        """
-        observations = EVENT_CONFIG["test_observations"]
-        if not observations:
-            return TurnResult(system_message="[未設定測試情境]")
-
-        if arg:
-            if not arg.isdigit() or not (1 <= int(arg) <= len(observations)):
-                return TurnResult(
-                    system_message=f"[編號需為 1～{len(observations)} 的整數]"
-                )
-            index = int(arg) - 1
-        else:
-            index = state.observation_test_index % len(observations)
-            state.observation_test_index += 1
-
-        description = observations[index]
-        state.event_queue.put(
-            Event(source="test", kind=OBSERVATION, payload=description)
-        )
-
-        note = "" if state.proactive_enabled else "\n  ⚠ proactive 目前關閉，此事件會被忽略"
-        return TurnResult(system_message=(
-            f"[注入測試事件 {index + 1}/{len(observations)}] {description}{note}"
-        ))
-
     def _cmd_test_on(self, _state, _factory, _arg) -> TurnResult:
         self._set_test_mode(True)
         return TurnResult(system_message=(
             "[測試模式已開啟]\n"
             "  · RAG 已停用（不查詢、不寫入）\n"
             "  · 推理參數切為貪婪解碼（temperature=0、top_k=1），輸出可重現\n"
+            "  · 串流輸出已停用（串流與非串流是否逐字相同尚未驗證，施測不賭這個假設）\n"
             "  · 記憶改用獨立測試檔，正式記憶檔完全未被改動\n"
             "  · Working Memory 已清空（僅存在記憶體、從不寫檔）\n"
             "  ⚠ 本次開機以來尚未壓縮的對話已直接丟棄，不會進入長期記憶\n"
@@ -199,6 +219,7 @@ class Pipeline:
             "[測試模式已關閉]\n"
             "  · RAG 已恢復\n"
             "  · 推理參數已還原為日常設定\n"
+            "  · 串流輸出已恢復（依 config LLM_CONFIG['stream']）\n"
             "  · 記憶已切回正式檔\n"
             "  · Working Memory 已清空\n"
             "  ⚠ 測試期間尚未壓縮的對話已直接丟棄"
@@ -222,6 +243,8 @@ class Pipeline:
             f"  · 推理參數：temperature={self.llm.temperature} "
             f"top_p={self.llm.top_p} freq_pen={self.llm.frequency_penalty} "
             f"extra_body={self.llm.extra_body}\n"
+            f"  · 串流輸出：{'開啟' if self.llm.stream else '關閉'}"
+            f"{'（測試模式下強制停用中）' if self.memory.test_mode else ''}\n"
             f"  · RAG：{'啟用' if self.memory.rag.enabled else '停用'}\n"
             f"  · 記憶檔：{self.memory.memory_path}\n"
             f"  · Working Memory：{len(self.memory.working_memory)} 則"
@@ -241,16 +264,31 @@ class Pipeline:
 
     # ── 正常對話輪次 ──────────────────────────────────────────────
 
+    def _chat_streamed(self, messages: list, purpose: str = "dialogue") -> Tuple[str, bool]:
+        """
+        呼叫 LLM 並在支援時逐段印出。回傳 (完整回應, 是否已印出)。
+
+        ⚠️ close() 放在 finally：串流中途拋例外若沒還原 console 的串流狀態，
+        之後所有 emit() 都會停在「不重畫提示」的模式，輸入提示從此消失，
+        而且症狀看起來像當機而不是像例外。
+        """
+        sink = _StreamSink(self.REPLY_PREFIX, self.REPLY_TRAILING)
+        try:
+            reply = self.llm.chat(messages, purpose=purpose, on_delta=sink)
+        finally:
+            sink.close()
+        return reply, sink.used
+
     def handle_turn(self, user_input: str) -> TurnResult:
         """取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。壓縮見 finalize_turn()。"""
         context = self.memory.get_context(user_input)
         messages = self.persona.build_messages(context, user_input)
-        reply = self.llm.chat(messages)
+        reply, printed = self._chat_streamed(messages)
 
         if reply:
             self.memory.add_turn(user_input, reply)
 
-        return TurnResult(reply=reply)
+        return TurnResult(reply=reply, printed=printed)
 
     # ── 輪次收尾 ──────────────────────────────────────────────────
 
@@ -321,9 +359,9 @@ class Pipeline:
 
         dump_observation_messages(messages)  # 腳手架，見 core/short_time_test.py
 
-        reply = self.llm.chat(messages)
+        reply, printed = self._chat_streamed(messages)
 
         if reply:
             self.memory.add_turn(placeholder, reply)
 
-        return TurnResult(reply=reply)
+        return TurnResult(reply=reply, printed=printed)
