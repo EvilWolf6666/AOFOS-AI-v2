@@ -8,10 +8,8 @@ Pipeline（流程控制層）
 
 Prompt 組裝的優先順序由 persona.build_messages() 決定，此處只負責呼叫順序。
 
-指令一律登記於 _commands（見 __init__），is_command() 與 handle_command() 共用
-同一份來源。新增指令只需加一個 handler 並登記一行——這是刻意的結構：先前兩處
-各有一份清單，漏改任一邊都會靜默失效（漏 A 則指令被當對話送給 LLM，看起來像
-正常回話；漏 B 則什麼都不印，看起來像當機）。
+指令一律登記於 _commands，is_command() 與 handle_command() 共用同一份來源。
+⚠️ 不得再開第二份清單——漏改任一邊都會靜默失效。
 
 註：/remember、/list 已停用且不在 _commands 內，輸入這兩個字串會落入
 handle_turn() 當一般對話處理（預期行為，非 bug）。
@@ -40,9 +38,8 @@ class TurnResult:
         self.reply = reply
         self.system_message = system_message
 
-        # printed=True 代表 reply 已在生成過程中逐段印到畫面上，Agent 不可再印一次。
-        # ⚠️ Agent 的輸出點必須改為 `if result.reply and not result.printed:`，
-        #    否則串流開啟時每句話都會出現兩遍（一次逐字、一次整段）。
+        # printed=True 代表 reply 已逐段印到畫面上，Agent 不可再印一次
+        # （否則串流開啟時每句話出現兩遍）。
         self.printed = printed
 
 
@@ -50,11 +47,9 @@ class _StreamSink:
     """
     串流輸出的接收端：第一次真的收到內容時才開始串流輸出。
 
-    延遲到第一個片段才 begin_stream() 有兩個作用：
-      · 非串流路徑下（LLMClient 依設定決定不串流）回呼從未被呼叫，used 保持
-        False，Agent 照舊整段印出——**Pipeline 因此不需要自己判斷會不會串流**，
-        那個判斷留在 LLMClient 一處，不製造第二份真相
-      · 呼叫失敗回傳空字串時，畫面不會留下一個孤零零的前綴
+    延遲到第一個片段才 begin_stream()：非串流路徑下回呼從未被呼叫，used 保持
+    False，Agent 照舊整段印出——**Pipeline 因此不需要自己判斷會不會串流**，
+    該判斷留在 LLMClient 一處。另可避免呼叫失敗時畫面留下孤零零的前綴。
     """
 
     def __init__(self, prefix: str, trailing: str = "\n") -> None:
@@ -76,14 +71,11 @@ class _StreamSink:
 class Pipeline:
     """不負責模組的建立與連線（那是 Agent 的職責），只負責呼叫順序與分流邏輯。"""
 
-    # 壓縮期間畫面完全沒有動靜，看起來像當機（實測時使用者因此連按 Enter）。
-    # 抽成常數是因為兩條路徑都要用（輪次收尾與離場），分開寫會在改秒數時漏一邊。
+    # 壓縮期間畫面完全沒有動靜，看起來像當機。兩條路徑共用（輪次收尾與離場）。
     COMPRESS_WAIT_MESSAGE = "[整理記憶中，約需 20～30 秒，請稍候……]"
 
-    # 串流輸出的前後綴，對齊 agent.py 既有的 emit(f"\n奧狐：{reply}\n") 格式
-    # （emit 自帶 end="\n"，故非串流路徑的實際輸出是前一空行 + 內容 + 後一空行）。
-    # ⚠️ 兩處必須逐字元一致，否則開關 stream 時畫面行距會跳動。
-    #    名字由 PERSONA_CONFIG["name"] 取，不寫死。
+    # 串流輸出的前後綴。⚠️ 必須與 agent.py 的非串流輸出格式逐字元一致，
+    # 否則開關 stream 時畫面行距會跳動。
     REPLY_PREFIX = f"\n{PERSONA_CONFIG['name']}："
     REPLY_TRAILING = "\n\n"
 
@@ -115,17 +107,12 @@ class Pipeline:
         """
         找出對應的 handler 與參數字串，找不到回傳 None。
 
-        由長至短逐段比對，因為指令 key 本身就含空白（"/mode t"、"/proactive on"）。
-        單純取第一段會讓 "/proactive on" 誤命中不存在的 "/proactive"；完整比對
-        優先，也確保多段指令不會被當成短指令加參數。
+        由長至短逐段比對，因為指令 key 本身含空白（"/mode t"）。取第一段會讓
+        "/proactive on" 誤命中不存在的 "/proactive"。
 
-        ⚠️ takes_arg 機制目前**沒有任何使用者**——唯一用到它的 "/proactive test"
-        已於 2026-08-16 隨腳手架清理移除（C4）。保留的理由是刪除要同時改動
-        _commands 的值格式、本方法與 handle_command()，而留著的成本是一個 bool。
-        新增帶參數的指令時直接登記 takes_arg=True 即可。
-
-        ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫。日後若加入大小寫敏感的參數，
-        需改由原始輸入取。
+        ⚠️ takes_arg 目前無任何使用者（C4 清理後），留著的成本是一個 bool；
+        新增帶參數的指令時登記 takes_arg=True 即可。
+        ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫；需大小寫敏感時改由原始輸入取。
         """
         key = self._key(user_input)
         parts = key.split()
@@ -144,13 +131,10 @@ class Pipeline:
         """
         供啟動訊息列出可用指令。
 
-        ⚠️ 存在理由是消滅第三份真相：先前 agent.py 的啟動訊息把指令名稱寫成字面
-        字串，與 _commands 各自維護。2026-08-16 刪除 /proactive test 時該處沒跟著
-        改，使用者照著提示打會靜默落入對話分支——這與檔頭記載的 is_command /
-        handle_command 雙清單是同一個坑，只是跨了檔案所以更難察覺。
+        ⚠️ 存在理由是消滅第三份真相——agent.py 的啟動訊息不得再寫字面清單。
 
-        排序照登記順序（Python 3.7+ dict 有序），不另外排序：登記順序本身就是
-        依相關性分組的，字母序反而讓 /mode 與 /proactive 打散。
+        排序照登記順序（dict 有序），不另外排序：登記順序依相關性分組，
+        字母序會讓 /mode 與 /proactive 打散。
         """
         return list(self._commands.keys())
 
@@ -173,10 +157,8 @@ class Pipeline:
     # ── 指令 handler（簽名統一為 (state, voice_input_factory, arg)）─
 
     def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
-        # 離場壓縮同樣是一次完整的 LLM 呼叫（實測 17～25 秒），且 quit 之後
-        # 使用者更傾向認為程式已經在關了，卡住不動的誤判機率比一般輪次更高。
         # ⚠️ compress_on_exit() 不檢查 needs_compress()，只要 working_memory
-        # 非空就壓縮——講兩句話就退出也會等，故條件只看「有沒有東西要壓」。
+        # 非空就壓縮——講兩句話就退出也會等，故此處條件只看「有沒有東西要壓」。
         if self.memory.working_memory and not self.memory.test_mode:
             console.emit(self.COMPRESS_WAIT_MESSAGE)
 
@@ -268,9 +250,8 @@ class Pipeline:
         """
         呼叫 LLM 並在支援時逐段印出。回傳 (完整回應, 是否已印出)。
 
-        ⚠️ close() 放在 finally：串流中途拋例外若沒還原 console 的串流狀態，
-        之後所有 emit() 都會停在「不重畫提示」的模式，輸入提示從此消失，
-        而且症狀看起來像當機而不是像例外。
+        ⚠️ close() 必須放在 finally：串流中途拋例外若沒還原 console 的串流狀態，
+        之後所有 emit() 都停在「不重畫提示」模式，症狀看起來像當機而非例外。
         """
         sink = _StreamSink(self.REPLY_PREFIX, self.REPLY_TRAILING)
         try:
@@ -296,11 +277,11 @@ class Pipeline:
         """
         視 Working Memory 長度決定是否壓縮記憶。
 
-        ⚠️ 必須由 Agent 在回應「已經輸出之後」呼叫，這是本方法存在的唯一理由——
-        壓縮是一次完整的 LLM 呼叫（實測 20～30 秒），放在輸出前會直接落在
-        使用者等待的路徑上。目前仍為同步執行，尖峰只是被移到下一次輸入之前。
+        🔴 必須由 Agent 在回應「已經輸出之後」呼叫——這是本方法存在的唯一理由。
+        壓縮是一次完整的 LLM 呼叫，放在輸出前會直接落在使用者等待的路徑上。
+        目前仍為同步執行，尖峰只是被移到下一次輸入之前。
 
-        壓縮失敗不得中斷主流程：它是輔助功能，不該讓一次失敗拖垮對話。
+        壓縮失敗不得中斷主流程。
         """
         try:
             if self.memory.needs_compress():
@@ -319,33 +300,25 @@ class Pipeline:
         EVENT_CONFIG["observation_role"] 指定的角色帶入。與 handle_turn() 相同，
         此處只追加記憶不壓縮。
 
-        ⚠️ role 現行值為 "tool"，不是 "system"。LM Studio 有 role 白名單擋在
-        chat_template 之前，"observation" 與 "ipython" 皆送不出去；白名單內的
-        "tool" 會被 jinja 渲染成 <|start_header_id|>ipython，與訓練端
-        LLaMA-Factory 的 format_observation 輸出一致。見《決策脈絡歸檔》二十二之4。
+        🔴 role 的現行值、待定狀態與兩套 role 定義交錯的問題，唯一記載在
+        config.EVENT_CONFIG["observation_role"]，此處不複述——改動前讀該處。
 
         情境訊息只存在於這次呼叫，不寫入 Working Memory。
         ⚠️ 已知會造成兩個症狀（連續觸發時模型照抄前一組回應、`_compress` 讀不到
         情境導致摘要抓不到事件）。待 observation 類訓練資料就緒後重新評估——
         模型學到「U 空時看情境說話」可能即可壓過複製傾向，故不預先修。
-        見《決策脈絡歸檔》二十之7 之5、二十二之7。
 
-        情境訊息一律 append 在歷史「之後」、緊鄰生成點。prompt cache 是 token
-        序列的最長共同前綴比對，變動內容排在最尾端時，分岔點之後只需重算情境與
-        空 user；若前移到歷史之前，整段歷史都會被牽連重算，且代價隨對話變長而
-        增大。訓練端只能把 system 放在最前面、無法表達此結構，這正是情境必須走
-        observation role 的原因，見《決策脈絡歸檔》二十二之3。
+        🔴 情境訊息一律 append 在歷史「之後」、緊鄰生成點，順序不可前移。
+        prompt cache 比對的是最長共同前綴，變動內容排最尾端時分岔點之後只需重算
+        情境與空 user；前移則整段歷史被牽連重算，代價隨對話變長而增大。
+        同一原理見 memory_manager.get_context()。
 
-        ⚠️ placeholder、suffix、role 皆由 config 帶入，不寫死在此：訓練端格式
-        若再變動，推理端只需改 config 一處。
+        ⚠️ placeholder、suffix、role 皆由 config 帶入，不寫死在此。
 
-        ⚠️ **observation 輪次不查 RAG——這是目前的實際行為，但尚未確認是否應該
-        如此**（2026-08-03 程式碼審查 I-2 提出）。傳給 get_context() 的是空的
-        placeholder，該方法的 `if user_input:` 因此跳過 RAG 查詢，即使
-        description 本身（例如「邪狼剛才在 VS Code 待了快 40 分鐘」）其實是
-        可用的檢索字串。暫不改動的理由：RAG 查詢實測約 2 秒，加在這條本來就慢的
-        路徑上，而「observation 需不需要長期記憶」尚未被驗證，屬 ① 類。
-        改動前請先確認收益，不要當成 bug 直接「修好」。
+        ⚠️ **observation 輪次不查 RAG，這是實際行為但尚未確認是否應該如此。**
+        傳給 get_context() 的是空 placeholder，該方法的 `if user_input:` 因此
+        跳過查詢，即使 description 本身是可用的檢索字串。屬 ① 類，暫不改動——
+        改動前先確認收益，不要當成 bug 直接「修好」。
         """
         placeholder = EVENT_CONFIG["user_placeholder"]
         suffix = EVENT_CONFIG["observation_prompt_suffix"]
