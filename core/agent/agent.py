@@ -8,11 +8,11 @@ Agent（中央控制核心 / Single Control Point）
     - 驅動主迴圈：從 event_queue 取事件 → 依 kind 分流 → 輸出 / 驅動 VTube / 結束
 
 「該怎麼處理這個事件」的決策細節屬於 Pipeline，Agent 不介入。
-拆分理由與例外記錄見《決策脈絡歸檔》六之6、十四章。
+拆分理由與例外記錄見《歸檔》F0006。
 
 ⚠️ event_queue.get() 是所有事件的唯一取用點，仲裁層即建於此（_arbitrate）。
    新增仲裁規則一律加在該方法內，不得在各 producer 內分頭決定要不要發言
-   （分散決策點的失效案例見十一之3）。
+   （分散決策點的失效案例見《歸檔》L0005）。
 """
 
 from __future__ import annotations
@@ -31,12 +31,9 @@ from core.agent.pipeline import Pipeline
 from core.agent.events import Event, UTTERANCE, OBSERVATION
 from core.producers.window_watcher import WindowWatcher
 from core import console
-# ⚠️ 從 ctrl_stream_signal 取，不是從 voice_input 取。後者會在模組層級把整個
-# 語音棧（faster_whisper ~6s、torch ~4s）載進來，而文字模式完全用不到——
-# 實測 import core.voice_input 需 5.7 秒，且會讓下方 _voice_input_factory()
-# 的「惰性建立」失效（函式內的 import 只是查 sys.modules）。
-# 見《決策脈絡歸檔》三十二章。
-from core.ctrl_stream_signal import VoiceModeExit
+# 從 ctrl_signals 取，不是從 voice_input 取：後者會在模組層級拉進整個語音棧，
+# 使下方 _voice_input_factory() 的惰性建立失效（函式內 import 只是查 sys.modules）。
+from core.ctrl_signals import VoiceModeExit
 
 logger = setup_logger("Agent")
 
@@ -69,10 +66,8 @@ class Agent:
     def _voice_input_factory():
         """惰性建立，文字模式使用者不必載入語音模型。
 
-        ⚠️ 這個惰性只有在**本檔沒有任何其他地方於模組層級 import
-        core.voice_input** 的前提下才成立——函式內的 import 遇到已載入的
-        模組只是查 sys.modules，一毛錢都省不到。2026-08-06 之前正是如此
-        （VoiceModeExit 從 voice_input 取），本 docstring 當時是假的。
+        ⚠️ 前提是本檔模組層級沒有任何路徑會先載入 core.voice_input，
+        否則此處 import 只是查 sys.modules，一毛錢都省不到。
         """
         from core.voice_input import VoiceInput
         return VoiceInput(model_size="small", language="zh")
@@ -181,7 +176,7 @@ class Agent:
 
         這是系統中唯一的仲裁點——它成立的前提是 event_queue.get() 是唯一取用點。
         規則若下放到各 producer 自行判斷，多來源時必然出現同時輸出
-        （Lumi_Nox 失效案例，見《決策脈絡歸檔》十一之1、十一之3）。
+        （Lumi_Nox 失效案例，見《歸檔》L0005）。
 
         現行兩條規則，皆只作用於 observation：
           1. proactive 開關關閉 → 不處理

@@ -146,7 +146,13 @@ class MemoryManager:
         return False
 
     def get_context(self, user_input: str = "") -> list[dict]:
-        """組裝 context：Compressed Memory（若有）→ RAG 查詢結果（若有相關）→ 當前對話。"""
+        """組裝 context：Compressed Memory → Working Memory → RAG 查詢結果。
+
+        ⚠️ 順序依「變動頻率由低到高」排列，不可任意調換：prompt cache 比對的是
+        最長共同前綴，任何一段內容變動，其後全部要重新 prefill。RAG 每輪依
+        user_input 重查、內容每輪都不同，排在 Working Memory 之前會使 WM 永遠
+        落在斷點之後、永遠無法重用。同一原理見 pipeline.handle_observation()。
+        """
         with timed("記憶組裝"):
             context = []
 
@@ -155,6 +161,8 @@ class MemoryManager:
                     "role": "system",
                     "content": f"[過去對話摘要]\n{self.compressed_memory}"
                 })
+
+            context.extend(self.working_memory)
 
             if user_input:
                 rag_results = self.rag.query(user_input)
@@ -168,8 +176,6 @@ class MemoryManager:
                 else:
                     logger.debug("無相關 RAG 記憶，跳過注入。")
 
-            context.extend(self.working_memory)
-
         return context
 
     # ── 記憶壓縮 ─────────────────────────────────
@@ -182,7 +188,7 @@ class MemoryManager:
         句數上限）——區分只增加 LLM 誤判風險，兩者最終都存進同一個地方。
 
         prompt 的三條規則各自對應一個實測踩過的失敗模式，改動前請先看
-        《決策脈絡歸檔》五之2：
+        《歸檔》D0001：
           規則一 未提及內容預設保留 → 防資訊無聲消失
           規則二 禁止逐字複製對話原文 → 防記憶變成自我強化的複述錨點
           規則三 禁止推測填充 → 防取捨順序被讀成必填欄位模板
