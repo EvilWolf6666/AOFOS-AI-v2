@@ -4,7 +4,8 @@
 import os
 import uuid
 
-from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K, TEST_CONFIG, TEST_MODE
+from config import (RAG_INCLUDE_SEED, RAG_SIMILARITY_THRESHOLD, RAG_TOP_K,
+                    TEST_CONFIG, TEST_MODE)
 
 # ⚠️ chromadb 刻意不在此 import，見 _init_backend()。
 from core.logger import setup_logger, timed
@@ -22,7 +23,7 @@ SOURCE_SEED = "seed"              # 人工撰寫的世界觀，由 tools/seed_ra
 # 退場機制。RAG 是唯一沒有下一層可退的記憶層——Working Memory 會滾掉、
 # Compressed Memory 靠 _compress 整合覆寫，而 RAG 進來就永遠在。過期的知識
 # （例如「她看不到畫面」在 VL 接上之後）留在庫裡會與新事實一起被召回，變成
-# 矛盾注入，且沒有任何訊號提示該刪它。見《歸檔》二十九之3、三十之2。
+# 矛盾注入，且沒有任何訊號提示該刪它。見《歸檔》K0001、E0005。
 #
 # ⚠️ 只做「寫入欄位 + 查詢過濾」這一半。下線的 setter、觸發條件與介面刻意不做：
 #    欄位已經在每一列上，之後補寫 setter 不需要資料遷移；而現在做要猜「什麼時候
@@ -54,7 +55,7 @@ class RAGManager:
         永遠不會被呼叫，而 `import chromadb` 實測 2.8～7.4 秒（雜訊大，只能看
         量級）。放在模組層級的話，即使 RAG 全程停用也照付這筆錢——那正是
         本檔檔頭「測試模式下完全用不到，沒必要付這個成本」想避免的事，
-        原本卻只做到一半。見《決策脈絡歸檔》三十二之2。
+        原本卻只做到一半。見《歸檔》I0028。
 
         ⚠️ 這裡的 import 必須排在 config 被載入之後才有意義（config 頂部設定
         HF_HUB_OFFLINE，而 huggingface_hub 在 import 當下把它讀成模組常數）。
@@ -83,7 +84,8 @@ class RAGManager:
             # 固定，事後無法修改，換空間需刪除整個 data/chroma_db 資料夾重建。
             metadata={"hnsw:space": "cosine"},
         )
-        logger.info(f"RAG 初始化完成（目前 {self.collection.count()} 筆）。")
+        seed_state = "含種子" if RAG_INCLUDE_SEED else "**種子已隔離停用**"
+        logger.info(f"RAG 初始化完成（目前 {self.collection.count()} 筆，檢索範圍：{seed_state}）。")
 
     def set_enabled(self, enabled: bool):
         """供 /test 指令在執行期切換。關閉時不銷毀既有連線，只是不再查詢/寫入。"""
@@ -105,7 +107,7 @@ class RAGManager:
         `text` 是拿去比對的索引文本，`answer` 是實際要注入模型的內容。
         兩者分開的理由：使用者的查詢永遠是問句，索引文本若也是問句，兩邊
         同分佈，相似度的絕對值才有意義（實測 0.437 → 0.760）。但問句不該
-        被注入模型，所以答案另存 metadata。見《歸檔》三十之1。
+        被注入模型，所以答案另存 metadata。見《歸檔》E0004。
 
         `answer` 省略時（`_compress` 淘汰內容即是）查詢端會退回傳 `text` 本身，
         故淘汰路徑的呼叫端一行都不用改。
@@ -134,13 +136,21 @@ class RAGManager:
 
     # ── 查詢知識（含相似度門檻）─────────────────
 
+    @staticmethod
+    def _build_where() -> dict:
+        """檢索階段的 metadata 過濾條件。單一組裝點，不在呼叫端各自拼。"""
+        if RAG_INCLUDE_SEED:
+            return {RETIRED_FIELD: False}
+        return {"$and": [{RETIRED_FIELD: False}, {"source": {"$ne": SOURCE_SEED}}]}
+
+
     def query(self, text: str) -> list[str]:
         """查詢最相關的知識，回傳實際要注入的內容（有 answer 者回 answer）。
 
         ⚠️ RAG_SIMILARITY_THRESHOLD 的職責是**地板不是閘門**。實測 recall@3 與
         MRR 都是滿分——排序本身已經正確，門檻的工作只剩「擋掉整個查詢與知識庫
         無關的情況」（例如問天氣）。當成閘門用會砍掉已經排對的結果，這正是
-        0.7 造成 0/15 的原因。見《歸檔》三十之1。
+        0.7 造成 0/15 的原因。見《歸檔》E0004。
 
         ⚠️ 依 answer 去重：一個答案可掛多個問句，不去重的話三個同義問句會佔滿
         TOP_K，實際只回到一則知識，recall 反而下降。故多取候選再去重。
@@ -160,9 +170,13 @@ class RAGManager:
                 # 多取候選：同一答案可能掛多個問句，去重後才湊得滿 TOP_K
                 n_results=min(RAG_TOP_K * 3, count),
                 include=["documents", "distances", "metadatas"],
-                # 已下線的知識在檢索階段就排除，不是撈回來再過濾——一旦進了
-                # 上下文就很難保證不以某種形式洩漏進回答裡
-                where={RETIRED_FIELD: False},
+                # ⚠️ 過濾一律下在檢索階段，不是撈回來再篩。兩個理由不同但同樣硬：
+                #    已下線的知識一旦進了上下文，就很難保證不以某種形式洩漏進回答；
+                #    而種子若撈回來再篩，n_results 的名額會先被它佔滿，
+                #    過濾完剩不到 TOP_K——那是「看起來有過濾、實際砍掉召回」。
+                # ⚠️ 種子條件寫 `$ne SEED` 而非 `$eq EVICT`：缺 source 欄位的舊資料
+                #    依慣例視為淘汰內容，用後者會把它們一併漏掉。
+                where=self._build_where(),
             )
 
         docs = results["documents"][0] if results["documents"] else []
@@ -174,7 +188,9 @@ class RAGManager:
         for doc, distance, meta in zip(docs, distances, metas):
             similarity = 1 - distance
             if similarity < RAG_SIMILARITY_THRESHOLD:
-                logger.debug(f"RAG 過濾（相似度 {similarity:.2f}）：{doc[:30]}...")
+                # ⚠️ 這裡印的是**索引文本**（多為問句），命中那行印的是 answer。
+                #    兩者是同一筆知識的兩面，不標明會被誤讀成庫裡塞滿問句條目。
+                logger.debug(f"RAG 過濾（相似度 {similarity:.2f}，索引文本）：{doc[:30]}...")
                 continue
 
             meta = meta or {}
