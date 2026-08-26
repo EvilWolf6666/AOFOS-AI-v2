@@ -33,6 +33,8 @@ class MemoryManager:
         # 測試模式改用獨立記憶檔，避免施測污染正式記憶。
         # 起始值取自 config，執行期可由 /test 指令切換（見 set_test_mode）。
         self.test_mode = TEST_MODE
+        # 逐字複製偵測的累計次數。僅本次執行有效、不落盤（見 add_turn）
+        self._verbatim_repeat_count = 0
         self.memory_path = TEST_MEMORY_PATH if TEST_MODE else NORMAL_MEMORY_PATH
         if TEST_MODE:
             logger.warning(f"TEST_MODE 啟用：記憶檔改用 {self.memory_path}")
@@ -124,8 +126,47 @@ class MemoryManager:
 
     def add_turn(self, user_input: str, assistant_reply: str):
         """只追加進 Working Memory，不觸發壓縮（壓縮時機交給呼叫端，見 maybe_compress）。"""
+        # ⚠️ 必須在 append 之前比對，之後比對必定自我命中
+        self._log_verbatim_repeat(assistant_reply)
         self.working_memory.append({"role": "user", "content": user_input})
         self.working_memory.append({"role": "assistant", "content": assistant_reply})
+
+    def _log_verbatim_repeat(self, reply: str) -> None:
+        """本輪回應若與 Working Memory 內既有 assistant 內容逐字相同，記一次。
+
+        **純診斷，刻意不改變任何行為。**《現況》12之0 記著「乾淨條件下重現之前
+        不動 F0006」，而在日常運行中累積樣本正是重現的前置——專門排一輪去釣它，
+        比讓它自己出現昂貴得多。
+
+        ⚠️ 日常運行不是 12之0 說的乾淨條件（RAG 啟用、有舊記憶），本計數只能
+        回答「頻率多高」；**`/test on` 下也觸發才是乾淨條件的證據**，故一併記
+        test_mode。
+        ⚠️ 只比對完全相同，不做相似度：部分重複另有成因，混進同一個計數會使
+        這個數字失去意義。
+        """
+        if not reply:
+            return
+
+        hit_idx = next(
+            (i for i in range(len(self.working_memory) - 1, -1, -1)
+             if self.working_memory[i].get("role") == "assistant"
+             and self.working_memory[i].get("content") == reply),
+            None,
+        )
+        if hit_idx is None:
+            return
+
+        # 相隔幾輪：只複製上一輪 = recency 效應，複製更早的 = 另一種機制。
+        # 兩者的下一步診斷方向不同，故此欄不可省。
+        turns_ago = (len(self.working_memory) - hit_idx + 1) // 2
+
+        self._verbatim_repeat_count += 1
+        logger.warning(
+            f"逐字複製：本輪回應與 {turns_ago} 輪前的回應完全相同"
+            f"（本次執行第 {self._verbatim_repeat_count} 次，"
+            f"WM {len(self.working_memory) // 2} 輪，test_mode={self.test_mode}）"
+            f"：{reply[:40]}"
+        )
 
     def needs_compress(self) -> bool:
         """僅回報是否將要壓縮，不執行。供呼叫端在壓縮前先給使用者提示。"""
@@ -332,8 +373,9 @@ class MemoryManager:
         if not self.working_memory:
             return
 
-        # 測試模式下不壓縮：評測不需要摘要，而壓縮是一次完整的 LLM 呼叫
-        # （實測 17～25 秒）；且壓縮結果會寫進測試記憶檔，成為下一題的污染源。
+        # 測試模式下不壓縮：評測不需要摘要，而壓縮是一次完整的 LLM 呼叫；
+        # 且壓縮結果會寫進測試記憶檔，成為下一題的污染源——後者才是決定性的，
+        # 耗時只是附帶。⚠️ 此處刻意不寫秒數：它會過期，且不是本判斷的依據。
         if self.test_mode:
             logger.info("測試模式：跳過離開時的記憶壓縮。")
             return

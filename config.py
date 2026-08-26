@@ -34,7 +34,7 @@ LLM_CONFIG = {
     #
     # ⚠️ 換模型流程：Eject 舊模型 → 載入新模型 → 於 GUI 重設載入層參數
     #    （見 LMSTUDIO_LOAD_PARAMS）→ 才改這一行。JIT 已關閉，順序顛倒會直接報錯。
-    "model": "aofos_v4_colab",
+    "model": "aofos_v1",
 
     # ── 標準 OpenAI 參數（以具名參數送出）──
     "temperature": 0.8,
@@ -128,6 +128,17 @@ COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user
 # RAG
 RAG_TOP_K = 3
 RAG_SIMILARITY_THRESHOLD = 0.55   # 低於此分數的查詢結果直接丟棄
+
+# 種子（人工寫的設定集）是否參與檢索。False = 隔離停用，資料仍在庫裡、不刪。
+#
+# 🔴 目前庫內 64 筆全為種子、淘汰內容 0 筆，故設 False 等同 RAG 暫時查不到東西。
+#    這是刻意的：設定集回答的是「她是誰」（persona 已常駐帶著），
+#    而 RAG 該回答的是「你和她之間發生過什麼」。見《現況》11之2。
+#
+# ⚠️ 過濾條件用「不是 seed」而非「是 compress_evict」：缺 source 欄位的舊資料
+#    依查詢端慣例視為淘汰內容，用後者會把它們一併漏掉。
+# ⚠️ 過濾必須下在向量庫層，不可取回 top_k 之後再篩——名額會先被種子佔掉。
+RAG_INCLUDE_SEED = False
 
 # 輸出後處理
 TEXT_CONFIG = {
