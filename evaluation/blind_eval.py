@@ -10,7 +10,8 @@ blind_eval.py — AOFOS 施測記錄表的盲評工具（make / merge）
   · 只用 Python 標準庫，無第三方依賴
   · 獨立指令觸發，不掛進 pipeline._commands，不進 Agent 生命週期
 
-理由同 `tools/chat_strata.py` 的判定：`tools/` 底下的腳本共用 config.py
+理由同《歸檔》C0035 對 `chat_strata.py` 的判定（⚠️ 該檔已移出程式碼庫，
+tools/ 底下現已無此檔，判定本體留在 C0035）：`tools/` 底下的腳本共用 config.py
 唯一入口，而本工具不需要任何設定值，硬接會讓一個純文字處理工具綁上
 `HF_HUB_OFFLINE` 那條啟動路徑。施測時 LM Studio 可能正載著別的模型、
 config.py 可能改到一半，本工具不該因此跑不起來。
