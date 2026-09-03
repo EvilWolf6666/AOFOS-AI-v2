@@ -4,9 +4,14 @@
 # ⚠️ 與 seed_rag.py 同，這不是診斷腳手架，不列入 core/short_time_test.py 的清理清單。
 #    每次擴充 worldview/ 之後都會再用到，沒有刪除條件。
 #
-# ⚠️ 刻意不呼叫 RAGManager.query()：那條路徑會 record_search()，跑一輪題本會讓
-#    rag_stats.json 的 searches 平白增加十幾次，污染「淘汰內容命中率」的量測
-#    （《歸檔》K0003）。本檔直接打 collection，只讀不寫。
+# ⚠️ 刻意不呼叫 RAGManager.query()，直接打 collection，只讀不寫。
+#    ⚠️ **原理由已不成立**：本行原本寫的是「避免 record_search() 讓 rag_stats.json
+#    的 searches 平白增加、污染淘汰內容命中率的量測（《歸檔》K0003）」，而 RagStats
+#    已於 2026-08-08 整組移除（《歸檔》E0013）。
+#    現行理由是本檔要算的東西：recall@k 與 MRR 需要**原始排序與 distances**，而
+#    RAGManager.query() 只回傳過濾去重後的 payload 字串，排名與相似度都取不到。
+#    ⚠️ 代價是量到的**不完全等同正式路徑**（《現況》16之1 已登記）；要比對三條路徑
+#    差異請用 tools/check_path_parity.py。
 #
 # ⚠️ 前提假設：正式路徑是用「使用者輸入原文」去查 RAG。已於 2026-08-05 確認
 #    memory_manager.py:160 為 self.rag.query(user_input)，無改寫或加料。
