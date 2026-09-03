@@ -314,6 +314,44 @@ def parse_scores(path):
     return out
 
 
+def parse_record_scores(path, titles):
+    """
+    直接從施測記錄表讀邪狼那欄，回傳 {group_index: {qid: score}}。
+
+    ⚠️ 為什麼要有這條路徑：他的分數本來就填在記錄表的 `**評分**：__/2` 裡，
+    若要求他再手抄成 `代號: 分數`，等於一邊查對照表一邊轉 24 行——
+    **抄錯不會有任何警告**，而且同一份分數會存在兩個地方。
+    這裡讓記錄表維持唯一來源。
+    """
+    score_re = re.compile(r'^\s*\*\*評分\*\*\s*[：:]\s*(\d)\s*/\s*2')
+    flag_re = re.compile(r'\[([RXNP])\]')
+    out, flags = defaultdict(dict), defaultdict(lambda: defaultdict(int))
+    gi, qid = -1, None
+    order = {t: i for i, t in enumerate(titles)}
+    unknown_titles = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            m = GROUP_RE.match(line)
+            if m:
+                t = m.group(1).strip()
+                gi = order.get(t, -1)
+                if gi < 0:
+                    unknown_titles.append(t)
+                qid = None
+                continue
+            m = QID_RE.match(line)
+            if m:
+                qid = m.group(1)
+                continue
+            if gi >= 0 and qid:
+                for f in flag_re.findall(line):
+                    flags[gi][f] += 1
+            m = score_re.match(line)
+            if m and gi >= 0 and qid:
+                out[gi][qid] = int(m.group(1))
+    return out, unknown_titles, flags
+
+
 def cmd_merge(args):
     if not os.path.isfile(args.key):
         print(f'🔴 找不到對照表：{args.key}', file=sys.stderr)
@@ -326,31 +364,52 @@ def cmd_merge(args):
     qids = sorted({c.rsplit('-', 1)[0] for c in key['map']})
     scored_qids = [q for q in qids if q[0] in SCORED_PREFIXES]
 
-    raters = OrderedDict()
-    for p in args.scores:
+    # {rater: {gi: {qid: score}}}
+    table, unknown, missing = OrderedDict(), [], []
+
+    # 來源一：記錄表（未盲，邪狼那欄）。組別標題直接對應，不經代號。
+    if args.record:
+        if not os.path.isfile(args.record):
+            print(f'🔴 找不到記錄表：{args.record}', file=sys.stderr)
+            return 2
+        rec, bad_titles, flags = parse_record_scores(args.record, titles)
+        if bad_titles:
+            print('🔴 記錄表裡的組別標題不在對照表中，兩者不是同一輪：', file=sys.stderr)
+            for t in bad_titles:
+                print(f'   組別：{t}', file=sys.stderr)
+            return 1
+        name = os.path.splitext(os.path.basename(args.record))[0] + '（記錄表）'
+        table[name] = rec
+
+    else:
+        flags = None
+
+    # 來源二：盲評版填答區或純分數檔（每位盲評者一份）
+    for p in args.scores or []:
         if not os.path.isfile(p):
             print(f'🔴 找不到分數檔：{p}', file=sys.stderr)
             return 2
-        raters[os.path.splitext(os.path.basename(p))[0]] = parse_scores(p)
-
-    if not raters:
-        print('🔴 沒有給任何分數檔。', file=sys.stderr)
-        return 1
-
-    # {rater: {gi: {qid: score}}}
-    table = {r: defaultdict(dict) for r in raters}
-    unknown, missing = [], []
-    for r, scores in raters.items():
+        r = os.path.splitext(os.path.basename(p))[0]
+        scores = parse_scores(p)
+        table[r] = defaultdict(dict)
         for code, val in scores.items():
             gi = key['map'].get(code)
             if gi is None:
                 unknown.append(f'{r}: {code}')
                 continue
             table[r][gi][code.rsplit('-', 1)[0]] = val
+
+    if not table:
+        print('🔴 沒有給任何分數來源（--record / --scores 至少要有一個）。',
+              file=sys.stderr)
+        return 1
+
+    raters = table  # 下游沿用同一個名字
+    for r in table:
         for q in scored_qids:
-            for n in range(1, len(titles) + 1):
-                if f'{q}-{n}' not in scores:
-                    missing.append(f'{r}: {q}-{n}')
+            for gi in range(len(titles)):
+                if table[r][gi].get(q) is None:
+                    missing.append(f'{r}: {titles[gi]} / {q}')
 
     if unknown:
         print('🔴 下列代號不在對照表裡（打錯或對到別輪的對照表）：', file=sys.stderr)
@@ -425,6 +484,16 @@ def cmd_merge(args):
     else:
         print('⚠️ 只有一位評分者，門檻升一級：≥5 分為 90% 信心、≥6 分為 95%。')
 
+    if flags:
+        names = {'R': '角色反轉', 'X': '語法破碎', 'N': '稱謂疊用', 'P': '無情境第三人稱'}
+        if any(flags[gi] for gi in range(len(titles))):
+            print()
+            print('── 語言瑕疵標記（不計分，來自記錄表備註）──')
+            print(f'{"組別":<14}' + ''.join(f'{v:<12}' for v in names.values()))
+            for gi, t in enumerate(titles):
+                print(f'{t:<14}' + ''.join(f'{flags[gi].get(k, 0):<12}' for k in names))
+            print('⚠️ 四種是不同的病，不要相加。`[P]` 需判斷情境，是唯一不能純字面判定的。')
+
     print()
     print('── 對照表 ──')
     for gi, t in enumerate(titles):
@@ -452,8 +521,11 @@ def main():
 
     mg = sub.add_parser('merge', help='對照表 ＋ 分數檔 → 開盲、合併、算差距')
     mg.add_argument('--key', required=True, help='make 產出的 .對照表.json')
-    mg.add_argument('--scores', nargs='+', required=True,
-                    help='填好的盲評版或純分數檔，可給多個（每人一份）')
+    mg.add_argument('--record', default=None,
+                    help='填好的施測記錄表 .md，直接讀其中的 `**評分**：n/2`'
+                         '（未盲那一欄，免手抄）')
+    mg.add_argument('--scores', nargs='*', default=[],
+                    help='填好的盲評版或純分數檔，可給多個（每位盲評者一份）')
     mg.set_defaults(func=cmd_merge)
 
     args = ap.parse_args()
