@@ -35,7 +35,7 @@ def fix_traditional(text: str) -> str:
     原本的量測方式是「開著 DIAGNOSTICS['log_opencc_changes'] 看它有沒有動作」，
     但那條判讀規則（有 diff = opencc 有價值）**本身沒有被驗證過**：s2* 系列對
     「已經是繁體」的輸入不是 no-op，diff 有可能正是它把本來就對的字改壞。
-    直接看關掉後的輸出裡有沒有簡體字，才是在量真正要量的東西。見《歸檔》一之14。
+    直接看關掉後的輸出裡有沒有簡體字，才是在量真正要量的東西。見《歸檔》A0014。
 
     ⚠️ 關閉走早退，不是移除——opencc 的 import 與 _converter 建立一律保留在
     模組層級。恢復只需把 config 那個布林改回 True，不必回頭動三個檔案。

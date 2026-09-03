@@ -19,7 +19,7 @@ _EXTRA_BODY_KEYS = ("top_k", "repeat_penalty", "min_p")
 
 # context 用量（prompt + max_tokens）達此比例即警告。
 # 不放進 config：這個值不會為了改變行為而被調整，只在換模型／context 變動時
-# 重新檢視一次（判準見《歸檔》十九之3）。
+# 重新檢視一次（判準見《歸檔》I0010）。
 _CONTEXT_WARN_RATIO = 0.85
 
 

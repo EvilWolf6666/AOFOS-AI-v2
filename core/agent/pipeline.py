@@ -112,7 +112,7 @@ class Pipeline:
         由長至短逐段比對，因為指令 key 本身含空白（"/mode t"）。取第一段會讓
         "/proactive on" 誤命中不存在的 "/proactive"。
 
-        ⚠️ takes_arg 目前無任何使用者（C4 清理後），留著的成本是一個 bool；
+        ⚠️ takes_arg 目前無任何使用者（《現況》第八章 C4 清理後），留著的成本是一個 bool；
         新增帶參數的指令時登記 takes_arg=True 即可。
         ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫；需大小寫敏感時改由原始輸入取。
         """

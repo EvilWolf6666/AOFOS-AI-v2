@@ -184,17 +184,17 @@ EVENT_CONFIG = {
     #    引導句，推理端結構須與訓練端一致。非空值會把情境框成「有人在跟妳講話」。
     "observation_prompt_suffix": "",
 
-    # 情境訊息的 role 名稱。🔴 待定，值暫時不動（《現況》P18）。
+    # 情境訊息的 role 名稱。🔴 待定，值暫時不動（《現況》第八章 P18）。
     #
     # ⚠️ 兩套 role 定義交錯，交集裡沒有兩邊都正確的選項：
     #      "ipython" 過不了 LM Studio 白名單（400，實測）
     #      "tool"    非 Llama-3.1 合法 role，且 v4 的 template 把它原樣插進 header
     #                （渲染出 <|start_header_id|>tool，模型沒見過）
     #    v3 曾有 tool → ipython 映射分支，v4 沒有——依 v3 時代的推理做決定會出錯。
-    # ⚠️ 讀完 P18 之前不要改這個值。
+    # ⚠️ 讀完《現況》第八章 P18 之前不要改這個值。
     "observation_role": "tool",
 
-    # 註："test_observations" 腳手架已移除（C4）。日後若再需要手動注入情境，
+    # 註："test_observations" 腳手架已移除（《現況》第八章 C4）。日後若再需要手動注入情境，
     #     正確做法是新增 producer 而非加回腳手架——路徑必須與真實事件相同。
 }
 
@@ -319,7 +319,7 @@ TIMING_CONFIG = {
 
 DIAGNOSTICS = {
     # ⚠️ 現行目的：換模型後判斷 opencc 這一層還需不需要（舊目的「釐清異體字來源」
-    #    已達成且證偽）。見 C1。
+    #    已達成且證偽）。見《現況》第八章 C1。
     "log_opencc_changes": True,
     "dump_observation_messages": True, # 印出 observation 輪次送出的完整 messages
 }
