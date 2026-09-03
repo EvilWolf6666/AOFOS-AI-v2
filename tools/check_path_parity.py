@@ -10,7 +10,16 @@
 #    與「程式碼有 bug」的修法完全相反。
 #
 # ⚠️ 唯讀：不呼叫 add()／delete()／upsert()。B 路徑會真的跑 RAGManager.query()，
-#    但 RagStats 已於本輪移除，不再有統計副作用。
+#    但 RagStats 已於 2026-08-08 移除（《歸檔》E0013），不再有統計副作用。
+#
+# 🔴 **三條路徑一律套用同一組 metadata 過濾條件，且來源是 RAGManager._build_where()。**
+#    2026-09-03 修正：A 與 C 原本寫死 `where={retired: False}`，而 B 走
+#    _build_where()——`RAG_INCLUDE_SEED = False` 上線後兩者不再相同，A 會撈到種子、
+#    B 不會。此時「B 少了高分項」是**正確行為**，而下方判讀提示原本把它寫成
+#    「RAGManager.query() 有 bug」——⚠️ **那條提示已經是偽陽性製造機**，不是理論風險。
+#    ⚠️ 這裡刻意呼叫 RAGManager 的私有方法而不是抄一份條件：本檔要回答的是
+#    「正式路徑做了什麼」，依單一來源判準必須共用；獨立實作只保留給 C 的**排序**
+#    （暴力餘弦＝標準答案），過濾條件不在獨立實作的射程內。
 #
 # 用法（於專案根目錄執行）：
 #     python -m tools.check_path_parity
@@ -23,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config  # noqa: F401,E402  ← HF_HUB_OFFLINE 必須在 huggingface_hub 之前生效
 from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K  # noqa: E402
-from core.rag_manager import RAGManager, RETIRED_FIELD  # noqa: E402
+from core.rag_manager import RAGManager  # noqa: E402
 
 DEFAULT_Q = "妳叫什麼名字"
 REPEATS = 3
@@ -43,8 +52,10 @@ def main():
 
     count = rag.collection.count()
     n_req = min(RAG_TOP_K * 3, count)
+    where = rag._build_where()   # 三條路徑共用，不各自拼
     print(f"\n查詢：{q}")
     print(f"庫內 {count} 筆　n_results={n_req}　門檻 {RAG_SIMILARITY_THRESHOLD}　TOP_K {RAG_TOP_K}")
+    print(f"過濾條件（三路共用）：{where}")
 
     # ── A. collection.query()，同一進程內重複多次 ──────────────
     runs = []
@@ -53,7 +64,7 @@ def main():
             query_texts=[q],
             n_results=n_req,
             include=["documents", "distances", "metadatas"],
-            where={RETIRED_FIELD: False},
+            where=where,
         )
         rows = [
             (1 - dist, doc, (meta or {}).get("answer") or doc)
@@ -95,7 +106,8 @@ def main():
     try:
         import numpy as np
 
-        all_rows = rag.collection.get(include=["documents", "embeddings", "metadatas"])
+        # ⚠️ get() 也要帶 where：C 是 A 的標準答案，候選集合不同就沒有可比性
+        all_rows = rag.collection.get(where=where, include=["documents", "embeddings", "metadatas"])
         mat = np.asarray(all_rows["embeddings"], dtype=float)
         qv = np.asarray(rag.embedding_fn([q])[0], dtype=float)
 
@@ -136,6 +148,8 @@ def main():
     print("  · A 同進程相同、但與跨進程觀察到的不同 → 進程間差異（索引載入順序等）")
     print("  · A 與 C 集合不同         → HNSW 近似誤差，非程式碼問題")
     print("  · A 與 C 一致但 B 少了高分項 → RAGManager.query() 有 bug，我改壞了")
+    print("     ⚠️ 前提是三路過濾條件相同（上方已印出）。若日後又有人把 A 或 C 的")
+    print("        where 寫死回去，這一條會把『B 正確地過濾掉種子』誤判成 bug。")
     print("─" * 70 + "\n")
 
 

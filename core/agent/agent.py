@@ -21,7 +21,8 @@ import threading
 import time
 from typing import Optional
 
-from config import ARBITRATION_CONFIG, PERSONA_CONFIG
+# PERSONA_CONFIG 已不在此使用：回應前後綴改由 Pipeline.REPLY_PREFIX/TRAILING 單一來源提供
+from config import ARBITRATION_CONFIG
 from core.llm_client import LLMClient
 from core.persona import Persona
 from core.memory_manager import MemoryManager
@@ -96,6 +97,21 @@ class Agent:
         self.state.text_input_thread = None
 
     # ── 輸出端副作用 ─────────────────────────────────────────────────
+
+    def _emit_reply(self, reply: str) -> None:
+        """
+        非串流路徑的回應輸出。
+
+        🔴 **前後綴一律取自 Pipeline，不在此重寫。** 兩條路徑的畫面格式必須逐字元
+        一致，否則開關 stream 時行距會跳動——而那看起來像程式出了問題，會誘使人
+        去查一個不存在的 bug（同 console.end_stream() 的註解）。
+        ⚠️ 這裡原本是手寫的 f"\n{名字}：{回應}\n" 加一行「改動需兩處同步」的註解，
+        也就是**同一個格式有兩份真相、只靠紀律維持**。依《現況》20之0——
+        **副本數才是變因，同步紀律不是**——2026-09-03 改為單一來源。
+        """
+        console.emit(
+            f"{Pipeline.REPLY_PREFIX}{reply}{Pipeline.REPLY_TRAILING}", end=""
+        )
 
     def _drive_vtube_on_reply(self) -> None:
         if self.vtube:
@@ -218,9 +234,8 @@ class Agent:
         result = self.pipeline.handle_observation(event.payload)
         if result.reply:
             # printed=True 代表回應已在生成過程中逐段印出（串流），再印一次會出現兩遍。
-            # 格式與 Pipeline.REPLY_PREFIX / REPLY_TRAILING 對齊，改動需兩處同步。
             if not result.printed:
-                console.emit(f"\n{PERSONA_CONFIG['name']}：{result.reply}\n")
+                self._emit_reply(result.reply)
             logger.debug(f"奧狐主動發起：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()
@@ -243,7 +258,7 @@ class Agent:
         result = self.pipeline.handle_turn(text)
         if result.reply:
             if not result.printed:
-                console.emit(f"\n{PERSONA_CONFIG['name']}：{result.reply}\n")
+                self._emit_reply(result.reply)
             logger.debug(f"奧狐回應：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()

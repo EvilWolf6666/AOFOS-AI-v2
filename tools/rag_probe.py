@@ -13,8 +13,23 @@
 #    ⚠️ 代價是量到的**不完全等同正式路徑**（《現況》16之1 已登記）；要比對三條路徑
 #    差異請用 tools/check_path_parity.py。
 #
-# ⚠️ 前提假設：正式路徑是用「使用者輸入原文」去查 RAG。已於 2026-08-05 確認
-#    memory_manager.py:160 為 self.rag.query(user_input)，無改寫或加料。
+# 🔴 **本檔刻意不套用種子過濾（`RAG_INCLUDE_SEED`），這是有意義的分岔，不是漏改。**
+#    本檔量的是**檢索側品質**——「這則世界觀寫成這樣、被這樣問的時候撈不撈得到」，
+#    每次擴充 worldview/ 之後都要看。若跟著正式路徑把種子濾掉，題本會全數命中 0、
+#    工具直接失效，而失效的原因與它要量的東西無關。
+#    ⚠️ **代價：`RAG_INCLUDE_SEED = False` 時本檔的 recall@k／MRR 不描述正式路徑的任何
+#    行為**——那邊一筆種子都不會回傳。故啟動時強制印出落差警告（見 main()），
+#    不靠人讀到這段註解。
+#    ⚠️ **與 tools/check_path_parity.py 的處置相反是刻意的**：那支要回答「正式路徑做了
+#    什麼」，依單一來源判準必須共用 `_build_where()`；本檔要回答「該撈的撈不撈得到」。
+#    📌 本檔的長期定位跟著《現況》11之2「種子的長期去留」那個未裁決項走。
+#
+# ⚠️ 前提假設：正式路徑是用「使用者輸入原文」去查 RAG。已於 2026-08-05 確認、
+#    2026-09-03 複查：memory_manager.get_context() 內為 self.rag.query(user_input)，
+#    無改寫或加料。
+#    ⚠️ 這裡刻意寫函式名不寫行號——原註解寫「memory_manager.py:160」，複查時該行已漂到
+#    209 行。行號會隨任何一次無關的編輯而過期，而過期時**不會有任何徵兆**：它仍然指向
+#    一個真實存在的行，只是內容變成別的東西了（同《現況》19之5「指向真實但錯誤的條目」）。
 #
 # ⚠️ 要看的是 recall@k 與 MRR，不是「過門檻數」。門檻是地板不是閘門——只要正確
 #    答案進了上下文，模型就有機會用它。用過門檻數當成績會把「檢索夠好但閘門設錯」
@@ -34,7 +49,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K  # noqa: E402
+from config import (RAG_INCLUDE_SEED, RAG_SIMILARITY_THRESHOLD,  # noqa: E402
+                    RAG_TOP_K)
 from core.rag_manager import RAGManager, RETIRED_FIELD  # noqa: E402
 
 DEFAULT_QUESTIONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_questions.txt")
@@ -71,7 +87,13 @@ def main():
     if count == 0:
         sys.exit("❌ RAG 是空的，請先跑 python -m tools.seed_rag")
 
-    print(f"庫內 {count} 筆　門檻 {RAG_SIMILARITY_THRESHOLD}　TOP_K {RAG_TOP_K}\n")
+    print(f"庫內 {count} 筆　門檻 {RAG_SIMILARITY_THRESHOLD}　TOP_K {RAG_TOP_K}")
+    # 落差要印在數字之前——印在最後會被整頁結果推走
+    if not RAG_INCLUDE_SEED:
+        print("🔴 RAG_INCLUDE_SEED = False：正式路徑會過濾掉種子，本檔刻意不過濾。")
+        print("   ⇒ 以下 recall@k／MRR 是**檢索側品質**，"
+              "不描述正式對話的行為（那邊一筆種子都不會回傳）。")
+    print()
 
     scored = 0          # 有標注正確答案的題數
     recall_hits = 0     # 正確答案出現在去重後前 K 名的題數
