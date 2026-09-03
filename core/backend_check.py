@@ -50,7 +50,7 @@ def _verify_loaded_model(base_url: str, model: str, expected_context_length: int
     """
     查驗「實際已載入」的模型與其 context 長度。
 
-    存在理由是兩個實際踩過的坑（詳見《決策脈絡歸檔》十六章）：
+    存在理由是兩個實際踩過的坑（詳見《歸檔》J0004）：
       1. JIT 載入失敗時 LM Studio 不報錯，會沿用當前已載入的模型回應——
          回答看起來完全正常，但那是錯的模型，整批實驗數據靜默作廢。
          （JIT 現已關閉，改為人工 Eject 後載入，此查驗仍作為第二道防線。）
