@@ -28,7 +28,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.rag_manager import RAGManager, SOURCE_SEED  # noqa: E402
+from core.memory.rag import RAGManager, SOURCE_SEED  # noqa: E402
 
 WORLDVIEW_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "worldview"

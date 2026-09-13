@@ -25,7 +25,7 @@
 #    📌 本檔的長期定位跟著《現況》11之2「種子的長期去留」那個未裁決項走。
 #
 # ⚠️ 前提假設：正式路徑是用「使用者輸入原文」去查 RAG。已於 2026-08-05 確認、
-#    2026-09-03 複查：memory_manager.get_context() 內為 self.rag.query(user_input)，
+#    2026-09-03 複查：core/memory/manager.py 的 get_context() 內為 self.rag.query(user_input)，
 #    無改寫或加料。
 #    ⚠️ 這裡刻意寫函式名不寫行號——原註解寫「memory_manager.py:160」，複查時該行已漂到
 #    209 行。行號會隨任何一次無關的編輯而過期，而過期時**不會有任何徵兆**：它仍然指向
@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (RAG_INCLUDE_SEED, RAG_SIMILARITY_THRESHOLD,  # noqa: E402
                     RAG_TOP_K)
-from core.rag_manager import RAGManager, RETIRED_FIELD  # noqa: E402
+from core.memory.rag import RAGManager, RETIRED_FIELD  # noqa: E402
 
 DEFAULT_QUESTIONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_questions.txt")
 

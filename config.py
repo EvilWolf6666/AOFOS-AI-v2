@@ -16,6 +16,20 @@ load_dotenv()
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 # ─────────────────────────────────────────────────────────────
+# 專案根目錄 — 全專案唯一的解析點
+# ─────────────────────────────────────────────────────────────
+# 🔴 任何模組都不得自己用 os.path.dirname(__file__) + ".." 推算專案根。
+#    那個寫法把「這個檔在第幾層」寫死進程式碼，**檔案一搬就指到別的地方，
+#    而且不會報錯**——os.makedirs(exist_ok=True) 與 get_or_create_collection
+#    會乖乖在錯的位置建一套空的，啟動訊息印「無歷史記憶，從零開始」（那是一句
+#    正常的訊息），而 .gitignore 的 `data/` 不帶前導斜線、任何層級都忽略，
+#    連版控都看不到。⇒ 三層遮蔽疊在一起，症狀是「搬檔成功了，但成功的是另一件事」。
+#
+# config.py 固定在專案根，深度不會變，故由它解析一次、其餘模組一律引用。
+# 依《現況》零章第八條（資料要收斂到單一來源）與本檔既有的「唯一設定入口」定位。
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# ─────────────────────────────────────────────────────────────
 # LLM 連線與推理參數
 # ─────────────────────────────────────────────────────────────
 # 所有影響輸出的參數一律在此明確指定並隨 request 送出。
@@ -264,9 +278,9 @@ WINDOW_WATCHER_CONFIG = {
 # 用於《AOFOS-固定評測題組》施測與 LoRA 對照組實驗。
 #
 # ⚠️ 這裡只是旗標，實際分支在三處：
-#      core/rag_manager.py    → True 時不查詢、不寫入、不初始化
-#      core/memory_manager.py → True 時改用 TEST_CONFIG["memory_path"]
-#      core/llm_client.py     → True 時套用 llm_overrides
+#      core/memory/rag.py      → True 時不查詢、不寫入、不初始化
+#      core/memory/manager.py  → True 時改用 TEST_CONFIG["memory_path"]
+#      core/llm_client.py      → True 時套用 llm_overrides
 
 TEST_MODE = False
 
