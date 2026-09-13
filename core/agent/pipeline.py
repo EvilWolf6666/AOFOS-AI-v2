@@ -262,14 +262,28 @@ class Pipeline:
             sink.close()
         return reply, sink.used
 
-    def handle_turn(self, user_input: str) -> TurnResult:
-        """取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。壓縮見 finalize_turn()。"""
+    def handle_turn(self, event: Event) -> TurnResult:
+        """取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。壓縮見 finalize_turn()。
+
+        ⚠️ 收整個 Event 而不是字串：`source` 與 `kind` 是 Event 自己的欄位，
+        在此只取 payload 等於把它們丟掉。Pipeline 本來就是 Event 的消費者
+        （見 events.py 檔頭），收整個才是它原本的設計意圖。
+
+        🔴 **但只傳到這一層為止。** 往下呼叫 MemoryManager 時改傳明確的值，
+        不傳 Event 物件——core/memory/ 是 core/agent/ 的下層，讓它 import
+        core.agent.events 會造成反向依賴，而那正是 events.py 與 ctrl_signals.py
+        兩處檔頭都明寫要避免的事。
+        ⭐ 附帶好處：**記憶的欄位集是它自己的規格，不該隨 Event 新增欄位而漂移。**
+        """
+        user_input = event.payload
         context = self.memory.get_context(user_input)
         messages = self.persona.build_messages(context, user_input)
         reply, printed = self._chat_streamed(messages)
 
         if reply:
-            self.memory.add_turn(user_input, reply)
+            self.memory.add_turn(
+                user_input, reply, source=event.source, kind=event.kind
+            )
 
         return TurnResult(reply=reply, printed=printed)
 
@@ -295,7 +309,7 @@ class Pipeline:
 
     # ── 環境事件輪次 ──────────────────────────────────────────────
 
-    def handle_observation(self, description: str) -> TurnResult:
+    def handle_observation(self, event: Event) -> TurnResult:
         """
         環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話，故 user 欄位
         填 EVENT_CONFIG["user_placeholder"]（不偽裝成使用者發言），情境改由
@@ -317,11 +331,23 @@ class Pipeline:
 
         ⚠️ placeholder、suffix、role 皆由 config 帶入，不寫死在此。
 
+        🔴 **情境描述現在會進記憶（方案 β：掛欄位、不進訊息串）。**
+        `add_turn(..., situation=description)` 把它掛在**該輪的 user 那一則**上
+        ——那一則的 content 是空 placeholder，情境正是那個位置該有的東西。
+        ⭐ **「user 空 ＋ 有 situation」是自洽的形狀；「user 空 ＋ 沒有 situation」
+        一眼看得出是異常。** 先前情境只存在於這一次呼叫，事件層會留下一批
+        「她突然說了一段話而沒有人知道為什麼」的紀錄。
+        ⚠️ **但模型看到的東西完全不變**：`get_context()` 會把非標準欄位投影掉
+        （見 core/memory/manager.py 的 get_context）——**那個投影是本做法成立的前提，
+        不是防禦性程式碼**。而「要不要把情境餵給模型／餵給 _compress」是另一個
+        決定（方案 α），待 observation 類訓練資料就緒後再議，本次不做。
+
         ⚠️ **observation 輪次不查 RAG，這是實際行為但尚未確認是否應該如此。**
         傳給 get_context() 的是空 placeholder，該方法的 `if user_input:` 因此
         跳過查詢，即使 description 本身是可用的檢索字串。屬 ① 類，暫不改動——
         改動前先確認收益，不要當成 bug 直接「修好」。
         """
+        description = event.payload
         placeholder = EVENT_CONFIG["user_placeholder"]
         suffix = EVENT_CONFIG["observation_prompt_suffix"]
 
@@ -337,6 +363,9 @@ class Pipeline:
         reply, printed = self._chat_streamed(messages)
 
         if reply:
-            self.memory.add_turn(placeholder, reply)
+            self.memory.add_turn(
+                placeholder, reply,
+                source=event.source, kind=event.kind, situation=description,
+            )
 
         return TurnResult(reply=reply, printed=printed)

@@ -57,6 +57,26 @@ def main():
     print(f"庫內 {count} 筆　n_results={n_req}　門檻 {RAG_SIMILARITY_THRESHOLD}　TOP_K {RAG_TOP_K}")
     print(f"過濾條件（三路共用）：{where}")
 
+    # 🔴 **過濾後候選為 0 時直接大聲退出，不得往下跑。**
+    #    三路都會撈到空集合，而空集合彼此「完全相同」——A 區塊一列都不印、
+    #    B 印「（空）」、C 對空陣列取 axis=1 拋 AxisError，而「同進程 3 次是否
+    #    完全相同」會印出 ✅。⇒ **整支工具變成恆綠，而恆綠比恆紅更糟：
+    #    恆紅至少會被看到，恆綠會被當成通過。**
+    #    （實例：2026-09-13 步驟 0–2 驗收時，庫內 64 筆全為種子而
+    #     RAG_INCLUDE_SEED=False，本工具實際上什麼都沒驗到卻印了綠勾。）
+    matching = len(rag.collection.get(where=where)["ids"])
+    if matching == 0:
+        print(
+            f"\n🔴 過濾後候選為 0 筆（庫內 {count} 筆全部被上方條件排除）。"
+            f"\n   **本次未驗到任何東西**——三條路徑都會是空集合，而空集合彼此相同，"
+            f"\n   往下跑只會印出三個空區塊和一個沒有意義的綠勾。"
+            f"\n   · 庫內只有種子而 RAG_INCLUDE_SEED=False ⇒ 這是預期的，"
+            f"本工具要等庫裡有淘汰內容才驗得到東西"
+            f"\n   · 否則 ⇒ 先確認 _build_where() 與庫內 metadata 對不對得上",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # ── A. collection.query()，同一進程內重複多次 ──────────────
     runs = []
     for i in range(REPEATS):

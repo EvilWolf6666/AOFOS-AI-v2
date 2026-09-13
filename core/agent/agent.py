@@ -231,7 +231,7 @@ class Agent:
 
     def _handle_observation(self, event: Event) -> None:
         """環境事件：沒有人在說話，情境走標記過的 context 區塊注入。"""
-        result = self.pipeline.handle_observation(event.payload)
+        result = self.pipeline.handle_observation(event)
         if result.reply:
             # printed=True 代表回應已在生成過程中逐段印出（串流），再印一次會出現兩遍。
             if not result.printed:
@@ -255,7 +255,10 @@ class Agent:
                 console.emit(f"{result.system_message}\n")
             return result.should_exit
 
-        result = self.pipeline.handle_turn(text)
+        # ⚠️ 傳整個 Event 而不是 text：source／kind 是 Event 自己的欄位，
+        # 只傳 payload 等於在入口把它們丟掉（events.py 檔頭：Event 由 Agent 產生、
+        # 由 Pipeline 消費——傳整個才是它原本的設計意圖）。
+        result = self.pipeline.handle_turn(event)
         if result.reply:
             if not result.printed:
                 self._emit_reply(result.reply)
