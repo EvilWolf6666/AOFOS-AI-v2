@@ -103,6 +103,11 @@ META_KEYS = ('模型', '量化', 'LoRA', 'GPU 卸載層數', 'GPU 卸載層數 /
              '施測日期')
 
 # 計分類別。F（指紋）與 A（語氣）不計分，預設也不進盲評版。
+# 沒有判準檔時的計分類別白名單（v1 題本的形狀）。
+# ⚠️ **給了 --rubric 就不看這個**——判準檔列了哪些題，哪些題就計分。
+#    理由：v2 新增 G／H／I 三個計分類別時，這個常數沒跟著改，
+#    三類就被靜默當成不計分排除掉了（2026-09-05 端到端實跑抓到）。
+#    ⇒ **計分範圍的單一來源是判準檔**，寫死字母只是沒有判準檔時的退路。
 SCORED_PREFIXES = ('B', 'C', 'D', 'E')
 
 # 題目與判準的區塊標頭。兩份文件的標題層級不同（一份 ###、一份 ##），
@@ -272,12 +277,51 @@ def cmd_make(args):
             print(f'   組別：{t}', file=sys.stderr)
         return 1
 
+    # ── 題目與判準（外部評審模型專用）─────────────────────────────
+    # 邪狼與 Claude 評分時不需要這兩塊（題目本來就在手上）；
+    # 外部模型不認識奧狐、也沒有題本，不注入就等於讓它憑印象打分。
+    # 🔴 兩者省略時本函式行為與注入前完全相同（向後相容）。
+    # 🔴 題本走**白名單**：只取 `<!-- 給評審 -->` 內的題目情境，
+    #    標準答案與判讀重點留在題本裡，不進評分表（見 parse_sections）。
+    questions = parse_sections(args.questions, require_marker=True) \
+        if args.questions else None
+    rubric = parse_sections(args.rubric) if args.rubric else None
+
+    # 缺題必須大聲失敗：靜默輸出一份缺題目的評分表時，
+    # 評審模型仍然會給出分數，而那個分數看起來與正常的一模一樣。
+    # 實際檢查排在 qids 算出來之後（見下方），這裡只放解析結果。
+
     include = {c.strip().upper() for c in args.include.split(',') if c.strip()}
-    qids = [q for q in samples if q[0] in SCORED_PREFIXES or q[0] in include]
+    # 計分範圍：判準檔優先（單一來源），沒給才退回字母白名單。
+    if rubric:
+        scored_set = set(rubric)
+        qids = [q for q in samples if q in scored_set or q[0] in include]
+    else:
+        scored_set = None
+        qids = [q for q in samples
+                if q[0] in SCORED_PREFIXES or q[0] in include]
     if not qids:
         print('🔴 沒有任何題目符合輸出條件（--include 目前是 '
               f'"{args.include}"）。', file=sys.stderr)
         return 1
+
+    # 前置檢查一之二：題本／判準缺題就大聲失敗。
+    # 靜默輸出一份缺題目的評分表時，評審模型仍然會給分，
+    # 而那個分數看起來與正常的一模一樣。
+    for label, src, hint in (
+            ('題本', questions,
+             '　（題本走白名單：每題的題目情境要用 <!-- 給評審 --> … '
+             '<!-- /給評審 --> 包起來，沒包＝不給）'),
+            ('判準', rubric, '')):
+        if src is None:
+            continue
+        lack = [q for q in qids if not src.get(q)]
+        if lack:
+            print(f'🔴 {label}檔缺下列題號，或該題區塊是空的：{hint}',
+                  file=sys.stderr)
+            for q in lack:
+                print(f'   {q}', file=sys.stderr)
+            return 1
 
     # 前置檢查二：空輸出。
     # 空的 <<< >>> 靜默進盲評版時，那一題無法評分，而評分者看不出是漏貼還是模型沒回。
@@ -295,33 +339,6 @@ def cmd_make(args):
 
     seed = args.seed if args.seed is not None else random.randrange(1, 10 ** 9)
     rng = random.Random(seed)
-
-    # ── 題目與判準（外部評審模型專用）─────────────────────────────
-    # 邪狼與 Claude 評分時不需要這兩塊（題目本來就在手上）；
-    # 外部模型不認識奧狐、也沒有題本，不注入就等於讓它憑印象打分。
-    # 🔴 兩者省略時本函式行為與注入前完全相同（向後相容）。
-    # 🔴 題本走**白名單**：只取 `<!-- 給評審 -->` 內的題目情境，
-    #    標準答案與判讀重點留在題本裡，不進評分表（見 parse_sections）。
-    questions = parse_sections(args.questions, require_marker=True) \
-        if args.questions else None
-    rubric = parse_sections(args.rubric) if args.rubric else None
-
-    # 缺題必須大聲失敗：靜默輸出一份缺題目的評分表時，
-    # 評審模型仍然會給出分數，而那個分數看起來與正常的一模一樣。
-    for label, src, hint in (
-            ('題本', questions,
-             '　（題本走白名單：每題的題目情境要用 <!-- 給評審 --> … '
-             '<!-- /給評審 --> 包起來，沒包＝不給）'),
-            ('判準', rubric, '')):
-        if src is None:
-            continue
-        lack = [q for q in qids if not src.get(q)]
-        if lack:
-            print(f'🔴 {label}檔缺下列題號，或該題區塊是空的：{hint}',
-                  file=sys.stderr)
-            for q in lack:
-                print(f'   {q}', file=sys.stderr)
-            return 1
 
     head = [
         '# AOFOS 施測結果（盲評版）',
@@ -380,7 +397,7 @@ def cmd_make(args):
                  f'再細的數字沒有判準支撐。',
                  '> 介於兩格之間才用半分；不確定的留空不要猜。', ''])
     for q in qids:
-        if q[0] in SCORED_PREFIXES:
+        if (q in scored_set) if scored_set is not None else (q[0] in SCORED_PREFIXES):
             for n in range(1, len(groups) + 1):
                 body.append(f'{q}-{n}: ')
     body.append('')
@@ -432,6 +449,9 @@ def cmd_make(args):
         'source': os.path.basename(args.record),
         'seed': seed,
         'groups': [{'title': g['title'], 'meta': g['meta']} for g in groups],
+        # 計分題清單。merge 沒有 --rubric，**必須靠這裡才知道哪些題進總分**，
+        # 否則它只能回頭猜字母白名單，而 v2 新增的類別不在那個白名單裡。
+        'scored': sorted(scored_set) if scored_set is not None else None,
         'map': mapping,
     }
     with open(key_path, 'w', encoding='utf-8', newline='\n') as f:
@@ -453,8 +473,10 @@ def cmd_make(args):
         print(f'已注入：{"、".join(got)}')
     skipped = [q for q in samples if q not in qids]
     if skipped:
-        print(f'（未輸出：{"、".join(skipped)}——F/A 類預設不盲評，'
-              f'要放進來用 --include F,A）')
+        why = ('不在判準檔的計分題清單內' if scored_set is not None
+               else 'F/A 類預設不盲評')
+        print(f'（未輸出：{"、".join(skipped)}——{why}，'
+              f'要放進來用 --include）')
 
     # 殘留檢查：只定位、不自動改。
     # 模型自稱（「我是 Qwen」）既是識別線索、也是 A/D 類的判讀材料，
@@ -601,7 +623,13 @@ def cmd_merge(args):
     titles = [g['title'] for g in key['groups']]
     models = [g['meta'].get('模型', '(未填)') for g in key['groups']]
     qids = sorted({c.rsplit('-', 1)[0] for c in key['map']})
-    scored_qids = [q for q in qids if q[0] in SCORED_PREFIXES]
+    # 計分範圍優先讀對照表（make 當時以判準檔決定的）；
+    # 舊對照表沒有這個欄位，退回字母白名單。
+    if key.get('scored'):
+        scored_set = set(key['scored'])
+        scored_qids = [q for q in qids if q in scored_set]
+    else:
+        scored_qids = [q for q in qids if q[0] in SCORED_PREFIXES]
 
     # {rater: {gi: {qid: score}}}
     table, unknown, missing = OrderedDict(), [], []
