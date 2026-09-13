@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (RAG_INCLUDE_SEED, RAG_SIMILARITY_THRESHOLD,  # noqa: E402
                     RAG_TOP_K)
-from core.memory.rag import RAGManager, RETIRED_FIELD  # noqa: E402
+from core.memory.rag import DB_PATH, RAGManager, RETIRED_FIELD  # noqa: E402
 
 DEFAULT_QUESTIONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_questions.txt")
 
@@ -85,7 +85,20 @@ def main():
 
     count = rag.collection.count()
     if count == 0:
-        sys.exit("❌ RAG 是空的，請先跑 python -m tools.seed_rag")
+        # 🔴 **必須印出實際路徑。** 「庫是空的」與「庫不在這個位置」症狀一模一樣：
+        #    chromadb.PersistentClient 對不存在的路徑會**直接建一個**，於是
+        #    路徑寫錯時也是 0 筆、也是這一句提示。照著提示跑 seed_rag 的結果，
+        #    是**在錯的位置灌好一個庫**，之後一切看起來完全正常。
+        #    ⇒ 這句提示會把「路徑指錯」變成「已解決」，故一律連路徑一起印。
+        #    （實例：2026-09-13 搬 core/memory/ 時，`..` 的相對深度會讓 DB_PATH
+        #     指到 core/data/，而三支工具吃同一個常數、彼此驗證不出來。）
+        sys.exit(
+            "❌ RAG 是空的（0 筆）。\n"
+            f"   實際讀取位置：{os.path.abspath(DB_PATH)}\n"
+            "   · 路徑是對的 ⇒ 請先跑 python -m tools.seed_rag\n"
+            "   · 路徑不是你預期的 ⇒ **先停手**，那是 config.PROJECT_ROOT 或 DB_PATH 的問題，"
+            "灌種子只會在錯的位置建一個庫"
+        )
 
     print(f"庫內 {count} 筆　門檻 {RAG_SIMILARITY_THRESHOLD}　TOP_K {RAG_TOP_K}")
     # 落差要印在數字之前——印在最後會被整頁結果推走

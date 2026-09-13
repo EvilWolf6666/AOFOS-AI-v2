@@ -92,9 +92,21 @@ class MemoryManager:
             with open(self.memory_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 self.compressed_memory = data.get("compressed_memory", "")
-            logger.info("記憶載入完成。")
+            # ⚠️ **必須印出實際載入的長度，不能只說「載入完成」。**
+            # 本方法只看檔案存不存在，而 agent.run() 的啟動訊息看的是
+            # compressed_memory 有沒有內容 ⇒ 檔案在但摘要是空字串時，畫面上會
+            # 相鄰印出「記憶載入完成」與「首次啟動，無歷史記憶」，**兩句互相打架**。
+            # 🔴 而「檔案在不在」與「內容有沒有」正是搬檔／換路徑時最需要分清楚的
+            # 兩件事——一句不準的成功訊息剛好蓋住它。（2026-09-13 實際發生過。）
+            n = len(self.compressed_memory)
+            logger.info(
+                f"記憶檔已讀取：{self.memory_path}（摘要 {n} 字）"
+                if n else
+                f"記憶檔存在但摘要是空的：{self.memory_path}"
+                "——這與「沒有記憶檔」是兩回事，若非預期請先查那個檔"
+            )
         else:
-            logger.info("無歷史記憶，從零開始。")
+            logger.info(f"無歷史記憶檔，從零開始：{self.memory_path}")
 
     def save_memory(self):
         os.makedirs(os.path.dirname(self.memory_path), exist_ok=True)
@@ -128,12 +140,47 @@ class MemoryManager:
 
     # ── 對話管理 ─────────────────────────────────
 
-    def add_turn(self, user_input: str, assistant_reply: str):
-        """只追加進 Working Memory，不觸發壓縮（壓縮時機交給呼叫端，見 maybe_compress）。"""
+    def add_turn(self, user_input: str, assistant_reply: str, *,
+                 source: str = "", kind: str = "", situation: str = ""):
+        """只追加進 Working Memory，不觸發壓縮（壓縮時機交給呼叫端，見 maybe_compress）。
+
+        source / kind / situation 由 Pipeline 從 Event 拆出來傳入。
+        🔴 **本模組刻意不 import core.agent.events**：core/memory/ 是 core/agent/ 的
+        下層，下層 import 上層是反向依賴（events.py 與 ctrl_signals.py 兩處檔頭
+        都明寫要避免）。⇒ 這裡只收值、只記錄，不認識 Event 型別。
+
+        ⚠️ **三個欄位在本層一律只記錄，不做任何分支判斷。**
+        · `kind`（utterance / observation）是**封閉值域**，日後要分支是合法的，
+          但那要在有需求時才做，不在寫入端先做。
+        · `source`（user_text / user_voice / window，未來還會長）是**開放值域**，
+          🔴 **永遠不得拿來做分支**——新增一個 producer 時它會靜默走進 else，
+          不報錯、不崩潰，只是那類事件悄悄套用了為別的東西寫的邏輯。
+          真的需要依來源分流時，正確做法是新增一個封閉值域的欄位。
+
+        ⚠️ `situation` 只掛在 **user 那一則**：observation 輪次的 user content 是空
+        placeholder，情境正是那個位置該有的東西。⭐ **「user 空 ＋ 有 situation」
+        是自洽的形狀；「user 空 ＋ 沒有 situation」一眼看得出是異常。**
+
+        ⚠️ 三者皆為選填且空值不寫入 key——不帶參數呼叫時行為與加入本功能之前**完全相同**。
+        🔴 **這些欄位不得進入送給模型的 messages**，剝除點在 get_context()。
+        """
         # ⚠️ 必須在 append 之前比對，之後比對必定自我命中
         self._log_verbatim_repeat(assistant_reply)
-        self.working_memory.append({"role": "user", "content": user_input})
-        self.working_memory.append({"role": "assistant", "content": assistant_reply})
+
+        meta = {}
+        if source:
+            meta["source"] = source
+        if kind:
+            meta["kind"] = kind
+
+        user_turn = {"role": "user", "content": user_input, **meta}
+        if situation:
+            user_turn["situation"] = situation
+
+        self.working_memory.append(user_turn)
+        self.working_memory.append(
+            {"role": "assistant", "content": assistant_reply, **meta}
+        )
 
     def _log_verbatim_repeat(self, reply: str) -> None:
         """本輪回應若與 Working Memory 內既有 assistant 內容逐字相同，記一次。
@@ -190,6 +237,24 @@ class MemoryManager:
             return True
         return False
 
+    @staticmethod
+    def _to_message(turn: dict) -> dict:
+        """把一則 Working Memory 紀錄投影成「只有 role 與 content」的訊息。
+
+        🔴 **這不是防禦性程式碼，它是「掛欄位不影響模型」這個做法成立的前提。**
+        add_turn() 可能在紀錄上掛 source／kind／situation，而 get_context() 的結果
+        會被原封不動放進 messages、序列化進 LM Studio 的 request body：
+          · 後端拒收 ⇒ 400（至少會停）
+          · 後端忽略 ⇒ 「模型看到的完全不變」變成一句**沒有被驗證過的話**
+        兩種都不可接受，故一律在此剝除。
+
+        ⚠️ 刻意用 turn["role"] 直接取而不是 .get()：Working Memory 由本模組自己
+        建立，缺 key 代表有人繞過 add_turn 寫進來了——那要大聲失敗，不是靜默補空。
+        ⚠️ **新增任何本地欄位時都不需要改這裡**（白名單，不是黑名單）——
+        黑名單漏一個就外流，而外流的那份看起來完全正常。
+        """
+        return {"role": turn["role"], "content": turn["content"]}
+
     def get_context(self, user_input: str = "") -> list[dict]:
         """組裝 context：Compressed Memory → Working Memory → RAG 查詢結果。
 
@@ -197,6 +262,9 @@ class MemoryManager:
         最長共同前綴，任何一段內容變動，其後全部要重新 prefill。RAG 每輪依
         user_input 重查、內容每輪都不同，排在 Working Memory 之前會使 WM 永遠
         落在斷點之後、永遠無法重用。同一原理見 pipeline.handle_observation()。
+
+        ⚠️ Working Memory 一律**經 _to_message() 投影**後才進 context，不得直接
+        extend——見該方法的說明。
         """
         with timed("記憶組裝"):
             context = []
@@ -207,7 +275,7 @@ class MemoryManager:
                     "content": f"[過去對話摘要]\n{self.compressed_memory}"
                 })
 
-            context.extend(self.working_memory)
+            context.extend(self._to_message(m) for m in self.working_memory)
 
             if user_input:
                 rag_results = self.rag.query(user_input)
