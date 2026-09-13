@@ -1,4 +1,4 @@
-# core/memory_manager.py
+# core/memory/manager.py
 # 記憶系統：Working Memory（近期對話）+ Compressed Memory（摘要）+ RAG（長期知識）
 
 import json
@@ -9,18 +9,22 @@ from config import (
     COMPRESS_BATCH_SIZE,
     MAX_SUMMARY_SENTENCES,
     MAX_WORKING_MEMORY,
+    PROJECT_ROOT,
     TEST_CONFIG,
     TEST_MODE,
 )
 from core.llm_client import LLMClient
 from core.logger import setup_logger, timed
-from core.rag_manager import RAGManager
+# ⚠️ 一律寫 `core.memory.rag`（子模組），不可寫 `from core.memory import RAGManager`
+#    ——後者會在套件還沒初始化完時回頭 import 本套件，形成循環 import。
+from core.memory.rag import RAGManager
 
 logger = setup_logger("MemoryManager")
 
-_PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
-NORMAL_MEMORY_PATH = os.path.join(_PROJECT_ROOT, "data", "memory.json")
-TEST_MEMORY_PATH = os.path.join(_PROJECT_ROOT, TEST_CONFIG["memory_path"])
+# ⚠️ 專案根一律取自 config.PROJECT_ROOT，不得在此用 __file__ + ".." 推算——
+#    那個寫法把本檔的層級寫死，檔案一搬就指到別的地方且不報錯（見 config 該處）。
+NORMAL_MEMORY_PATH = os.path.join(PROJECT_ROOT, "data", "memory.json")
+TEST_MEMORY_PATH = os.path.join(PROJECT_ROOT, TEST_CONFIG["memory_path"])
 
 
 class MemoryManager:

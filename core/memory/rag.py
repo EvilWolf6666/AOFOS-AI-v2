@@ -1,18 +1,20 @@
-# core/rag_manager.py
+# core/memory/rag.py
 # RAG 長期記憶 — 用 ChromaDB 儲存/查詢具體知識
 
 import os
 import uuid
 
-from config import (RAG_INCLUDE_SEED, RAG_SIMILARITY_THRESHOLD, RAG_TOP_K,
-                    TEST_CONFIG, TEST_MODE)
+from config import (PROJECT_ROOT, RAG_INCLUDE_SEED, RAG_SIMILARITY_THRESHOLD,
+                    RAG_TOP_K, TEST_CONFIG, TEST_MODE)
 
 # ⚠️ chromadb 刻意不在此 import，見 _init_backend()。
 from core.logger import setup_logger, timed
 
 logger = setup_logger("RAGManager")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "chroma_db")
+# ⚠️ 專案根一律取自 config.PROJECT_ROOT，不得在此用 __file__ + ".." 推算——
+#    搬檔時它會靜默指到別的位置，然後 get_or_create_collection 建一個空庫。
+DB_PATH = os.path.join(PROJECT_ROOT, "data", "chroma_db")
 COLLECTION_NAME = "aofos_memory"
 
 # 知識來源。寫入 metadata，供 tools/seed_rag.py 的整份同步辨識哪些是種子

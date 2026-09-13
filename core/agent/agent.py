@@ -25,7 +25,7 @@ from typing import Optional
 from config import ARBITRATION_CONFIG
 from core.llm_client import LLMClient
 from core.persona import Persona
-from core.memory_manager import MemoryManager
+from core.memory import MemoryManager
 from core.logger import setup_logger
 from core.agent.state import AgentState
 from core.agent.pipeline import Pipeline

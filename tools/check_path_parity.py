@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config  # noqa: F401,E402  ← HF_HUB_OFFLINE 必須在 huggingface_hub 之前生效
 from config import RAG_SIMILARITY_THRESHOLD, RAG_TOP_K  # noqa: E402
-from core.rag_manager import RAGManager  # noqa: E402
+from core.memory.rag import RAGManager  # noqa: E402
 
 DEFAULT_Q = "妳叫什麼名字"
 REPEATS = 3

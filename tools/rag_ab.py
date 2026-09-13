@@ -24,7 +24,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import RAG_SIMILARITY_THRESHOLD  # noqa: E402
-from core.rag_manager import RAGManager  # noqa: E402
+from core.memory.rag import RAGManager  # noqa: E402
 
 DEFAULT_CASES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ab_cases.txt")
 

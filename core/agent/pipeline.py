@@ -313,7 +313,7 @@ class Pipeline:
         🔴 情境訊息一律 append 在歷史「之後」、緊鄰生成點，順序不可前移。
         prompt cache 比對的是最長共同前綴，變動內容排最尾端時分岔點之後只需重算
         情境與空 user；前移則整段歷史被牽連重算，代價隨對話變長而增大。
-        同一原理見 memory_manager.get_context()。
+        同一原理見 core/memory/manager.py 的 get_context()。
 
         ⚠️ placeholder、suffix、role 皆由 config 帶入，不寫死在此。
 
