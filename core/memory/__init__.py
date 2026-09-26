@@ -22,7 +22,11 @@
    搬動時會靜默指到錯的位置（理由詳見 config.py 的 PROJECT_ROOT 區塊）。
 """
 
+# 🆕 2026-09-26 manager.py 已整份換成準 v3 最小記憶切片
+#    （《現況》〈🔒 隔離區〉記憶模塊〈準 v3〉〈十二〉）。
+#    ⚠️ **本檔不再 import rag.py**——v1 的 rag.py 移出後本套件照常載入；
+#    但 tools/ 底下直接 import `core.memory.rag` 的診斷腳本會隨之失效，這是預期的。
 from core.memory.manager import MemoryManager
-from core.memory.rag import RAGManager
 
-__all__ = ["MemoryManager", "RAGManager"]
+__all__ = ["MemoryManager"]
+
