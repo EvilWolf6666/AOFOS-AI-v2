@@ -26,7 +26,18 @@
 #    （《現況》〈🔒 隔離區〉記憶模塊〈準 v3〉〈十二〉）。
 #    ⚠️ **本檔不再 import rag.py**——v1 的 rag.py 移出後本套件照常載入；
 #    但 tools/ 底下直接 import `core.memory.rag` 的診斷腳本會隨之失效，這是預期的。
-from core.memory.manager import MemoryManager
-
+#
+# 🔴 **延後載入（PEP 562），不在本檔頂層 import manager**：頂層 import 會讓
+#    `python -m core.memory.db --selftest`／`-m core.memory.recall` 先經由本檔把
+#    db／recall 載入一次、runpy 再以 __main__ 執行第二份 ⇒ 每次都印
+#    RuntimeWarning（2026-09-26 Windows 實跑撞到）。一個每次都出現的警告會訓練人
+#    忽略警告。⇒ 只有真的取用 `core.memory.MemoryManager` 時才 import。
 __all__ = ["MemoryManager"]
+
+
+def __getattr__(name: str):
+    if name == "MemoryManager":
+        from core.memory.manager import MemoryManager
+        return MemoryManager
+    raise AttributeError(f"module 'core.memory' has no attribute {name!r}")
 
