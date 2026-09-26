@@ -1,203 +1,264 @@
 # core/memory/manager.py
-# 記憶系統：Working Memory（近期對話）+ Compressed Memory（摘要）+ RAG（長期知識）
+"""
+準 v3 最小記憶切片（《現況》〈🔒 隔離區〉記憶模塊〈準 v3（基準 1）〉〈十二〉）。
 
-import json
+做的事只有三件：
+  ① 每輪把雙方原句寫進原文存放區（沿用準 v2 的 pre_write → transcript）
+  ② 每輪依本輪輸入撈回原句（bigram＋FTS5，top_k＋前後鄰域）
+  ③ 撈到的原句附時間差，**追加在 context 尾端**
+Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪），超出的直接滑出——
+⭐ 原句已經落地，滑出不會丟任何東西，**所以不需要壓縮**。
+
+🔴 **2026-09-26 本檔整份取代 v1 的 manager.py**（v1 原檔由邪狼移出停用）：
+   v1 的兩個注入——`[過去對話摘要]`（Compressed Memory）與 ChromaDB `[相關記憶]`——
+   **在這裡不存在**。本檔**不 import rag.py／llm_client.py**。
+
+⚠️ **對外介面與 v1 相同**（agent.py／pipeline.py 一行不改）。
+   只為相容而保留、在本檔沒有意義的成員，一律標 [相容殼]：
+   `compressed_memory`（恆為空）、`rag`（恆為停用）、`needs_compress`／
+   `maybe_compress`（恆為 False）、`compress_on_exit`（只補寫、不壓縮）。
+
+🔴 **執行緒**：DB 連線在**第一次使用時**於當下執行緒開啟，之後只能在同一執行緒用
+   （sqlite3 預設 check_same_thread，跨執行緒會直接拋 ProgrammingError——大聲，是對的）。
+   目前 agent 的事件迴圈是單一執行緒，符合。
+
+📐 兩軸標註：寫進持久化資料的照目標形（transcript 欄位、clean 欄），
+   程式行為照最小可行（每輪撈、N、top_k、只存雙方）——見〈十二〉。
+"""
+
+from __future__ import annotations
+
 import os
 from datetime import datetime
 
-from config import (
-    COMPRESS_BATCH_SIZE,
-    MAX_SUMMARY_SENTENCES,
-    MAX_WORKING_MEMORY,
-    PROJECT_ROOT,
-    TEST_CONFIG,
-    TEST_MODE,
-)
-from core.llm_client import LLMClient
+from config import MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE
 from core.logger import setup_logger, timed
-# ⚠️ 一律寫 `core.memory.rag`（子模組），不可寫 `from core.memory import RAGManager`
-#    ——後者會在套件還沒初始化完時回頭 import 本套件，形成循環 import。
-from core.memory.rag import RAGManager
+from core.memory.db import connect
+from core.memory.pre_write import PreWrite
+from core.memory.recall import RecallIndex, check_fts5, format_blocks
+from core.memory.transcript import Transcript
 
 logger = setup_logger("MemoryManager")
 
-# ⚠️ 專案根一律取自 config.PROJECT_ROOT，不得在此用 __file__ + ".." 推算——
-#    那個寫法把本檔的層級寫死，檔案一搬就指到別的地方且不報錯（見 config 該處）。
-NORMAL_MEMORY_PATH = os.path.join(PROJECT_ROOT, "data", "memory.json")
-TEST_MEMORY_PATH = os.path.join(PROJECT_ROOT, TEST_CONFIG["memory_path"])
+
+class _RagDisabled:
+    """[相容殼] pipeline 的 /status 會讀 `memory.rag.enabled`。本檔沒有向量 RAG。"""
+    enabled = False
+
+    def set_enabled(self, _on: bool) -> None:
+        pass
+
+
+class _Store:
+    """一個 DB 檔：連線 ＋ 三個存取物件。連線延後到第一次使用才開（見檔頭「執行緒」）。"""
+
+    def __init__(self, path: str, *, writable: bool) -> None:
+        self.path = path
+        self.writable = writable
+        self._cx = None
+        self.pre_write: PreWrite | None = None
+        self.transcript: Transcript | None = None
+        self.index: RecallIndex | None = None
+
+    def open(self) -> "_Store":
+        if self._cx is None:
+            self._cx = connect(self.path)
+            self.pre_write = PreWrite(self._cx)
+            self.transcript = Transcript(self._cx)
+            self.index = RecallIndex(self._cx, writable=self.writable)
+            if self.writable:
+                n = self.index.catch_up()
+                if n:
+                    logger.info(f"檢索索引補上 {n} 筆：{self.path}")
+        return self
+
+    def close(self) -> None:
+        if self._cx is not None:
+            self._cx.close()
+            self._cx = None
+
+
+def _discard_db(path: str) -> None:
+    """整包丟棄一個 DB（含 WAL 的兩個附屬檔）。**呼叫前必須已關閉連線。**"""
+    for p in (path, path + "-wal", path + "-shm"):
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def _now_iso() -> str:
+    # ⚠️ 帶時區：時間差是跨場次算的，裸時間在換時區／夏令時間時會算錯且不報錯。
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 class MemoryManager:
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm=None, *, db_path: str | None = None,
+                 test_db_path: str | None = None):
+        """`llm` 只為介面相容而收（本檔不呼叫 LLM）。兩個路徑參數只給自測用。"""
+        # 🔴 依賴檢查放在建構時、大聲失敗：沒有 FTS5 就不要啟動，
+        #    否則會是「對話照常、記憶照寫、永遠撈不回來」——最難發現的那種壞。
+        check_fts5()
+
         self.llm = llm
         self.working_memory: list[dict] = []
-        self.compressed_memory: str = ""
-        self.rag = RAGManager()
-
-        # 測試模式改用獨立記憶檔，避免施測污染正式記憶。
-        # 起始值取自 config，執行期可由 /test 指令切換（見 set_test_mode）。
-        self.test_mode = TEST_MODE
-        # 逐字複製偵測的累計次數。僅本次執行有效、不落盤（見 add_turn）
+        self.compressed_memory: str = ""       # [相容殼] 沒有摘要
+        self.rag = _RagDisabled()               # [相容殼]
         self._verbatim_repeat_count = 0
-        self.memory_path = TEST_MEMORY_PATH if TEST_MODE else NORMAL_MEMORY_PATH
-        if TEST_MODE:
-            logger.warning(f"TEST_MODE 啟用：記憶檔改用 {self.memory_path}")
 
-        self._load_memory()
+        cfg = MEMORY_CONFIG
+        self._daily_path = db_path or cfg["db_path"]
+        self._test_path = test_db_path or cfg["test_db_path"]
+        self._top_k = cfg["top_k"]
+        self._n = cfg["neighbor_n"]
+        self._max_terms = cfg["max_query_terms"]
+        self._labels = cfg["speaker_labels"]
+
+        self._daily = _Store(self._daily_path, writable=True)
+        self._test: _Store | None = None
+        self.test_mode = False
+        if TEST_MODE:
+            self._enter_test()
+        logger.info(f"記憶（準 v3 最小切片）：原句寫入 {self.memory_path}，摘要與向量 RAG 注入已停用")
+
+    # ── 測試模式：讀取共用、寫入分流（第八章 C8）───────────────
+
+    @property
+    def memory_path(self) -> str:
+        """[相容] pipeline 的 /status 會印它。現在指向「寫入」的那個 DB。"""
+        return self._test_path if self.test_mode else self._daily_path
+
+    def _enter_test(self) -> None:
+        # 進場先丟一次：上一輪若沒正常離開，測試區會殘留，第 N 題就被前面污染。
+        _discard_db(self._test_path)
+        self._test = _Store(self._test_path, writable=True)
+        # 日常區在施測中只讀：不 catch-up、不記命中 ⇒ 整輪施測日常區是靜止的。
+        self._daily.close()
+        self._daily = _Store(self._daily_path, writable=False)
+        self.test_mode = True
+        logger.warning(f"TEST_MODE：寫入只進 {self._test_path}，日常區唯讀")
+
+    def _leave_test(self) -> None:
+        if self._test is not None:
+            self._test.close()
+            _discard_db(self._test_path)
+            self._test = None
+        self._daily.close()
+        self._daily = _Store(self._daily_path, writable=True)
+        self.test_mode = False
 
     def set_test_mode(self, on: bool) -> None:
-        """
-        執行期切換測試模式：存回目前記憶 → 切換路徑與 RAG 開關 →
-        清空 Working Memory 並從新路徑重新載入。
+        """切換測試模式。⚠️ Working Memory 會清空（對呼叫端可見的副作用，切換的目的就是隔離）。
 
-        Working Memory 必須清空（切換的目的就是隔離，殘留對話會污染下一次施測的
-        context），這是對呼叫端可見的副作用，指令回應中會明講。
-
-        進入測試模式時一併清掉上一次的測試記憶檔：施測協定為「每題重開程式 +
-        /test on」，測試記憶若跨題殘留，第 N 題會被前 N-1 題壓縮出的摘要污染。
-        自動清空以避免依賴人工每題手動刪檔（12 題 × 2 組共 24 次，漏一次整批作廢）。
-
-        本切換刻意不寫回 config：不持久化才不會有「測完忘記關」的風險。
+        先把還沒寫進去的補寫，**寫進切換前的那一區**，再切。
         """
         if on == self.test_mode:
             return
-
-        self.save_memory()  # 先把現況存回切換前的檔案
-
-        self.test_mode = on
-        self.memory_path = TEST_MEMORY_PATH if on else NORMAL_MEMORY_PATH
-        self.rag.set_enabled(not (on and TEST_CONFIG.get("disable_rag", True)))
-
-        if on and os.path.exists(TEST_MEMORY_PATH):
-            try:
-                os.remove(TEST_MEMORY_PATH)
-                logger.info("已清除上一次的測試記憶檔")
-            except Exception as e:
-                logger.warning(f"清除測試記憶檔失敗，本次施測可能受前次殘留污染：{e}")
-
+        self._flush()
+        self._enter_test() if on else self._leave_test()
         self.working_memory.clear()
-        self.compressed_memory = ""
-        self._load_memory()
-
         logger.warning(
-            f"測試模式{'開啟' if on else '關閉'}：記憶檔切換為 {self.memory_path}，"
+            f"測試模式{'開啟' if on else '關閉'}：寫入改為 {self.memory_path}，"
             f"Working Memory 已清空"
-        )
+            + ("" if on else "，測試區已整包丟棄"))
 
-    # ── 讀取 / 儲存 ──────────────────────────────
+    def _write_store(self) -> _Store:
+        return (self._test if self.test_mode else self._daily).open()
 
-    def _load_memory(self):
-        os.makedirs(os.path.dirname(self.memory_path), exist_ok=True)
-        if os.path.exists(self.memory_path):
-            with open(self.memory_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                self.compressed_memory = data.get("compressed_memory", "")
-            # ⚠️ **必須印出實際載入的長度，不能只說「載入完成」。**
-            # 本方法只看檔案存不存在，而 agent.run() 的啟動訊息看的是
-            # compressed_memory 有沒有內容 ⇒ 檔案在但摘要是空字串時，畫面上會
-            # 相鄰印出「記憶載入完成」與「首次啟動，無歷史記憶」，**兩句互相打架**。
-            # 🔴 而「檔案在不在」與「內容有沒有」正是搬檔／換路徑時最需要分清楚的
-            # 兩件事——一句不準的成功訊息剛好蓋住它。（2026-09-13 實際發生過。）
-            n = len(self.compressed_memory)
-            logger.info(
-                f"記憶檔已讀取：{self.memory_path}（摘要 {n} 字）"
-                if n else
-                f"記憶檔存在但摘要是空的：{self.memory_path}"
-                "——這與「沒有記憶檔」是兩回事，若非預期請先查那個檔"
-            )
-        else:
-            logger.info(f"無歷史記憶檔，從零開始：{self.memory_path}")
+    def _read_stores(self) -> list[_Store]:
+        stores = [self._write_store()]
+        if self.test_mode and os.path.exists(self._daily_path):
+            # 唯讀那一區不存在就不開——開了會在日常區憑空建一個空檔
+            stores.append(self._daily.open())
+        return stores
 
-    def save_memory(self):
-        os.makedirs(os.path.dirname(self.memory_path), exist_ok=True)
-        with open(self.memory_path, "w", encoding="utf-8") as f:
-            json.dump({"compressed_memory": self.compressed_memory}, f, ensure_ascii=False, indent=2)
-        logger.debug("記憶已存檔。")
-
-    def _backup_memory(self, reason: str) -> str | None:
-        """
-        在即將以不可信內容覆寫 compressed_memory 前，先另存一份現有內容。
-
-        存在理由：_parse_compress_result() 解析失敗時會直接用 LLM 原始輸出當摘要，
-        等於用一段格式不明的文字覆蓋掉正常的長期記憶，且原本不可逆。
-        """
-        if not self.compressed_memory:
-            return None
-        try:
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            path = os.path.join(
-                os.path.dirname(self.memory_path), f"memory_backup_{ts}_{reason}.json"
-            )
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"compressed_memory": self.compressed_memory},
-                    f, ensure_ascii=False, indent=2
-                )
-            return path
-        except Exception as e:
-            logger.warning(f"記憶備份失敗（不影響主流程）：{e}")
-            return None
-
-    # ── 對話管理 ─────────────────────────────────
+    # ── 寫入 ──────────────────────────────────────────────────
 
     def add_turn(self, user_input: str, assistant_reply: str, *,
                  source: str = "", kind: str = "", situation: str = ""):
-        """只追加進 Working Memory，不觸發壓縮（壓縮時機交給呼叫端，見 maybe_compress）。
+        """追加進 Working Memory 並寫進原文存放區。
 
-        source / kind / situation 由 Pipeline 從 Event 拆出來傳入。
+        source／kind／situation 由 Pipeline 從 Event 拆出來傳入。
         🔴 **本模組刻意不 import core.agent.events**：core/memory/ 是 core/agent/ 的
-        下層，下層 import 上層是反向依賴（events.py 與 ctrl_signals.py 兩處檔頭
-        都明寫要避免）。⇒ 這裡只收值、只記錄，不認識 Event 型別。
+        下層，下層 import 上層是反向依賴 ⇒ 這裡只收值、只記錄，不認識 Event 型別。
 
         ⚠️ **三個欄位在本層一律只記錄，不做任何分支判斷。**
-        · `kind`（utterance / observation）是**封閉值域**，日後要分支是合法的，
-          但那要在有需求時才做，不在寫入端先做。
+        · `kind`（utterance / observation）是封閉值域，日後要分支是合法的，
+          但要在有需求時才做。
         · `source`（user_text / user_voice / window，未來還會長）是**開放值域**，
-          🔴 **永遠不得拿來做分支**——新增一個 producer 時它會靜默走進 else，
-          不報錯、不崩潰，只是那類事件悄悄套用了為別的東西寫的邏輯。
-          真的需要依來源分流時，正確做法是新增一個封閉值域的欄位。
-
+          🔴 **永遠不得拿來做分支**——新增一個 producer 時它會靜默走進 else。
         ⚠️ `situation` 只掛在 **user 那一則**：observation 輪次的 user content 是空
-        placeholder，情境正是那個位置該有的東西。⭐ **「user 空 ＋ 有 situation」
-        是自洽的形狀；「user 空 ＋ 沒有 situation」一眼看得出是異常。**
-
-        ⚠️ 三者皆為選填且空值不寫入 key——不帶參數呼叫時行為與加入本功能之前**完全相同**。
+        placeholder，情境正是那個位置該有的東西。
         🔴 **這些欄位不得進入送給模型的 messages**，剝除點在 get_context()。
         """
-        # ⚠️ 必須在 append 之前比對，之後比對必定自我命中
         self._log_verbatim_repeat(assistant_reply)
 
-        meta = {}
+        ts = _now_iso()
+        meta = {"ts": ts}
         if source:
             meta["source"] = source
         if kind:
             meta["kind"] = kind
-
         user_turn = {"role": "user", "content": user_input, **meta}
         if situation:
             user_turn["situation"] = situation
-
         self.working_memory.append(user_turn)
-        self.working_memory.append(
-            {"role": "assistant", "content": assistant_reply, **meta}
-        )
+        self.working_memory.append({"role": "assistant", "content": assistant_reply, **meta})
+
+        self._flush()
+        self._slide()
+
+    def _flush(self) -> None:
+        """把 Working Memory 裡還沒有 serial 的紀錄寫進去。
+
+        流程沿用準 v2：預寫區 append（取號＋落盤）→ 讀出 → 原文存放區 land
+        （推進 N）→ 清預寫區 → 補索引。
+        ⭐ **失敗不中斷對話，而且會自己重試**：沒拿到 serial 的紀錄留在 WM，
+           下一輪再寫；已進預寫區但沒 land 的，下一輪 read_pending 會一起帶出來。
+        🔴 但失敗要大聲——連續失敗代表原句根本沒在存，關係連續性是假的。
+        """
+        pending = [t for t in self.working_memory if "serial" not in t]
+        if not pending:
+            return
+        try:
+            with timed("原句寫入"):
+                st = self._write_store()
+                serials = st.pre_write.append(pending)
+                for t, s in zip(pending, serials):
+                    t["serial"] = s
+                rows, halt = st.pre_write.read_pending(st.transcript.landed_upto)
+                if rows:
+                    st.transcript.land(rows)
+                    st.pre_write.purge_upto(st.transcript.landed_upto)
+                if halt:
+                    logger.error(f"預寫區中止：{halt}（已落地的部分照常可撈）")
+                st.index.catch_up()
+        except Exception as e:
+            logger.error(
+                f"原句寫入失敗，{len(pending)} 則暫留 Working Memory、下一輪重試："
+                f"{type(e).__name__}: {e}")
+
+    def _slide(self) -> None:
+        """滑動視窗：超過 MAX_WORKING_MEMORY 輪時，丟掉最舊的**已落地**紀錄。
+
+        🔴 **沒有 serial 的一律不丟**（寫入失敗的那些）——丟了就真的沒了。
+        """
+        limit = MAX_WORKING_MEMORY * 2
+        while len(self.working_memory) > limit and "serial" in self.working_memory[0]:
+            self.working_memory.pop(0)
+        if len(self.working_memory) > limit:
+            logger.error(
+                f"Working Memory {len(self.working_memory)} 則超過上限 {limit}："
+                "最舊的紀錄一直沒寫進去，無法滑出。")
 
     def _log_verbatim_repeat(self, reply: str) -> None:
         """本輪回應若與 Working Memory 內既有 assistant 內容逐字相同，記一次。
 
-        **純診斷，刻意不改變任何行為。**《現況》12之0 記著「乾淨條件下重現之前
-        不動《歸檔》F0006」，而在日常運行中累積樣本正是重現的前置——專門排一輪去釣它，
-        比讓它自己出現昂貴得多。
-
-        ⚠️ 日常運行不是《現況》12之0 說的乾淨條件（RAG 啟用、有舊記憶），本計數只能
-        回答「頻率多高」；**`/test on` 下也觸發才是乾淨條件的證據**，故一併記
-        test_mode。
-        ⚠️ 只比對完全相同，不做相似度：部分重複另有成因，混進同一個計數會使
-        這個數字失去意義。
+        **純診斷，刻意不改變任何行為**：在日常運行中累積「逐字複製」樣本
+        （《現況》12之0）。⚠️ 必須在 append 之前比對，之後比對必定自我命中。
+        ⚠️ 只比對完全相同、不做相似度——部分重複另有成因，混進同一個計數會使
+        這個數字失去意義。記 test_mode 是因為 `/test on` 下也觸發才是乾淨條件的證據。
         """
         if not reply:
             return
-
         hit_idx = next(
             (i for i in range(len(self.working_memory) - 1, -1, -1)
              if self.working_memory[i].get("role") == "assistant"
@@ -206,262 +267,96 @@ class MemoryManager:
         )
         if hit_idx is None:
             return
-
-        # 相隔幾輪：只複製上一輪 = recency 效應，複製更早的 = 另一種機制。
-        # 兩者的下一步診斷方向不同，故此欄不可省。
         turns_ago = (len(self.working_memory) - hit_idx + 1) // 2
-
         self._verbatim_repeat_count += 1
         logger.warning(
             f"逐字複製：本輪回應與 {turns_ago} 輪前的回應完全相同"
             f"（本次執行第 {self._verbatim_repeat_count} 次，"
             f"WM {len(self.working_memory) // 2} 輪，test_mode={self.test_mode}）"
-            f"：{reply[:40]}"
-        )
+            f"：{reply[:40]}")
 
-    def needs_compress(self) -> bool:
-        """僅回報是否將要壓縮，不執行。供呼叫端在壓縮前先給使用者提示。"""
-        return len(self.working_memory) > MAX_WORKING_MEMORY * 2
-
-    def maybe_compress(self) -> bool:
-        """
-        視 Working Memory 長度決定是否壓縮，回傳是否真的執行了壓縮。
-
-        ⚠️ 應在回應已經輸出之後呼叫，避免壓縮耗時落在使用者等待的路徑上。
-        目前仍是同步執行，尖峰只是被移到「下一次輸入之前」，並未消失。
-        若改為背景執行，需一併處理併發寫入 compressed_memory 的風險
-        （本欄位是整份覆寫而非追加，競態的後果是記憶被寫壞且無徵兆）。
-        """
-        if self.needs_compress():
-            self._compress_oldest()
-            return True
-        return False
+    # ── 讀取 ──────────────────────────────────────────────────
 
     @staticmethod
     def _to_message(turn: dict) -> dict:
-        """把一則 Working Memory 紀錄投影成「只有 role 與 content」的訊息。
+        """只投影 role／content（白名單）。
 
-        🔴 **這不是防禦性程式碼，它是「掛欄位不影響模型」這個做法成立的前提。**
-        add_turn() 可能在紀錄上掛 source／kind／situation，而 get_context() 的結果
-        會被原封不動放進 messages、序列化進 LM Studio 的 request body：
-          · 後端拒收 ⇒ 400（至少會停）
-          · 後端忽略 ⇒ 「模型看到的完全不變」變成一句**沒有被驗證過的話**
-        兩種都不可接受，故一律在此剝除。
-
-        ⚠️ 刻意用 turn["role"] 直接取而不是 .get()：Working Memory 由本模組自己
-        建立，缺 key 代表有人繞過 add_turn 寫進來了——那要大聲失敗，不是靜默補空。
-        ⚠️ **新增任何本地欄位時都不需要改這裡**（白名單，不是黑名單）——
-        黑名單漏一個就外流，而外流的那份看起來完全正常。
+        🔴 **這不是防禦性程式碼，是「掛欄位不影響模型」成立的前提**：本地欄位
+        （ts／serial／source…）若進了 request body，後端拒收 ⇒ 400；後端忽略 ⇒
+        「模型看到的完全不變」變成一句沒驗證過的話。⚠️ 用 turn["role"] 直接取：
+        缺 key 代表有人繞過 add_turn 寫進來，要大聲失敗。白名單 ⇒ 新增本地欄位不用改這裡。
         """
         return {"role": turn["role"], "content": turn["content"]}
 
     def get_context(self, user_input: str = "") -> list[dict]:
-        """組裝 context：Compressed Memory → Working Memory → RAG 查詢結果。
+        """Working Memory → 撈回的原句（追加尾端）。
 
-        ⚠️ 順序依「變動頻率由低到高」排列，不可任意調換：prompt cache 比對的是
-        最長共同前綴，任何一段內容變動，其後全部要重新 prefill。RAG 每輪依
-        user_input 重查、內容每輪都不同，排在 Working Memory 之前會使 WM 永遠
-        落在斷點之後、永遠無法重用。同一原理見 pipeline.handle_observation()。
-
-        ⚠️ Working Memory 一律**經 _to_message() 投影**後才進 context，不得直接
-        extend——見該方法的說明。
+        ⚠️ 順序依「變動頻率由低到高」：撈回內容每輪不同，放尾端才不會讓
+           WM 落在 prompt cache 斷點之後（prompt cache 比對的是最長共同前綴）。
+        ⚠️ user_input 為空（observation 輪次的 placeholder）時不撈——沿用舊行為，
+           屬 ① 類未確認項，不在本切片改動。
         """
         with timed("記憶組裝"):
-            context = []
-
-            if self.compressed_memory:
-                context.append({
-                    "role": "system",
-                    "content": f"[過去對話摘要]\n{self.compressed_memory}"
-                })
-
-            context.extend(self._to_message(m) for m in self.working_memory)
-
+            context = [self._to_message(m) for m in self.working_memory]
             if user_input:
-                rag_results = self.rag.query(user_input)
-                if rag_results:
-                    rag_text = "\n".join(f"- {r}" for r in rag_results)
-                    context.append({
-                        "role": "system",
-                        "content": f"[相關記憶]\n{rag_text}"
-                    })
-                    logger.debug(f"注入 {len(rag_results)} 筆 RAG 記憶。")
-                else:
-                    logger.debug("無相關 RAG 記憶，跳過注入。")
-
+                text = self._recall(user_input)
+                if text:
+                    context.append({"role": "system", "content": text})
         return context
 
-    # ── 記憶壓縮 ─────────────────────────────────
-
-    def _compress(self, turns: list[dict]):
-        """
-        將指定對話輪次與既有摘要整合覆寫（非疊加），長度受 MAX_SUMMARY_SENTENCES 限制。
-
-        舊摘要中沒出現在新摘要裡的內容一律轉存 RAG，不區分原因（被取代或排不進
-        句數上限）——區分只增加 LLM 誤判風險，兩者最終都存進同一個地方。
-
-        prompt 的三條規則各自對應一個實測踩過的失敗模式，改動前請先看
-        《歸檔》D0001：
-          規則一 未提及內容預設保留 → 防資訊無聲消失
-          規則二 禁止逐字複製對話原文 → 防記憶變成自我強化的複述錨點
-          規則三 禁止推測填充 → 防取捨順序被讀成必填欄位模板
-
-        內部 LLM 呼叫以 purpose="compress" 標記，才能與回應使用者的對話呼叫
-        在計時紀錄中區分開來。
-        """
-        with timed("記憶壓縮(整體)"):
-            dialogue_text = "\n".join(
-                f"{'邪狼' if m['role'] == 'user' else '奧狐'}：{m['content']}"
-                for m in turns
-            )
-
-            existing_block = f"[之前的摘要]\n{self.compressed_memory}\n\n" if self.compressed_memory else ""
-
-            prompt = [{
-                "role": "user",
-                "content": (
-                    "你要幫忙整理「奧狐」的近期記憶摘要。\n\n"
-                    f"{existing_block}[新對話]\n{dialogue_text}\n\n"
-                    "請完成兩件事，並嚴格遵守以下規則：\n"
-                    "規則一：「之前的摘要」中的每一條資訊，預設都要「保留」在新摘要裡，"
-                    "除非新對話明確更新、推翻、或讓它過時（例如某件事後來解決了、狀態變了），"
-                    "或受限於新摘要的句數上限而排不進去。"
-                    "新對話沒有提到的舊資訊，不代表它不重要，原則上不可以省略，"
-                    "只有在真的擠不進新摘要時才可以不保留。\n"
-                    "規則二：新摘要必須是改寫過的客觀概括描述，即使某句對話內容很簡短，"
-                    "也一樣要改寫成第三人稱敘述句，不可以逐字複製對話原文"
-                    "（不論是之前摘要裡的句子，還是新對話裡奧狐或邪狼說的原話，"
-                    "都不可以整句照抄）。\n"
-                    "規則三：只能寫「之前的摘要」或「新對話」裡實際出現過的內容，"
-                    "不可以補充、推測或為了湊長度而填充。"
-                    "如果某類資訊完全沒有出現過（例如沒談到關係、沒做出決定），"
-                    "就完全不要提到那類資訊——"
-                    "不要寫「關係沒有改變」「最近沒有新的決定」這種句子，"
-                    "沒有資訊時正確的做法是「不寫」，不是「寫沒有變化」。"
-                    "新摘要的長度取決於實際有多少內容，只有一兩句也完全可以。\n\n"
-                    f"1. 輸出整合後的新摘要，不超過 {MAX_SUMMARY_SENTENCES} 句話，"
-                    "包含：未被取代的舊資訊（照規則一保留）+ 新對話中重要的新資訊，"
-                    "全部以改寫過的概括句呈現（依規則二）。"
-                    "句數上限是上限不是目標，有多少寫多少。"
-                    "只有在內容確實超過上限、必須取捨時，才依此順序保留："
-                    "人名 > 明確做出的決定 > 近期狀態 > 其他；"
-                    "這是取捨順序，不是必填欄位清單。"
-                    "每一句話結束後換行，一行一句，不要把多句擠在同一行。\n"
-                    "2. 列出「之前的摘要」中，沒有出現在新摘要裡的所有舊資訊"
-                    "（無論原因是被新對話取代、還是因為句數上限排不進去，只要新摘要裡沒有，就列出來；"
-                    "若新摘要完整保留了之前摘要的所有內容，就寫「無」）。\n\n"
-                    "請只用以下格式輸出，不要其他說明文字：\n"
-                    "摘要：<新摘要內容>\n"
-                    "淘汰：<沒出現在新摘要裡的舊資訊，或「無」>"
-                )
-            }]
-
-            result = self.llm.chat(prompt, purpose="compress")
-
-            # ⚠️ llm_client.chat() 在任何例外時回傳 ""（刻意設計，見該檔）。
-            # 空字串會讓 _parse_compress_result 的 next() 拋 StopIteration、
-            # 落入保底分支並回傳 ("", "無")，接著把 compressed_memory 覆寫成
-            # 空字串並寫回磁碟——長期記憶就此消失，而使用者只會看到
-            # finalize_turn 印的一行「壓縮失敗」，不會知道記憶被清空了。
-            # 故必須在覆寫之前擋掉，且回傳 None 讓呼叫端知道本次沒有結果。
-            if not result.strip():
-                logger.error("壓縮呼叫回傳空內容，本次壓縮放棄（記憶維持原狀）")
-                return None
-
-            new_summary, discarded = self._parse_compress_result(result)
-
-            self.compressed_memory = new_summary
-            self.save_memory()
-
-            # 明確記錄淘汰結果：「RAG 沒有新增資料」有兩種完全不同的原因
-            # （本來就沒東西被淘汰 / 有東西被淘汰但寫入失敗），沒有這行 log 無法區分
-            if discarded and discarded != "無":
-                logger.info(f"本次壓縮淘汰內容（將轉存 RAG）：{discarded[:80]}")
-                try:
-                    self.rag.add(discarded)
-                    logger.debug(f"舊記憶已轉存 RAG：{discarded[:50]}...")
-                except Exception as e:
-                    logger.warning(f"舊記憶轉存 RAG 失敗（不影響主流程）：{e}")
-            else:
-                logger.info("本次壓縮無淘汰內容，RAG 不會新增資料（此為正常情況之一）")
-
-        return new_summary
-
-    def _parse_compress_result(self, result: str) -> tuple[str, str]:
-        """解析 LLM 回傳的『摘要 / 淘汰』結果。"""
+    def _recall(self, query: str) -> str:
+        """撈回失敗不中斷對話，但要大聲。"""
         try:
-            lines = result.strip().splitlines()
-            summary_line_idx = next(
-                i for i, l in enumerate(lines) if l.strip().startswith("摘要：")
-            )
-            discard_line_idx = next(
-                (i for i, l in enumerate(lines) if l.strip().startswith("淘汰：")),
-                None,
-            )
+            stores = self._read_stores()
+            wm = {t["serial"] for t in self.working_memory if "serial" in t}
+            write_st = stores[0]
 
-            if discard_line_idx is not None:
-                summary = "\n".join(lines[summary_line_idx:discard_line_idx]).replace("摘要：", "", 1).strip()
-                discarded = "\n".join(lines[discard_line_idx:]).replace("淘汰：", "", 1).strip()
-            else:
-                summary = "\n".join(lines[summary_line_idx:]).replace("摘要：", "", 1).strip()
-                discarded = "無"
+            # 各區各撈 top_k，再依 bm25 合併取 top_k。
+            # 🟩 兩個 FTS 表的 bm25 分數嚴格說不可直接比（語料統計不同），
+            #    施測時才有兩區，日常只有一區——先這樣，量到偏差再改。
+            cands = []
+            for st in stores:
+                excl = wm if st is write_st else frozenset()
+                cands += [(score, s, st) for s, score in
+                          st.index.search(query, top_k=self._top_k,
+                                          max_terms=self._max_terms, exclude=excl)]
+            cands.sort(key=lambda c: c[0])
+            cands = cands[: self._top_k]
+            if not cands:
+                return ""
 
-            return summary, discarded
+            blocks = []
+            for st in stores:
+                hits = [s for _, s, owner in cands if owner is st]
+                if not hits:
+                    continue
+                excl = wm if st is write_st else frozenset()
+                blocks += st.index.neighborhood(hits, self._n, exclude=excl)
+                st.index.mark_recalled(hits)
+            blocks.sort(key=lambda b: b[0]["ts"] or "")
+            logger.debug(f"撈回 {len(cands)} 則命中、{len(blocks)} 段")
+            return format_blocks(blocks, self._labels)
         except Exception as e:
-            # 保底：解析失敗時用原始輸出當摘要（避免記憶遺失），不寫入 RAG
-            # （避免存入格式錯亂內容）。覆寫前先備份，讓這一步變成可回復的。
-            backup_path = self._backup_memory("parse_fail")
-            logger.error(
-                f"壓縮結果解析失敗：{e}。將以原始輸出覆寫記憶"
-                + (f"，覆寫前已備份至 {backup_path}" if backup_path else "（無既有記憶可備份）")
-                + f"。原始結果：{result}"
-            )
-            return result.strip(), "無"
+            logger.error(f"取回失敗，本輪不注入記憶：{type(e).__name__}: {e}")
+            return ""
 
-    def _compress_oldest(self):
-        """
-        ⚠️ 「先壓縮、後裁切」的順序不可對調。先裁切的話，壓縮失敗時那批對話
-        已經從 working_memory 移除、而摘要也沒產生——兩邊都不在了，且沒有
-        任何徵兆（使用者只看到一行「壓縮失敗」）。
+    # ── [相容殼] 舊版的壓縮介面 ────────────────────────────────
 
-        壓縮失敗時 working_memory 會持續超長，下一次 finalize_turn 會再試一次。
-        這是正確的：重試比靜默清空好，而 LLM 連續失敗代表 LM Studio 掛了，
-        那本來就是更該被看見的事。
-        """
-        to_compress = self.working_memory[:COMPRESS_BATCH_SIZE]
-        summary = self._compress(to_compress)
+    def needs_compress(self) -> bool:
+        return False
 
-        if summary is None:
-            logger.error(
-                "壓縮未產生有效摘要，Working Memory 不裁切、既有摘要不覆寫"
-                "（下次觸發時會重試）"
-            )
-            return
+    def maybe_compress(self) -> bool:
+        return False
 
-        self.working_memory = self.working_memory[COMPRESS_BATCH_SIZE:]
-        logger.info(f"已壓縮記憶：{summary[:50]}...")
-
-    def compress_on_exit(self):
-        if not self.working_memory:
-            return
-
-        # 測試模式下不壓縮：評測不需要摘要，而壓縮是一次完整的 LLM 呼叫；
-        # 且壓縮結果會寫進測試記憶檔，成為下一題的污染源——後者才是決定性的，
-        # 耗時只是附帶。⚠️ 此處刻意不寫秒數：它會過期，且不是本判斷的依據。
+    def compress_on_exit(self) -> None:
+        """不壓縮；只把還沒寫進去的補寫一次，然後關連線。"""
+        self._flush()
+        left = [t for t in self.working_memory if "serial" not in t]
+        if left:
+            logger.error(f"離場時仍有 {len(left)} 則沒寫進原文存放區，程式結束後消失。")
         if self.test_mode:
-            logger.info("測試模式：跳過離開時的記憶壓縮。")
-            return
+            self._leave_test()   # 施測結束整包丟棄
+        self._daily.close()
 
-        if self._compress(self.working_memory) is None:
-            # ⚠️ 這裡和 _compress_oldest 不同：程式即將結束，沒有「下次重試」。
-            # working_memory 只存在記憶體中，此刻壓縮失敗就等於本次對話
-            # 完全不會進入長期記憶。必須大聲說明後果，否則使用者會以為
-            # 只是「摘要沒更新」。
-            logger.error(
-                f"離場壓縮失敗，本次對話的 {len(self.working_memory)} 則訊息"
-                "不會寫入長期記憶（僅存在記憶體，程式結束後消失）。"
-                "既有摘要未被覆寫。"
-            )
-            return
-
-        logger.info("對話已儲存。")
+    def save_memory(self) -> None:
+        """[相容殼] 每輪已即時落盤，沒有需要另外存的東西。"""

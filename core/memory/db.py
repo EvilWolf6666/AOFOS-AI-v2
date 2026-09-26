@@ -3,7 +3,7 @@
 記憶資料庫的連線與結構（SQLite）。
 
 一個檔、多張表：`pre_write`（預寫區佇列）／`transcript`（原文存放區，永久）／
-`meta`（`next_serial`、`landed_upto`＝N、`compressed_upto`＝M）。
+`recall_fts`（檢索索引，衍生、可刪重建，由 recall.py 持有）／`meta`（`next_serial`、`landed_upto`＝N、`compressed_upto`＝M）。
 
 🔴 **為什麼是同一個 DB 檔**：讓「原文寫進 transcript ＋ 推進 N」落在**同一個交易**裡
    ——分成兩個檔就沒有交易保證，那個「原文寫成功但 N 沒更新」的窗口會回來。
@@ -62,11 +62,12 @@ CREATE TABLE IF NOT EXISTS transcript (
     serial    INTEGER PRIMARY KEY,
     ts        TEXT    NOT NULL,
     role      TEXT    NOT NULL,
-    content   TEXT    NOT NULL,
+    content   TEXT    NOT NULL,   -- 原樣輸出（含表情標籤等），權威副本
     hash      TEXT    NOT NULL,
     source    TEXT,
     kind      TEXT,
     situation TEXT,
+    clean     TEXT,               -- 乾淨文字：供檢索與注入（規則見 clean.py）
     recalled  INTEGER NOT NULL DEFAULT 0,  -- 被撈次數計數器
     retired   INTEGER NOT NULL DEFAULT 0   -- 可標失效；⚠️ 永不刪除列
 );
@@ -106,12 +107,31 @@ def connect(path: str) -> sqlite3.Connection:
     cx.execute("PRAGMA synchronous=FULL")
     cx.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     cx.executescript(SCHEMA)
+    _migrate(cx)
     with write_txn(cx):
         cx.executemany(
             "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
             list(_DEFAULT_META.items()),
         )
     return cx
+
+
+def _migrate(cx: sqlite3.Connection) -> None:
+    """舊檔補欄位。`CREATE TABLE IF NOT EXISTS` 對已存在的表**什麼都不做**，
+    所以新加的欄位只會出現在新檔——舊檔要靠這裡補，否則寫入時才炸。
+
+    🆕 2026-09-25 `transcript.clean`（準 v3 最小記憶切片，標籤走 C）：
+    `ALTER TABLE ADD COLUMN` 在 SQLite 是零遷移成本（見上方 SCHEMA 的註解），
+    補完後把既有列回填成 `clean = content`——剝除規則未定前兩欄本來就相同，
+    ⚠️ 不回填的話舊列的 clean 是 NULL，而「NULL」與「剝完是空字串」是兩件事。
+    """
+    cols = {r["name"] for r in cx.execute("PRAGMA table_info(transcript)")}
+    if "clean" not in cols:
+        with write_txn(cx):
+            cx.execute("ALTER TABLE transcript ADD COLUMN clean TEXT")
+            n = cx.execute(
+                "UPDATE transcript SET clean = content WHERE clean IS NULL").rowcount
+        logger.warning(f"原文存放區補上 clean 欄位（一次性），回填 {n} 列")
 
 
 @contextmanager
@@ -327,3 +347,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     print("用法：python -m core.memory.db --selftest")
+

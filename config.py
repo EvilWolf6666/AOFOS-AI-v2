@@ -139,6 +139,23 @@ MAX_WORKING_MEMORY = 10      # Working Memory 保留輪數（超過 ×2 則觸�
 MAX_SUMMARY_SENTENCES = 8    # Compressed Memory 上限句數，避免無限累積
 COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user/assistant 各算一則）
 
+# ── 記憶：準 v3 最小記憶切片（core/memory/manager.py）──────────
+# 🟩 最小可行：每項的目標形與升級條件見《現況》〈🔒 隔離區〉記憶模塊〈準 v3〉〈十二〉。
+# ⚠️ 上面三個參數中 manager.py 只讀 MAX_WORKING_MEMORY（當滑動視窗輪數）；
+#    MAX_SUMMARY_SENTENCES／COMPRESS_BATCH_SIZE 與下方 RAG_* 只剩 v1 的 rag.py 與
+#    tools/ 診斷腳本在讀，v1 移出後即無讀者（保留不刪：刪了那幾支腳本 import 會炸）。
+MEMORY_CONFIG = {
+    # 日常區與測試區是兩個獨立檔。/test on 時「讀取共用、寫入分流」（第八章 C8）：
+    # 讀兩個、寫只寫測試區；進出測試模式時整包丟棄測試區。
+    "db_path": os.path.join(PROJECT_ROOT, "data", "memory.db"),
+    "test_db_path": os.path.join(PROJECT_ROOT, "data", "memory_test.db"),
+    "top_k": 3,              # 🟩 命中幾則
+    "neighbor_n": 2,         # 🟩 命中一則帶出前後各幾則
+    "max_query_terms": 64,   # 🟩 查詢最多取幾個 bigram（長輸入防 OR 爆量）
+    # 注入時的說話者稱呼。⚠️ 只影響注入文字，不寫進資料庫——改了不需遷移。
+    "speaker_labels": {"user": "邪狼", "assistant": "奧狐"},
+}
+
 # RAG
 RAG_TOP_K = 3
 RAG_SIMILARITY_THRESHOLD = 0.55   # 低於此分數的查詢結果直接丟棄
@@ -277,10 +294,12 @@ WINDOW_WATCHER_CONFIG = {
 # ─────────────────────────────────────────────────────────────
 # 用於《AOFOS-固定評測題組》施測與 LoRA 對照組實驗。
 #
-# ⚠️ 這裡只是旗標，實際分支在三處：
-#      core/memory/rag.py      → True 時不查詢、不寫入、不初始化
-#      core/memory/manager.py  → True 時改用 TEST_CONFIG["memory_path"]
+# ⚠️ 這裡只是旗標，實際分支在兩處（2026-09-26 起）：
+#      core/memory/manager.py  → True 時寫入改走 MEMORY_CONFIG["test_db_path"]
+#                                （讀取共用、寫入分流，第八章 C8）
 #      core/llm_client.py      → True 時套用 llm_overrides
+#    📌 TEST_CONFIG 的 "memory_path"／"disable_rag" 只剩 v1 的 rag.py 在讀，
+#       v1 移出後無讀者。
 
 TEST_MODE = False
 
