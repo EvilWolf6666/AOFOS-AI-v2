@@ -210,6 +210,10 @@ def main() -> int:
         th.start(); th.join()
         check("別的執行緒呼叫不崩潰、回傳不含注入（錯誤已記 log）",
               out and injected(out[0]) == "")
+        # ⚠️ Windows 不能刪「還開著」的檔：離開 with 前必須關連線，
+        #    否則暫存資料夾清不掉而拋 PermissionError（2026-09-26 Windows 實跑撞到，
+        #    Linux 不會發作——同一段測試碼在兩個平台行為不同）。
+        m.compress_on_exit()
 
     print("\n" + ("全部通過" if not _fail else f"❌ {_fail} 項失敗"))
     return 1 if _fail else 0
