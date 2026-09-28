@@ -16,7 +16,9 @@ import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 
+from config import MEMORY_CONFIG
 from core.memory.db import connect
+from core.memory.episode import EpisodeIndex, time_bucket
 from core.memory.manager import MemoryManager
 from core.memory.pre_write import PreWrite
 from core.memory.recall import RecallIndex, bigrams, check_fts5, time_ago
@@ -32,12 +34,39 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def mm(d: str, **kw) -> MemoryManager:
+    kw.setdefault("embed_enabled", False)   # 向量那一路另有專段測（用假模型）
     return MemoryManager(None, db_path=os.path.join(d, "memory.db"),
                          test_db_path=os.path.join(d, "memory_test.db"), **kw)
 
 
-def injected(ctx: list[dict]) -> str:
+def block(ctx: list[dict]) -> str:
+    """整個 ⟦記憶⟧ 區塊（沒有就空字串）。"""
     return "\n".join(m["content"] for m in ctx if m["role"] == "system")
+
+
+def injected(ctx: list[dict]) -> str:
+    """只取〔相關記憶〕那一段（檢索結果）；開場的狀態／上一場另外看。"""
+    b = block(ctx)
+    i = b.find("[相關記憶]")
+    return "" if i < 0 else b[i:].replace(MEMORY_CONFIG["block_close"], "").strip()
+
+
+class FakeModel:
+    """假 embedding：同義詞表裡的詞映到同一維，其餘逐字雜湊。只給自測用。"""
+    SYN = {"高雄": 0, "港都": 0, "貓": 1, "喵星人": 1}
+
+    def encode(self, texts):
+        import numpy as np
+        out = []
+        for t in ([texts] if isinstance(texts, str) else texts):
+            v = np.zeros(64, dtype=np.float32)
+            for w, dim in self.SYN.items():
+                if w in t:
+                    v[dim] += 3.0
+            for ch in t:
+                v[2 + (ord(ch) % 62)] += 0.05
+            out.append(v)
+        return np.stack(out)
 
 
 def main() -> int:
@@ -74,23 +103,31 @@ def main() -> int:
         m.compress_on_exit()
 
         m2 = mm(d)   # 新場次
-        check("新場次不注入摘要（摘要注入已停用）", m2.get_context("") == [])
+        b0 = block(m2.get_context(""))
+        check("新場次開頭帶狀態與上一場（包夾＋自帶說明）",
+              b0.startswith(MEMORY_CONFIG["block_open"]) and MEMORY_CONFIG["block_note"] in b0
+              and "[狀態] 上次聊天是剛剛" in b0 and "那次最後幾句" in b0, b0[:300])
+        check("開場不含日期數字", "2026-" not in b0 and "天前" not in b0)
         ctx = m2.get_context("高雄好玩嗎")
         inj = injected(ctx)
-        check("跨場次撈回原句", "我上次去高雄玩了三天" in inj, inj[:200])
-        check("帶出鄰域（對方回應）", "高雄的海風很舒服吧" in inj)
-        check("附時間差", "剛才" in inj or "分鐘前" in inj, inj[:120])
+        whole = block(ctx)
+        # 使用者那句已是開場「那次你特別說過」的代表句 ⇒ 檢索段只補對方回應、不重複
+        check("跨場次撈回（開場＋檢索合計、不重複）",
+              whole.count("我上次去高雄玩了三天") == 1 and "高雄的海風很舒服吧" in inj, whole[:400])
+        check("附口語時間感（不給日期）", "── 剛剛 ──" in inj and "2026-" not in inj, inj[:120])
         check("注入在尾端", ctx and ctx[-1]["role"] == "system")
         check("送模型的訊息只有 role/content",
               all(set(x) == {"role", "content"} for x in ctx))
-        inj2 = injected(m2.get_context("Minecraft 好玩"))
-        check("情境可被撈回且改印情境行", "［當時情境］使用者切換到 Minecraft" in inj2, inj2[:300])
+        inj2 = block(m2.get_context("Minecraft 好玩"))
+        # 那一輪是上一場的最後幾句 ⇒ 出現在開場段、不在檢索段重複（兩處擇一）
+        check("情境可被撈回且改印情境行", "［當時情境］使用者切換到 Minecraft" in inj2
+              and inj2.count("使用者切換到 Minecraft") == 1, inj2[:400])
         check("無關查詢不注入", injected(m2.get_context("量子色動力學")) == "")
         check("FTS5 語法字不炸", isinstance(m2.get_context('AND "NEAR* OR ) ('), list))
 
         cx = sqlite3.connect(os.path.join(d, "memory.db"))
-        rec = cx.execute("SELECT recalled FROM transcript WHERE content='我上次去高雄玩了三天'").fetchone()[0]
-        check("命中計數有記", rec >= 1, str(rec))
+        rec = cx.execute("SELECT SUM(recalled) FROM transcript WHERE content LIKE '%高雄%'").fetchone()[0]
+        check("命中計數有記", (rec or 0) >= 1, str(rec))
         check("clean 欄已寫", cx.execute(
             "SELECT COUNT(*) FROM transcript WHERE clean IS NULL").fetchone()[0] == 0)
         cx.close()
@@ -140,9 +177,9 @@ def main() -> int:
         """)
         old.commit(); old.close()
         m = mm(d)
-        inj = injected(m.get_context("台南"))
+        inj = block(m.get_context("台南"))
         check("舊檔補欄位＋回填＋補索引後撈得到", "舊資料裡的台南小吃" in inj, inj[:200])
-        check("舊資料時間差以天計", "天前" in inj, inj[:120])
+        check("舊資料的時間是口語、不給日期", "上次聊天是" in inj and "2026-" not in inj, inj[:160])
 
         # 預寫區被竄改：land 應停在壞列之前，不崩潰
         cx = connect(p)
@@ -214,6 +251,82 @@ def main() -> int:
         #    否則暫存資料夾清不掉而拋 PermissionError（2026-09-26 Windows 實跑撞到，
         #    Linux 不會發作——同一段測試碼在兩個平台行為不同）。
         m.compress_on_exit()
+
+    with tempfile.TemporaryDirectory() as d:
+        print("\n[事件層與開場帶入]")
+        import core.memory.manager as mgr
+        real_now = mgr._now_iso
+        base = datetime(2026, 9, 20, 20, 0, tzinfo=timezone(timedelta(hours=8)))
+        clock = [base]
+        mgr._now_iso = lambda: clock[0].isoformat(timespec="seconds")
+        try:
+            m = mm(d)
+            for i, (u, a) in enumerate([("今天去高雄吃了牛肉湯", "高雄的牛肉湯很有名"),
+                                        ("牛肉湯要配飯", "嗯嗯")]):
+                clock[0] = base + timedelta(minutes=i)
+                m.add_turn(u, a)
+            clock[0] = base + timedelta(hours=3)          # 相隔 3 小時 ⇒ 新的一段
+            for i in range(5):
+                clock[0] = base + timedelta(hours=3, minutes=i)
+                m.add_turn(f"在寫記憶模塊第{i}次", f"加油{i}")
+            m.compress_on_exit()
+        finally:
+            mgr._now_iso = real_now
+        cx = connect(os.path.join(d, "memory.db"))
+        ep = EpisodeIndex(cx)
+        n = cx.execute("SELECT COUNT(*) c FROM episode").fetchone()["c"]
+        check("依時間間隔切成 2 段", n == 2, str(n))
+        last = ep.last_before(10 ** 9)
+        check("上一段的關鍵詞抓到話題", any("記憶模塊" in k for k in last["keywords"]),
+              str(last["keywords"]))
+        check("代表句只挑使用者的話", all(r["role"] == "user" for r in
+              [dict(x) for x in cx.execute(
+                  f"SELECT role FROM transcript WHERE serial IN ({','.join(map(str, last['reps'])) or '0'})")]))
+        cx.close()
+        m2 = mm(d)
+        b1 = block(m2.get_context("嗨"))
+        check("開場帶上一場關鍵詞", "[上一場] 聊到：" in b1, b1[:300])
+        check("開場時間是口語（很久以前的那場）", "上次聊天是" in b1 and "2026-" not in b1, b1[:120])
+        for i in range(3):
+            m2.add_turn(f"閒聊{i}", "嗯")
+        check("過了開頭幾輪就不再帶上一場", "[上一場]" not in block(m2.get_context("閒聊")))
+        m2.compress_on_exit()
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+        check("時間感：昨天／上週／很久",
+              (time_bucket("2026-09-26T12:00:00+08:00", now), time_bucket("2026-09-18T12:00:00+08:00", now),
+               time_bucket("2026-06-01T12:00:00+08:00", now)) == ("昨天", "上週", "很久沒聊了"))
+
+    with tempfile.TemporaryDirectory() as d:
+        print("\n[向量那一路（假模型）＋RRF]")
+        import time as _t
+        m = mm(d, embed_enabled=True, embed_factory=FakeModel)
+        m.add_turn("我上次去高雄玩了三天", "好好喔")
+        m.add_turn("我家的貓很胖", "好可愛")
+        for i in range(11):
+            m.add_turn(f"填充{i}", f"嗯{i}")
+        for _ in range(100):
+            if m._emb.ready.is_set() and "未補向量 0 句" in m.status_text():
+                break
+            _t.sleep(0.05)
+        check("背景補完向量、狀態看得到積壓為 0", "未補向量 0 句" in m.status_text(), m.status_text())
+        inj = injected(m.get_context("港都好玩嗎"))
+        check("同義換句（字面零重疊）靠向量撈回", "高雄" in inj, inj[:200])
+        inj = injected(m.get_context("喵星人最近怎樣"))
+        check("第二組同義詞也撈得回", "貓很胖" in inj, inj[:200])
+        m.set_test_mode(True)
+        m.add_turn("測試區的一句話", "好")
+        m.set_test_mode(False)
+        check("有向量背景執行緒時，測試區仍能整包丟棄",
+              not os.path.exists(os.path.join(d, "memory_test.db")))
+        m.compress_on_exit()
+        m3 = mm(d, embed_enabled=True, embed_factory=lambda: (_ for _ in ()).throw(ImportError("假裝沒裝")))
+        for _ in range(40):
+            if m3._emb.failed:
+                break
+            _t.sleep(0.05)
+        check("向量套件缺失 ⇒ 退回字面檢索、不擋啟動", "向量停用" in m3.status_text()
+              and "高雄" in injected(m3.get_context("高雄")), m3.status_text())
+        m3.compress_on_exit()
 
     print("\n" + ("全部通過" if not _fail else f"❌ {_fail} 項失敗"))
     return 1 if _fail else 0

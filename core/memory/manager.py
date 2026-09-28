@@ -1,11 +1,14 @@
 # core/memory/manager.py
 """
-準 v3 最小記憶切片（《現況》〈🔒 隔離區〉記憶模塊〈準 v3（基準 1）〉〈十二〉）。
+準 v3 記憶（《現況》〈🔒 隔離區〉記憶模塊〈準 v3（基準 1）〉〈十二〉）。
 
-做的事只有三件：
+做的事：
   ① 每輪把雙方原句寫進原文存放區（沿用準 v2 的 pre_write → transcript）
-  ② 每輪依本輪輸入撈回原句（bigram＋FTS5，top_k＋前後鄰域）
-  ③ 撈到的原句附時間差，**追加在 context 尾端**
+  ② 每輪依本輪輸入撈回原句——兩路：bigram＋FTS5（字面）與向量（語意，背景載入），
+     以 RRF 合併取 top_k，每則帶前後鄰域（組合 6）
+  ③ 本場開頭幾輪另帶「狀態」與「上一場」（組合 7＋組合 9 甲案事件層）
+  ④ 全部包在一個 `⟦記憶⟧…⟦/記憶⟧` system 區塊裡，**追加在本輪輸入之前**；
+     區塊第一行自帶說明（prompt 版，不訓練、不改人格 prompt）
 Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪），超出的直接滑出——
 ⭐ 原句已經落地，滑出不會丟任何東西，**所以不需要壓縮**。
 
@@ -34,6 +37,8 @@ from datetime import datetime
 from config import MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE
 from core.logger import setup_logger, timed
 from core.memory.db import connect
+from core.memory.embed import Embedder, VectorSearch, VectorWorker, ensure_schema
+from core.memory.episode import EpisodeIndex, time_bucket
 from core.memory.pre_write import PreWrite
 from core.memory.recall import RecallIndex, check_fts5, format_blocks
 from core.memory.transcript import Transcript
@@ -52,13 +57,19 @@ class _RagDisabled:
 class _Store:
     """一個 DB 檔：連線 ＋ 三個存取物件。連線延後到第一次使用才開（見檔頭「執行緒」）。"""
 
-    def __init__(self, path: str, *, writable: bool) -> None:
+    def __init__(self, path: str, *, writable: bool, emb: Embedder | None = None,
+                 ep_cfg: dict | None = None) -> None:
         self.path = path
         self.writable = writable
+        self._emb = emb
+        self._ep_cfg = ep_cfg or {}
         self._cx = None
         self.pre_write: PreWrite | None = None
         self.transcript: Transcript | None = None
         self.index: RecallIndex | None = None
+        self.episodes: EpisodeIndex | None = None
+        self.vsearch: VectorSearch | None = None
+        self.session_start = 1   # 本場第一句的 serial；之前的都是「以前的場次」
 
     def open(self) -> "_Store":
         if self._cx is None:
@@ -66,11 +77,28 @@ class _Store:
             self.pre_write = PreWrite(self._cx)
             self.transcript = Transcript(self._cx)
             self.index = RecallIndex(self._cx, writable=self.writable)
+            self.episodes = EpisodeIndex(self._cx, writable=self.writable)
+            self.session_start = self.transcript.landed_upto + 1
             if self.writable:
                 n = self.index.catch_up()
                 if n:
                     logger.info(f"檢索索引補上 {n} 筆：{self.path}")
+                self.rebuild_episodes()
+                if self._emb is not None:
+                    ensure_schema(self._cx)
+            if self._emb is not None:
+                self.vsearch = VectorSearch(self._cx, self._emb)
         return self
+
+    def rebuild_episodes(self) -> None:
+        """事件層整張重建（確定性、不經 LLM）。失敗只記錄，不擋任何事。"""
+        if not (self.writable and self._ep_cfg):
+            return
+        try:
+            self.episodes.build(gap_minutes=self._ep_cfg["gap"],
+                                n_keywords=self._ep_cfg["kw"], n_reps=self._ep_cfg["reps"])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"事件層重建失敗（不影響原句與檢索）：{type(e).__name__}: {e}")
 
     def close(self) -> None:
         if self._cx is not None:
@@ -79,10 +107,17 @@ class _Store:
 
 
 def _discard_db(path: str) -> None:
-    """整包丟棄一個 DB（含 WAL 的兩個附屬檔）。**呼叫前必須已關閉連線。**"""
+    """整包丟棄一個 DB（含 WAL 的兩個附屬檔）。**呼叫前必須已關閉所有連線。**
+
+    ⚠️ 刪不掉（Windows 上有別的連線開著）時大聲、但不拋：測試模式切換不該因此崩潰；
+       殘留的測試區在下次 `/test on` 進場時會再丟一次。
+    """
     for p in (path, path + "-wal", path + "-shm"):
         if os.path.exists(p):
-            os.remove(p)
+            try:
+                os.remove(p)
+            except OSError as e:
+                logger.error(f"測試區檔案刪不掉（仍有連線開著？），殘留到下次進場再丟：{p}：{e}")
 
 
 def _now_iso() -> str:
@@ -92,8 +127,9 @@ def _now_iso() -> str:
 
 class MemoryManager:
     def __init__(self, llm=None, *, db_path: str | None = None,
-                 test_db_path: str | None = None):
-        """`llm` 只為介面相容而收（本檔不呼叫 LLM）。兩個路徑參數只給自測用。"""
+                 test_db_path: str | None = None, embed_factory=None,
+                 embed_enabled: bool | None = None):
+        """`llm` 只為介面相容而收（本檔不呼叫 LLM）。其餘參數只給自測用。"""
         # 🔴 依賴檢查放在建構時、大聲失敗：沒有 FTS5 就不要啟動，
         #    否則會是「對話照常、記憶照寫、永遠撈不回來」——最難發現的那種壞。
         check_fts5()
@@ -111,15 +147,37 @@ class MemoryManager:
         self._n = cfg["neighbor_n"]
         self._max_terms = cfg["max_query_terms"]
         self._labels = cfg["speaker_labels"]
+        self._open, self._close, self._note = cfg["block_open"], cfg["block_close"], cfg["block_note"]
+        self._carry = cfg["carry_rounds"]
+        self._opening_turns = cfg["opening_turns"]
+        self._ep_cfg = {"gap": cfg["episode_gap_minutes"], "kw": cfg["episode_keywords"],
+                        "reps": cfg["episode_reps"]}
+        self._vec_cfg = (cfg["embed_candidates"], cfg["embed_min_sim"], cfg["rrf_k"])
+        self._session_turns = 0
+        self._opening_cache: tuple[str, set[int]] | None = None
 
-        self._daily = _Store(self._daily_path, writable=True)
+        # 組合 6：向量那一路在背景載入，載好之前只用字面檢索（不擋啟動、不擋對話）
+        self._emb: Embedder | None = None
+        self._worker: VectorWorker | None = None
+        if cfg["embed_enabled"] if embed_enabled is None else embed_enabled:
+            self._emb = Embedder(cfg["embed_model"], factory=embed_factory)
+            self._emb.start()
+            self._worker = VectorWorker(self._emb)
+
+        self._daily = self._new_store(self._daily_path, writable=True)
         self._test: _Store | None = None
         self.test_mode = False
         if TEST_MODE:
             self._enter_test()
-        logger.info(f"記憶（準 v3 最小切片）：原句寫入 {self.memory_path}，摘要與向量 RAG 注入已停用")
+        if self._worker is not None:
+            self._worker.notify(self.memory_path)
+        logger.info(f"記憶（準 v3）：原句寫入 {self.memory_path}；"
+                    f"檢索＝字面{'＋向量（背景載入中）' if self._emb else '（向量已關閉）'}")
 
-    # ── 測試模式：讀取共用、寫入分流（第八章 C8）───────────────
+    def _new_store(self, path: str, *, writable: bool) -> _Store:
+        return _Store(path, writable=writable, emb=self._emb, ep_cfg=self._ep_cfg)
+
+    # ── 測試模式：讀取共用、寫入分流（第八章 舊C8（已結案））───────────────
 
     @property
     def memory_path(self) -> str:
@@ -128,21 +186,25 @@ class MemoryManager:
 
     def _enter_test(self) -> None:
         # 進場先丟一次：上一輪若沒正常離開，測試區會殘留，第 N 題就被前面污染。
+        if self._worker is not None:
+            self._worker.release(self._test_path)
         _discard_db(self._test_path)
-        self._test = _Store(self._test_path, writable=True)
-        # 日常區在施測中只讀：不 catch-up、不記命中 ⇒ 整輪施測日常區是靜止的。
+        self._test = self._new_store(self._test_path, writable=True)
+        # 日常區在施測中只讀：不 catch-up、不記命中、不補向量 ⇒ 整輪施測日常區是靜止的。
         self._daily.close()
-        self._daily = _Store(self._daily_path, writable=False)
+        self._daily = self._new_store(self._daily_path, writable=False)
         self.test_mode = True
         logger.warning(f"TEST_MODE：寫入只進 {self._test_path}，日常區唯讀")
 
     def _leave_test(self) -> None:
         if self._test is not None:
             self._test.close()
+            if self._worker is not None:
+                self._worker.release(self._test_path)
             _discard_db(self._test_path)
             self._test = None
         self._daily.close()
-        self._daily = _Store(self._daily_path, writable=True)
+        self._daily = self._new_store(self._daily_path, writable=True)
         self.test_mode = False
 
     def set_test_mode(self, on: bool) -> None:
@@ -155,10 +217,23 @@ class MemoryManager:
         self._flush()
         self._enter_test() if on else self._leave_test()
         self.working_memory.clear()
+        self._session_turns = 0
+        self._opening_cache = None
         logger.warning(
             f"測試模式{'開啟' if on else '關閉'}：寫入改為 {self.memory_path}，"
             f"Working Memory 已清空"
             + ("" if on else "，測試區已整包丟棄"))
+
+    def has_history(self) -> bool:
+        """原句存放區（讀取範圍內）有沒有任何一句。給啟動訊息用。
+
+        ⚠️ 讀失敗時回 False 並記 ERROR——啟動訊息印錯只是顯示問題，不該擋啟動。
+        """
+        try:
+            return any(st.transcript.count() > 0 for st in self._read_stores())
+        except Exception as e:
+            logger.error(f"讀不到原句存放區，啟動訊息當作無歷史：{type(e).__name__}: {e}")
+            return False
 
     def _write_store(self) -> _Store:
         return (self._test if self.test_mode else self._daily).open()
@@ -202,6 +277,7 @@ class MemoryManager:
             user_turn["situation"] = situation
         self.working_memory.append(user_turn)
         self.working_memory.append({"role": "assistant", "content": assistant_reply, **meta})
+        self._session_turns += 1
 
         self._flush()
         self._slide()
@@ -231,6 +307,8 @@ class MemoryManager:
                 if halt:
                     logger.error(f"預寫區中止：{halt}（已落地的部分照常可撈）")
                 st.index.catch_up()
+            if self._worker is not None:
+                self._worker.notify(st.path)
         except Exception as e:
             logger.error(
                 f"原句寫入失敗，{len(pending)} 則暫留 Working Memory、下一輪重試："
@@ -289,56 +367,139 @@ class MemoryManager:
         return {"role": turn["role"], "content": turn["content"]}
 
     def get_context(self, user_input: str = "") -> list[dict]:
-        """Working Memory → 撈回的原句（追加尾端）。
+        """Working Memory → 一個 `⟦記憶⟧` 區塊（追加在尾端、本輪輸入之前）。
 
-        ⚠️ 順序依「變動頻率由低到高」：撈回內容每輪不同，放尾端才不會讓
+        ⚠️ 順序依「變動頻率由低到高」：記憶區塊每輪不同，放尾端才不會讓
            WM 落在 prompt cache 斷點之後（prompt cache 比對的是最長共同前綴）。
-        ⚠️ user_input 為空（observation 輪次的 placeholder）時不撈——沿用舊行為，
-           屬 ① 類未確認項，不在本切片改動。
+        ⚠️ user_input 為空（observation 輪次的 placeholder）時不做檢索——沿用舊行為；
+           但本場開頭的「狀態／上一場」照帶（它不依賴輸入）。
         """
         with timed("記憶組裝"):
             context = [self._to_message(m) for m in self.working_memory]
+            sections, shown = [], set()
+            if self._session_turns < self._opening_turns:
+                opening, shown = self._opening()
+                if opening:
+                    sections.append(opening)
             if user_input:
-                text = self._recall(user_input)
-                if text:
-                    context.append({"role": "system", "content": text})
+                rel = self._recall(user_input, extra_exclude=shown)
+                if rel:
+                    sections.append(rel)
+            if sections:
+                context.append({"role": "system", "content": "\n".join(
+                    [self._open, self._note, *sections, self._close])})
         return context
 
-    def _recall(self, query: str) -> str:
-        """撈回失敗不中斷對話，但要大聲。"""
+    def _opening(self) -> tuple[str, set[int]]:
+        """組合 7（狀態）＋組合 9 甲案（上一場的關鍵詞、代表句、最後幾輪）。
+
+        ⭐ 本場只算一次、之後原樣重用 ⇒ 開頭幾輪這段字不變（對 prompt cache 友善），
+           且不依輸入——問「上次聊甚麼」這種沒有內容詞的話也有東西可用。
+        ⭐ 時間只給口語的時間感（`time_bucket`），不給日期與天數，避免她照唸。
+        回傳（文字, 已經帶出的 serial）——後者讓同一輪的檢索不重複帶同一句。
+        """
+        if self._opening_cache is not None:
+            return self._opening_cache
+        text, shown = "", set()
+        try:
+            if os.path.exists(self._daily_path) or not self.test_mode:
+                st = self._daily.open()
+                ep = st.episodes.last_before(st.session_start)
+                if ep is not None:
+                    bucket = time_bucket(ep["end_ts"])
+                    today = datetime.now().astimezone().date().isoformat()
+                    n_today = st.episodes.count_on(today)
+                    state = f"上次聊天是{bucket}" if bucket else "有上次聊天的紀錄"
+                    if n_today and bucket in ("剛剛", "今天稍早"):
+                        state += f"，今天已經聊過 {n_today} 次"
+                    state += f"；那次聊了大約 {max(1, ep['n_rows'] // 2)} 輪。"
+                    lines = [f"[狀態] {state}"]
+                    if ep["keywords"]:
+                        lines.append("[上一場] 聊到：" + "、".join(ep["keywords"]))
+                    reps = st.index.fetch(ep["reps"])
+                    lo = max(ep["start_serial"], st.session_start - self._carry * 2)
+                    tail = st.index.fetch(list(range(lo, st.session_start)))
+                    reps = [r for r in reps if r["serial"] < lo]   # 已在最後幾輪裡的不重複
+                    if reps:
+                        lines.append(format_blocks([reps], self._labels, title="  那次你特別說過：",
+                                                   when=lambda _ts: ""))
+                    if tail:
+                        lines.append(format_blocks([tail], self._labels, title="  那次最後幾句：",
+                                                   when=lambda _ts: ""))
+                    shown = {r["serial"] for r in reps + tail}
+                    text = "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"開場記憶組裝失敗，本場不帶上一場：{type(e).__name__}: {e}")
+            text, shown = "", set()
+        self._opening_cache = (text, shown)
+        return self._opening_cache
+
+    def _recall(self, query: str, *, extra_exclude: set[int] = frozenset()) -> str:
+        """字面＋向量兩路，RRF 合併取 top_k；撈回失敗不中斷對話，但要大聲。"""
         try:
             stores = self._read_stores()
             wm = {t["serial"] for t in self.working_memory if "serial" in t}
             write_st = stores[0]
+            n_cand, min_sim, k = self._vec_cfg
 
-            # 各區各撈 top_k，再依 bm25 合併取 top_k。
-            # 🟩 兩個 FTS 表的 bm25 分數嚴格說不可直接比（語料統計不同），
-            #    施測時才有兩區，日常只有一區——先這樣，量到偏差再改。
-            cands = []
-            for st in stores:
-                excl = wm if st is write_st else frozenset()
-                cands += [(score, s, st) for s, score in
-                          st.index.search(query, top_k=self._top_k,
-                                          max_terms=self._max_terms, exclude=excl)]
-            cands.sort(key=lambda c: c[0])
-            cands = cands[: self._top_k]
-            if not cands:
+            qvec = None
+            if self._emb is not None and self._emb.ready.is_set():
+                qvec = self._emb.encode([query])[0]
+
+            # RRF：每路依名次給 1/(k+名次)，兩路加總。⭐ 不比較兩路的原始分數
+            #    （bm25 與餘弦不同尺度、兩個 DB 的 bm25 也不同尺度），只比名次。
+            score: dict[tuple[int, int], float] = {}
+            n_fts = n_vec = 0
+            for si, st in enumerate(stores):
+                # 開場已帶出的句子只在日常區（stores 的最後一個）排除
+                excl = ((wm if st is write_st else set())
+                        | (set(extra_exclude) if si == len(stores) - 1 else set()))
+                fts = st.index.search(query, top_k=self._top_k * 3,
+                                      max_terms=self._max_terms, exclude=excl)
+                n_fts += len(fts)
+                for rank, (s, _) in enumerate(fts):
+                    score[(si, s)] = score.get((si, s), 0.0) + 1.0 / (k + rank + 1)
+                if qvec is not None and st.vsearch is not None:
+                    vec = st.vsearch.search(qvec, candidates=n_cand, min_sim=min_sim, exclude=excl)
+                    n_vec += len(vec)
+                    for rank, (s, _) in enumerate(vec):
+                        score[(si, s)] = score.get((si, s), 0.0) + 1.0 / (k + rank + 1)
+            top = sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))[: self._top_k]
+            if not top:
                 return ""
 
             blocks = []
-            for st in stores:
-                hits = [s for _, s, owner in cands if owner is st]
+            for si, st in enumerate(stores):
+                hits = [s for (i, s), _ in top if i == si]
                 if not hits:
                     continue
-                excl = wm if st is write_st else frozenset()
+                # 鄰域也排除開場已帶出的句子（同一句不在區塊裡出現兩次，省 token）
+                excl = ((wm if st is write_st else set())
+                        | (set(extra_exclude) if si == len(stores) - 1 else set()))
                 blocks += st.index.neighborhood(hits, self._n, exclude=excl)
                 st.index.mark_recalled(hits)
             blocks.sort(key=lambda b: b[0]["ts"] or "")
-            logger.debug(f"撈回 {len(cands)} 則命中、{len(blocks)} 段")
-            return format_blocks(blocks, self._labels)
-        except Exception as e:
+            logger.debug(f"撈回 {len(top)} 則命中、{len(blocks)} 段"
+                         f"（字面候選 {n_fts}、向量候選 {n_vec if qvec is not None else '未就緒'}）")
+            return format_blocks(blocks, self._labels, when=time_bucket,
+                                 title="[相關記憶] 過去對話的原句，依時間排列：")
+        except Exception as e:  # noqa: BLE001
             logger.error(f"取回失敗，本輪不注入記憶：{type(e).__name__}: {e}")
             return ""
+
+    def status_text(self) -> str:
+        """給 /status：檢索各路狀態與向量積壓（背景執行緒默默死掉時，這裡看得到積壓一直長）。"""
+        if self._emb is None:
+            return "字面（向量已關閉）"
+        if self._emb.failed:
+            return f"字面（向量停用：{self._emb.failed[:60]}）"
+        if not self._emb.ready.is_set():
+            return "字面（向量背景載入中）"
+        try:
+            pend = sum(st.vsearch.pending() for st in self._read_stores() if st.vsearch)
+        except Exception as e:  # noqa: BLE001
+            return f"字面＋向量（積壓查詢失敗：{type(e).__name__}）"
+        return f"字面＋向量（未補向量 {pend} 句）"
 
     # ── [相容殼] 舊版的壓縮介面 ────────────────────────────────
 
@@ -356,7 +517,13 @@ class MemoryManager:
             logger.error(f"離場時仍有 {len(left)} 則沒寫進原文存放區，程式結束後消失。")
         if self.test_mode:
             self._leave_test()   # 施測結束整包丟棄
+        else:
+            try:
+                self._daily.open().rebuild_episodes()   # 把本場切進事件層（確定性、毫秒級）
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"離場時事件層重建失敗：{type(e).__name__}: {e}")
         self._daily.close()
 
     def save_memory(self) -> None:
         """[相容殼] 每輪已即時落盤，沒有需要另外存的東西。"""
+

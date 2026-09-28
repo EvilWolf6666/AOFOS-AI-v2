@@ -239,7 +239,7 @@ class Agent:
             logger.debug(f"奧狐主動發起：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()
-            self.pipeline.finalize_turn()  # 與一般輪次相同，壓縮必須在輸出之後
+            self.pipeline.finalize_turn()  # 與一般輪次相同，收尾必須在輸出之後
 
     def _handle_utterance(self, event: Event) -> bool:
         """有人在說話。回傳 True 表示應結束主迴圈。"""
@@ -266,8 +266,8 @@ class Agent:
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()
 
-        # 記憶壓縮一律在輸出之後。即使本輪無回應也要呼叫：Working Memory
-        # 可能在先前輪次就已超長，略過會讓壓縮無限期延後。
+        # 收尾一律在輸出之後，即使本輪無回應也要呼叫（v1 時是壓縮；準 v3 目前空轉，
+        # 掛點保留給日後的離線處理——略過會讓那類處理無限期延後）。
         self.pipeline.finalize_turn()
         return False
 
@@ -279,19 +279,21 @@ class Agent:
         logger.debug(f"log 輸出已導向終端協調器（{bridged} 個 handler）")
 
         console.emit("=== 奧狐 AOFOS 啟動 ===")
-        console.emit("[記憶已載入]" if self.memory.compressed_memory else "[首次啟動，無歷史記憶]")
+        # 🔺 2026-09-26：改問 has_history()——原本看 compressed_memory，
+        #    而準 v3 切片沒有摘要 ⇒ 有記憶也永遠印「首次啟動」（《現況》二十一章 #7）。
+        console.emit("[記憶已載入]" if self.memory.has_history() else "[首次啟動，無歷史記憶]")
         console.emit("模式：t = 文字輸入，v = 語音輸入（預設文字）")
-        # ⚠️ 這串字面清單與 Pipeline._commands 是兩份真相，改指令時必須同步。
-        #    2026-08-16 實際發生過：/proactive test 已隨腳手架刪除，這裡仍列著它，
+        # 🔺 指令清單已改為取自 Pipeline.command_names()（單一來源），不再是字面清單。
+        #    改的原因：2026-08-16 /proactive test 已隨腳手架刪除，這裡的字面清單仍列著它，
         #    照著打會靜默落入對話分支（奧狐會認真回答「/proactive test」這句話）。
         console.emit("指令：" + "、".join(self.pipeline.command_names()) )
 
-        # 測試模式會改變記憶與 RAG 行為，必須在畫面上持續可見，
+        # 測試模式會改變記憶的寫入去向，必須在畫面上持續可見，
         # 否則容易在忘記自己開著的情況下把測試資料當成正常對話。
         if self.memory.test_mode:
             console.emit("\n" + "=" * 46)
             console.emit("  ⚠️  測試模式（TEST_MODE）目前為開啟狀態")
-            console.emit("     RAG 停用中、記憶寫入獨立測試檔")
+            console.emit("     記憶寫入只進測試區（讀取仍含日常區）")
             console.emit("     此為 config.py 的設定，非 /test 指令")
             console.emit("=" * 46)
         console.emit()
@@ -317,3 +319,4 @@ class Agent:
                 self._close_voice_input()
                 self._close_text_input_thread()
                 break
+
