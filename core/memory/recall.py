@@ -248,6 +248,15 @@ class RecallIndex:
                 blocks.append(block)
         return blocks
 
+    def fetch(self, serials: list[int]) -> list[dict]:
+        """依 serial 取原句（依 serial 排序、略過已退役）。給事件層代表句與開場帶入用。"""
+        if not serials:
+            return []
+        rows = self.cx.execute(
+            f"SELECT {','.join(_ROW_COLS)} FROM transcript WHERE retired = 0 AND serial IN "
+            f"({','.join('?' * len(serials))}) ORDER BY serial", list(serials)).fetchall()
+        return [{**{k: r[k] for k in _ROW_COLS}, "hit": False} for r in rows]
+
     def mark_recalled(self, serials: list[int]) -> None:
         """命中計數 +1（只算命中本身，不算鄰域）。唯讀模式下不寫。"""
         if not self.writable or not serials:
@@ -287,16 +296,23 @@ def time_ago(ts: str, now: datetime | None = None) -> str:
 
 
 def format_blocks(blocks: list[list[dict]], labels: dict[str, str],
-                  now: datetime | None = None) -> str:
+                  now: datetime | None = None, *, when=None,
+                  title: str = "[相關記憶] 以下是過去對話的原句，依時間排列；時間差以現在為準。"
+                  ) -> str:
     """段落 → 注入文字。原句逐字（取 clean），每段標時間差與日期。
 
     ⚠️ observation 輪次的 user 那則 content 是空 placeholder，情境在 situation
     ——這裡改印情境，否則會出現一行「邪狼：」後面什麼都沒有。
     """
-    parts = ["[相關記憶] 以下是過去對話的原句，依時間排列；時間差以現在為準。"]
+    parts = [title] if title else []
     for block in blocks:
         head = block[0]["ts"] or ""
-        parts.append(f"── {time_ago(head, now)}（{head[:16].replace('T', ' ')}）──")
+        # `when` 由呼叫端給（manager 用口語時間感、不給日期，見 episode.time_bucket）；
+        # 沒給就維持舊格式（時間差＋日期），給手動檢查工具用。
+        # 空字串 ⇒ 不印段頭（開場帶入那種「同一段、不需要再標時間」的用法）
+        label = when(head) if when else f"{time_ago(head, now)}（{head[:16].replace('T', ' ')}）"
+        if label:
+            parts.append(f"── {label} ──")
         for r in block:
             text = r["clean"] if r["clean"] is not None else r["content"]
             if r["role"] == "user" and not text.strip() and r["situation"]:

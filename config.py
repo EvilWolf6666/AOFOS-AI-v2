@@ -145,7 +145,7 @@ COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user
 #    MAX_SUMMARY_SENTENCES／COMPRESS_BATCH_SIZE 與下方 RAG_* 只剩 v1 的 rag.py 與
 #    tools/ 診斷腳本在讀，v1 移出後即無讀者（保留不刪：刪了那幾支腳本 import 會炸）。
 MEMORY_CONFIG = {
-    # 日常區與測試區是兩個獨立檔。/test on 時「讀取共用、寫入分流」（第八章 C8）：
+    # 日常區與測試區是兩個獨立檔。/test on 時「讀取共用、寫入分流」（第八章 舊C8（已結案））：
     # 讀兩個、寫只寫測試區；進出測試模式時整包丟棄測試區。
     "db_path": os.path.join(PROJECT_ROOT, "data", "memory.db"),
     "test_db_path": os.path.join(PROJECT_ROOT, "data", "memory_test.db"),
@@ -154,6 +154,36 @@ MEMORY_CONFIG = {
     "max_query_terms": 64,   # 🟩 查詢最多取幾個 bigram（長輸入防 OR 爆量）
     # 注入時的說話者稱呼。⚠️ 只影響注入文字，不寫進資料庫——改了不需遷移。
     "speaker_labels": {"user": "邪狼", "assistant": "奧狐"},
+
+    # ── 注入格式（prompt 版：不訓練，靠區塊自帶說明；2026-09-27 邪狼裁定）──
+    # 撈到的記憶以一則 system 訊息、用下面兩個符號包夾，緊接在本輪使用者輸入之前。
+    # ⚠️ 只用一般文字符號，不加進 tokenizer（加新 token 要訓 embed／lm_head）。
+    "block_open": "⟦記憶⟧",
+    "block_close": "⟦/記憶⟧",
+    # 區塊第一行的自我說明。⚠️ 刻意放在區塊裡、不改人格 prompt——人格 prompt 是
+    #    施測變數（SPT 在比較序列開跑後不得改動），記憶說明跟著記憶走才不互相牽動。
+    "block_note": "（以下是你記得的過去，不是對方現在說的話；和現在的話題有關才用，用自己的話帶出來，不要照抄原句。）",
+
+    # ── 組合 7：結構化狀態＋開場帶入（程式算、不經 LLM）──
+    "carry_rounds": 3,        # 開場帶入上一場最後幾輪
+    "opening_turns": 3,       # 本場前幾輪帶狀態與上一場；之後不帶（避免每輪同一段字被照唸）
+
+    # ── 組合 9 甲：事件層（程式切段、程式挑關鍵詞與代表句，不經 LLM）──
+    "episode_gap_minutes": 30,   # 兩句相隔超過這麼久就切成新的一段
+    "episode_keywords": 6,       # 每段挑幾個關鍵詞
+    "episode_reps": 2,           # 每段挑幾句代表句（只挑使用者的話）
+
+    # ── 組合 6：向量檢索（與 bigram＋FTS5 以 RRF 合併）──
+    # 2026-09-27 Windows 實測：import 14.5s＋載入 3.6s（只在開程式時、背景進行）、
+    # 單句 33 ms、常駐約 800 MB；掛著時 LLM 總耗時差約 1.7%（prompt 743 token）。
+    # ⚠️ 對話變長時記憶體壓力會變，屆時要重量。
+    "embed_enabled": True,
+    "embed_model": "paraphrase-multilingual-MiniLM-L12-v2",
+    # 低於此餘弦相似度的向量候選不採用。0.55 是同一顆模型在 v1 RAG 上
+    # 2026-08-07 第三輪實測定的「地板」（《歸檔》E0009～E0012）。
+    "embed_min_sim": 0.55,
+    "embed_candidates": 20,      # 向量路先取幾名再進 RRF
+    "rrf_k": 60,                 # RRF 常數（慣用值）
 }
 
 # RAG
@@ -215,17 +245,17 @@ EVENT_CONFIG = {
     #    引導句，推理端結構須與訓練端一致。非空值會把情境框成「有人在跟妳講話」。
     "observation_prompt_suffix": "",
 
-    # 情境訊息的 role 名稱。🔴 待定，值暫時不動（《現況》第八章 P18）。
+    # 情境訊息的 role 名稱。🔴 待定，值暫時不動（《現況》第八章 P8）。
     #
     # ⚠️ 兩套 role 定義交錯，交集裡沒有兩邊都正確的選項：
     #      "ipython" 過不了 LM Studio 白名單（400，實測）
     #      "tool"    非 Llama-3.1 合法 role，且 v4 的 template 把它原樣插進 header
     #                （渲染出 <|start_header_id|>tool，模型沒見過）
     #    v3 曾有 tool → ipython 映射分支，v4 沒有——依 v3 時代的推理做決定會出錯。
-    # ⚠️ 讀完《現況》第八章 P18 之前不要改這個值。
+    # ⚠️ 讀完《現況》第八章 P8 之前不要改這個值。
     "observation_role": "tool",
 
-    # 註："test_observations" 腳手架已移除（《現況》第八章 C4）。日後若再需要手動注入情境，
+    # 註："test_observations" 腳手架已移除（《現況》第八章 舊C4（已結案））。日後若再需要手動注入情境，
     #     正確做法是新增 producer 而非加回腳手架——路徑必須與真實事件相同。
 }
 
@@ -296,7 +326,7 @@ WINDOW_WATCHER_CONFIG = {
 #
 # ⚠️ 這裡只是旗標，實際分支在兩處（2026-09-26 起）：
 #      core/memory/manager.py  → True 時寫入改走 MEMORY_CONFIG["test_db_path"]
-#                                （讀取共用、寫入分流，第八章 C8）
+#                                （讀取共用、寫入分流，第八章 舊C8（已結案））
 #      core/llm_client.py      → True 時套用 llm_overrides
 #    📌 TEST_CONFIG 的 "memory_path"／"disable_rag" 只剩 v1 的 rag.py 在讀，
 #       v1 移出後無讀者。
@@ -351,7 +381,7 @@ TIMING_CONFIG = {
 # 註：TIMING_CONFIG 不屬腳手架（延遲量測是長期需求），評測結束後再決定去留。
 
 DIAGNOSTICS = {
-    # ⚠️ 保留理由已於 2026-08-28 從假設轉為排程（《現況》第八章 C1）：2026-08-26
+    # ⚠️ 保留理由已於 2026-08-28 從假設轉為排程（《現況》第八章 C13）：2026-08-26
     #    三組 36 題實測在 opencc 關閉下仍抓到簡體字，恢復已成定局、只剩何時
     #    （2026-09-03 裁定等換設備後再議），而恢復時本項是唯一能看見轉換內容的
     #    工具。舊目的「釐清異體字來源」已於 2026-08-06 達成且證偽。
@@ -365,3 +395,4 @@ PERSONA_CONFIG = {
     "name": "奧狐",
     "language": "繁體中文",
 }
+

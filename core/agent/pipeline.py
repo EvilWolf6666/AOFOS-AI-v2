@@ -4,7 +4,8 @@ Pipeline（流程控制層）
 
 決定一個事件該怎麼被處理：系統指令、正常對話輪次，還是環境事件。
 正常輪次的處理順序固定為：取記憶 context → 組裝 Prompt → 呼叫 LLM → 寫回記憶，
-輪次收尾（記憶壓縮）另由 finalize_turn() 負責，由 Agent 在輸出之後呼叫。
+輪次收尾另由 finalize_turn() 負責，由 Agent 在輸出之後呼叫
+（🔺 2026-09-27：準 v3 不壓縮，該掛點目前空轉；留著給日後的離線整理用）。
 
 Prompt 組裝的優先順序由 persona.build_messages() 決定，此處只負責呼叫順序。
 
@@ -71,6 +72,8 @@ class _StreamSink:
 class Pipeline:
     """不負責模組的建立與連線（那是 Agent 的職責），只負責呼叫順序與分流邏輯。"""
 
+    # 🔺 2026-09-27：準 v3 的 needs_compress() 恆為 False ⇒ 這句目前不會印出；
+    #    日後若恢復任何輸出後的長耗時處理，沿用此提示（畫面無動靜會被當成當機）。
     # 壓縮期間畫面完全沒有動靜，看起來像當機。兩條路徑共用（輪次收尾與離場）。
     # ⚠️ 寧可寫長不寫短：秒數隨 Working Memory 長度與背景 CPU 競爭浮動，
     #    提前結束無害，超出提示上限會被當成當機（實測依據見《現況》15之2）。
@@ -112,7 +115,7 @@ class Pipeline:
         由長至短逐段比對，因為指令 key 本身含空白（"/mode t"）。取第一段會讓
         "/proactive on" 誤命中不存在的 "/proactive"。
 
-        ⚠️ takes_arg 目前無任何使用者（《現況》第八章 C4 清理後），留著的成本是一個 bool；
+        ⚠️ takes_arg 目前無任何使用者（《現況》第八章 舊C4（已結案）清理後），留著的成本是一個 bool；
         新增帶參數的指令時登記 takes_arg=True 即可。
         ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫；需大小寫敏感時改由原始輸入取。
         """
@@ -161,7 +164,10 @@ class Pipeline:
     def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
         # ⚠️ compress_on_exit() 不檢查 needs_compress()，只要 working_memory
         # 非空就壓縮——講兩句話就退出也會等，故此處條件只看「有沒有東西要壓」。
-        if self.memory.working_memory and not self.memory.test_mode:
+        # 🔺 2026-09-26：改問 needs_compress()，不自己推「有 WM 就會壓縮」——
+        #    記憶層換成準 v3 切片後離場不再壓縮，舊條件會印一句不成立的「約需 1 分鐘」
+        #    （《現況》二十一章 #7）。要不要等由記憶層回答，本層不猜。
+        if self.memory.needs_compress() and not self.memory.test_mode:
             console.emit(self.COMPRESS_WAIT_MESSAGE)
 
         self.memory.compress_on_exit()
@@ -188,12 +194,11 @@ class Pipeline:
         self._set_test_mode(True)
         return TurnResult(system_message=(
             "[測試模式已開啟]\n"
-            "  · RAG 已停用（不查詢、不寫入）\n"
-            "  · 推理參數切為貪婪解碼（temperature=0、top_k=1），輸出可重現\n"
+            "  · 記憶：讀取共用（日常區＋測試區）、寫入只進測試區；日常區整輪不變動\n"
+            "  · 推理參數切為貪婪解碼（temperature=0、top_k=1）\n"
+            "    ⚠ 2026-09-27 實測：開機後第一次請求的輸出曾與之後不同，逐字重現不保證\n"
             "  · 串流輸出已停用（串流與非串流是否逐字相同尚未驗證，施測不賭這個假設）\n"
-            "  · 記憶改用獨立測試檔，正式記憶檔完全未被改動\n"
-            "  · Working Memory 已清空（僅存在記憶體、從不寫檔）\n"
-            "  ⚠ 本次開機以來尚未壓縮的對話已直接丟棄，不會進入長期記憶\n"
+            "  · Working Memory 已清空（本場已說的話先前已寫進日常區，沒有遺失）\n"
             "  · 本設定不寫入 config，重開程式後自動回到正常模式"
         ))
 
@@ -201,12 +206,10 @@ class Pipeline:
         self._set_test_mode(False)
         return TurnResult(system_message=(
             "[測試模式已關閉]\n"
-            "  · RAG 已恢復\n"
             "  · 推理參數已還原為日常設定\n"
             "  · 串流輸出已恢復（依 config LLM_CONFIG['stream']）\n"
-            "  · 記憶已切回正式檔\n"
-            "  · Working Memory 已清空\n"
-            "  ⚠ 測試期間尚未壓縮的對話已直接丟棄"
+            "  · 記憶已切回日常區；測試區已整包丟棄（測試期間的對話不進日常記憶）\n"
+            "  · Working Memory 已清空"
         ))
 
     def _set_test_mode(self, on: bool) -> None:
@@ -229,8 +232,8 @@ class Pipeline:
             f"extra_body={self.llm.extra_body}\n"
             f"  · 串流輸出：{'開啟' if self.llm.stream else '關閉'}"
             f"{'（測試模式下強制停用中）' if self.memory.test_mode else ''}\n"
-            f"  · RAG：{'啟用' if self.memory.rag.enabled else '停用'}\n"
-            f"  · 記憶檔：{self.memory.memory_path}\n"
+            f"  · 記憶檢索：{self.memory.status_text()}\n"
+            f"  · 記憶寫入：{self.memory.memory_path}\n"
             f"  · Working Memory：{len(self.memory.working_memory)} 則"
         ))
 
@@ -263,7 +266,7 @@ class Pipeline:
         return reply, sink.used
 
     def handle_turn(self, event: Event) -> TurnResult:
-        """取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。壓縮見 finalize_turn()。
+        """取記憶 context → 組 Prompt → 呼叫 LLM → 追加記憶。輸出後收尾見 finalize_turn()。
 
         ⚠️ 收整個 Event 而不是字串：`source` 與 `kind` 是 Event 自己的欄位，
         在此只取 payload 等於把它們丟掉。Pipeline 本來就是 Event 的消費者
@@ -291,7 +294,9 @@ class Pipeline:
 
     def finalize_turn(self) -> None:
         """
-        視 Working Memory 長度決定是否壓縮記憶。
+        輸出後的收尾掛點。🔺 2026-09-27：準 v3 不壓縮，`needs_compress()`／
+        `maybe_compress()` 是相容空殼（恆 False／不做事），本方法目前空轉。
+        以下為 v1 時期的設計理由，日後掛離線處理時仍適用：
 
         🔴 必須由 Agent 在回應「已經輸出之後」呼叫——這是本方法存在的唯一理由。
         壓縮是一次完整的 LLM 呼叫，放在輸出前會直接落在使用者等待的路徑上。
@@ -342,9 +347,9 @@ class Pipeline:
         不是防禦性程式碼**。而「要不要把情境餵給模型／餵給 _compress」是另一個
         決定（方案 α），待 observation 類訓練資料就緒後再議，本次不做。
 
-        ⚠️ **observation 輪次不查 RAG，這是實際行為但尚未確認是否應該如此。**
+        ⚠️ **observation 輪次不做記憶檢索，這是實際行為但尚未確認是否應該如此。**
         傳給 get_context() 的是空 placeholder，該方法的 `if user_input:` 因此
-        跳過查詢，即使 description 本身是可用的檢索字串。屬 ① 類，暫不改動——
+        跳過查詢，即使 description 本身是可用的檢索字串（開場帶入仍照常）。
         改動前先確認收益，不要當成 bug 直接「修好」。
         """
         description = event.payload
@@ -369,3 +374,4 @@ class Pipeline:
             )
 
         return TurnResult(reply=reply, printed=printed)
+
