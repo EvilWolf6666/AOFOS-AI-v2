@@ -83,6 +83,39 @@ def wait(pred, timeout=8.0) -> bool:
     return False
 
 
+def open_handles(d: str) -> list[str]:
+    """本行程還開著、指向 d 底下的檔案（Linux 用 /proc 看；其他平台回空＝不檢查）。
+
+    🔴 存在理由：Windows 不能刪開著的檔，Linux 可以 ⇒ 連線漏關在 Linux 自測永遠看不出來
+       （2026-09-30 Windows 實跑兩支自測都在清暫存資料夾時炸）。這裡在 Linux 上把同一件事變成可見。
+    """
+    import gc
+    gc.collect()   # sqlite3 連線可能卡在循環參考裡，先收掉，只留真的還被持有的
+    fd_dir = "/proc/self/fd"
+    if not os.path.isdir(fd_dir):
+        return []
+    real = os.path.realpath(d)
+    out = []
+    for fd in os.listdir(fd_dir):
+        try:
+            t = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if t.startswith(real):
+            out.append(os.path.basename(t))
+    return sorted(out)
+
+
+def has_table(path: str, name: str) -> bool:
+    # 🔴 一定要關：Windows 上沒關的連線會讓測試區刪不掉、暫存資料夾清不掉
+    #    （2026-09-30 Windows 實跑抓到；Linux 刪得掉開著的檔，所以本機自測看不出來）。
+    cx = sqlite3.connect(path)
+    try:
+        return cx.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone() is not None
+    finally:
+        cx.close()
+
+
 def injected(ctx: list[dict]) -> str:
     return "\n".join(m["content"] for m in ctx if m["role"] == "system" and "⟦記憶⟧" in m["content"])
 
@@ -167,8 +200,7 @@ def main() -> int:
             print("\n[端到端：閒置 → 判斷 → 主題 → 注入]")
             m = mm(d, fake)
             check("啟動時不碰 DB 建主題表（連線延後到真的要判）",
-                  sqlite3.connect(os.path.join(d, "memory.db")).execute(
-                      "SELECT 1 FROM sqlite_master WHERE name='topic'").fetchone() is None)
+                  not has_table(os.path.join(d, "memory.db"), "topic"))
             turn(m, "我住在高雄", "高雄很熱吧")
             turn(m, "我家的貓很胖", "好可愛")
             ok = wait(lambda: judged(m)[0] == judged(m)[1] == 4)
@@ -241,16 +273,18 @@ def main() -> int:
             m.set_test_mode(True)
             turn(m, "施測題：我住在高雄", "好")
             time.sleep(1.0)
-            check("施測中不判（測試區沒有主題表）", sqlite3.connect(m.memory_path).execute(
-                "SELECT 1 FROM sqlite_master WHERE name='topic'").fetchone() is None)
+            check("施測中不判（測試區沒有主題表）", not has_table(m.memory_path, "topic"))
             inj = injected(m.get_context("你住哪"))
             check("施測中仍讀得到日常區主題", "台北" in inj, inj)
             m.set_test_mode(False)
             check("離場測試區整包丟棄", not os.path.exists(os.path.join(d, "memory_test.db")))
             check("日常區進度沒被施測動到", judged(m)[0] == before)
 
-            print("\n[暫停逾時保險]")
             m.compress_on_exit()
+            h = open_handles(d)
+            check("離場後沒有任何連線還開著（Windows 才刪得掉）", not h, str(h))
+
+            print("\n[暫停逾時保險]")
         with tempfile.TemporaryDirectory() as d:
             m = mm(d, fake, judge_pause_timeout_s=0.5)
             m.bg_pause()
@@ -258,6 +292,8 @@ def main() -> int:
             ok = wait(lambda: judged(m)[0] == 2, 6.0)
             check("暫停沒被恢復 ⇒ 逾時自動恢復並完成", ok, str(judged(m)))
             m.compress_on_exit()
+            h = open_handles(d)
+            check("離場後沒有任何連線還開著", not h, str(h))
     finally:
         fake.close()
 

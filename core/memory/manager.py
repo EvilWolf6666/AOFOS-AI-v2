@@ -638,6 +638,10 @@ class MemoryManager:
             except Exception as e:  # noqa: BLE001
                 logger.error(f"離場時事件層重建失敗：{type(e).__name__}: {e}")
         self._daily.close()
+        if self._worker is not None:
+            # 背景補向量的執行緒自己開著日常區的連線；不放掉的話 Windows 上檔案刪不掉／搬不動
+            # （2026-09-30 Windows 跑 selftest 抓到，暫存資料夾清不掉）。
+            self._worker.release(self._daily_path)
 
     def save_memory(self) -> None:
         """[相容殼] 每輪已即時落盤，沒有需要另外存的東西。"""
