@@ -239,7 +239,9 @@ class Agent:
             logger.debug(f"奧狐主動發起：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
             self._drive_vtube_on_reply()
-            self.pipeline.finalize_turn()  # 與一般輪次相同，收尾必須在輸出之後
+        # 🔺 2026-09-30：移出 `if result.reply`，與 _handle_utterance 一致（無回應也收尾）——
+        #    準 v4 的背景判斷在輪次開始暫停、在這裡恢復，漏呼叫會卡到暫停逾時才恢復。
+        self.pipeline.finalize_turn()  # 與一般輪次相同，收尾必須在輸出之後
 
     def _handle_utterance(self, event: Event) -> bool:
         """有人在說話。回傳 True 表示應結束主迴圈。"""
@@ -319,4 +321,3 @@ class Agent:
                 self._close_voice_input()
                 self._close_text_input_thread()
                 break
-

@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS pre_write (
     hash      TEXT    NOT NULL,
     source    TEXT,               -- 開放值域：只記錄，不得做分支判斷
     kind      TEXT,               -- 封閉值域：utterance / observation
-    situation TEXT                -- 只有 observation 輪次的 user 那則會有
+    situation TEXT,               -- 只有 observation 輪次的 user 那則會有
+    speaker_id TEXT               -- 準 v4：說話者 ID（邪狼／奧狐／觀眾平台 ID）；NULL＝未知（舊資料）
 );
 
 -- 原文存放區：逐字原句的權威副本，永久。不刪，只標 retired。
@@ -69,13 +70,12 @@ CREATE TABLE IF NOT EXISTS transcript (
     situation TEXT,
     clean     TEXT,               -- 乾淨文字：供檢索與注入（規則見 clean.py）
     recalled  INTEGER NOT NULL DEFAULT 0,  -- 被撈次數計數器
-    retired   INTEGER NOT NULL DEFAULT 0   -- 可標失效；⚠️ 永不刪除列
+    retired   INTEGER NOT NULL DEFAULT 0,  -- 可標失效；⚠️ 永不刪除列
+    speaker_id TEXT                        -- 準 v4：這一句是誰說的；NULL＝未知（欄位加入前的舊列）
 );
--- ⚠️ **participants 欄位刻意不建**（2026-09-13 邪狼裁決）：現在沒有平台、
---    沒有 ID 機制，值域是猜的 ⇒ 退回 ① 類，等有觀眾層再加。
---    ⭐ 它之所以可以安全延後，是因為 SQLite 的 `ALTER TABLE ADD COLUMN`
---    對既有列給預設值、**零遷移成本**——這一點在有 schema 的儲存上不是通例，
---    是 SQLite 的性質，所以這個延後判斷不可直接套用到別的儲存。
+-- 🔺 2026-09-30：`participants` 改為每句一個 `speaker_id`（《現況》11之2 丁；舊裁決《歸檔》D0030）。
+--    「誰在場」由同一段對話的 speaker_id 收集推出，不另存（兩份會對不上）。
+--    舊列不回填：當時只有邪狼在用，但「猜的值」與「記錄到的值」長得一樣，寧可留 NULL。
 
 -- 單一鍵值表：next_serial（下一個可用號）／landed_upto（N）／compressed_upto（M）
 CREATE TABLE IF NOT EXISTS meta (
@@ -132,6 +132,15 @@ def _migrate(cx: sqlite3.Connection) -> None:
             n = cx.execute(
                 "UPDATE transcript SET clean = content WHERE clean IS NULL").rowcount
         logger.warning(f"原文存放區補上 clean 欄位（一次性），回填 {n} 列")
+
+    # 🆕 2026-09-30 準 v4：speaker_id（預寫區與原文存放區都要有，預寫區是原樣轉寫的上游）。
+    # ⚠️ 一次性結構改動（《現況》〈📐 規則〉二「架構上只做一次的事」）：動手前先備份 data/memory.db。
+    for table in ("pre_write", "transcript"):
+        cols = {r["name"] for r in cx.execute(f"PRAGMA table_info({table})")}
+        if "speaker_id" not in cols:
+            with write_txn(cx):
+                cx.execute(f"ALTER TABLE {table} ADD COLUMN speaker_id TEXT")
+            logger.warning(f"{table} 補上 speaker_id 欄位（一次性；舊列為 NULL＝未知）")
 
 
 @contextmanager
@@ -347,4 +356,3 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     print("用法：python -m core.memory.db --selftest")
-
