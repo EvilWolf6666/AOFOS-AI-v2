@@ -33,6 +33,29 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         _fail += 1
 
 
+def open_handles(d: str) -> list[str]:
+    """本行程還開著、指向 d 底下的檔案（Linux 用 /proc 看；其他平台回空＝不檢查）。
+
+    🔴 存在理由：Windows 不能刪開著的檔，Linux 可以 ⇒ 連線漏關在 Linux 自測永遠看不出來
+       （2026-09-30 Windows 實跑兩支自測都在清暫存資料夾時炸）。這裡在 Linux 上把同一件事變成可見。
+    """
+    import gc
+    gc.collect()   # sqlite3 連線可能卡在循環參考裡，先收掉，只留真的還被持有的
+    fd_dir = "/proc/self/fd"
+    if not os.path.isdir(fd_dir):
+        return []
+    real = os.path.realpath(d)
+    out = []
+    for fd in os.listdir(fd_dir):
+        try:
+            t = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if t.startswith(real):
+            out.append(os.path.basename(t))
+    return sorted(out)
+
+
 def mm(d: str, **kw) -> MemoryManager:
     kw.setdefault("embed_enabled", False)   # 向量那一路另有專段測（用假模型）
     # 🔺 2026-09-30：本檔測的是準 v3 的讀取路徑 ⇒ 明開 v3、關 v4（config 預設已改成準 v4）。
@@ -330,6 +353,8 @@ def main() -> int:
         check("向量套件缺失 ⇒ 退回字面檢索、不擋啟動", "向量停用" in m3.status_text()
               and "高雄" in injected(m3.get_context("高雄")), m3.status_text())
         m3.compress_on_exit()
+        h = open_handles(d)
+        check("離場後沒有任何連線還開著（Windows 才刪得掉）", not h, str(h))
 
     print("\n" + ("全部通過" if not _fail else f"❌ {_fail} 項失敗"))
     return 1 if _fail else 0
