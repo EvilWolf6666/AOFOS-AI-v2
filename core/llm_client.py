@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 from openai import OpenAI
 
-from config import LLM_CONFIG, LMSTUDIO_LOAD_PARAMS, TEST_CONFIG
+from config import LLM_CONFIG, LMSTUDIO_LOAD_PARAMS, TEST_CONFIG, TEST_MODE
 from core.backend_check import verify_lmstudio
 from core.logger import setup_logger, timed
 from core.text_utils import fix_traditional
@@ -79,6 +79,12 @@ class LLMClient:
             self.model,
             LMSTUDIO_LOAD_PARAMS.get("context_length"),
         )
+
+        # config.TEST_MODE 開啟時，啟動即套用評測推理參數（與 /test on 走同一條路徑）。
+        # 🔺 2026-09-28 修：先前只有記憶層讀 TEST_MODE，推理參數與串流仍是日常值，
+        #    而 /status 照樣顯示「測試模式：開啟」——不報錯的條件污染。
+        if TEST_MODE:
+            self.set_test_mode(True)
 
     # ── 評測模式 ──────────────────────────────────────────────
 
@@ -379,3 +385,145 @@ class LLMClient:
 
         logger.debug(f"回應：{reply[:50]}...")
         return reply
+
+
+# ══════════════════════════════════════════════════════════════
+# 準 v4：背景 LLM 呼叫（可跨執行緒取消）
+# ══════════════════════════════════════════════════════════════
+#
+# 為什麼另開一個 client、不共用上面的 LLMClient：
+#   · 背景呼叫要能被**另一條執行緒**中途取消（使用者開口時），取消的手段是關掉
+#     這次請求的 HTTP 連線；共用 client 會連帶影響對話那一條。
+#   · 參數不同：判斷與標主題一律貪婪解碼、輸出上限很低，不跟著日常取樣參數走。
+#
+# 🔴 **為什麼取消這麼重要**：LM Studio 只有一個推理槽（Max Concurrent Predictions=1）。
+#    背景呼叫還在跑時使用者開口，對話那一次會排在它後面，**多等一次 5～15 秒**。
+#    ⇒ 取消若做不出來，準 v4 裁決是直接改上小模型（甲），見《現況》〈🔒 隔離區〉〈準 v4〉。
+#    ⚠️ 本類別能保證的是「我們這端立刻放手、連線關掉」；LM Studio 收到斷線後
+#       會不會立刻停止生成是它的行為（《現況》11之2 己：串流下靠偵測斷線停止，屬外部查證、未實測）
+#       ⇒ Windows 實測時要看：取消後下一次對話的 TTFT 有沒有被拖長。
+
+class BackgroundCancelled(Exception):
+    """背景呼叫被取消（使用者開口）。不是錯誤，呼叫端照常跳過本次工作即可。"""
+
+
+class BackgroundLLM:
+    """背景專用、可取消的 LLM 呼叫。**只給記憶的背景工作用，不接對話。**
+
+    🔴 **刻意不用 OpenAI SDK，改用標準庫 http.client 自己送**：取消要在兩個階段都立刻生效——
+      ① 請求已送出、LM Studio 還在 prefill（連回應標頭都還沒回）
+      ② 已在串流
+    SDK（httpx）在 ① 階段沒有從別的執行緒中斷的手段（關 client 不會打斷正在等的讀取，
+    2026-09-30 用假伺服器實測：取消後仍卡到標頭回來才放手，prefill 3 秒就等 2.5 秒）。
+    自己持有 socket ⇒ `shutdown()` 會讓另一條執行緒卡住的 recv 立刻返回 ⇒ 兩個階段都是毫秒級。
+    ⚠️ 代價：SSE 解析自己做（只需 `data:` 行與 `[DONE]`，格式固定）。
+    """
+
+    def __init__(self, *, base_url: str | None = None, model: str | None = None,
+                 params: dict | None = None, timeout_s: float = 120.0) -> None:
+        import threading
+        from urllib.parse import urlparse
+        u = urlparse(base_url or LLM_CONFIG["base_url"])
+        self._host, self._port = u.hostname, u.port or 80
+        self._path = u.path.rstrip("/") + "/chat/completions"
+        self.model = model or LLM_CONFIG["model"]
+        self.params = dict(params or {})
+        self.timeout_s = timeout_s
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        # ⚠️ 存 socket 本身、不存 conn：伺服器回 Connection: close 時，http.client 在
+        #    getresponse() 之後就把 conn.sock 設成 None（socket 轉交給 response），
+        #    只存 conn 的話串流階段 cancel() 會找不到 socket（2026-09-30 自測抓到）。
+        self._sock = None
+
+    # ── 取消 ──────────────────────────────────────────────────
+
+    def cancel(self) -> bool:
+        """要求停止。回傳 True＝當下有請求在跑、已切斷連線。可從任何執行緒呼叫。"""
+        import socket
+        self._cancel.set()
+        with self._lock:
+            sock = self._sock
+        if sock is None:
+            return False
+        try:
+            sock.shutdown(socket.SHUT_RDWR)   # 讓卡在 recv 的那條執行緒立刻返回
+        except OSError:
+            pass
+        return True
+
+    def resume(self) -> None:
+        """允許下一次背景呼叫。"""
+        self._cancel.clear()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    # ── 呼叫 ──────────────────────────────────────────────────
+
+    def call(self, messages: list, *, purpose: str, max_tokens: int,
+             schema: dict | None = None) -> str:
+        """送出一次背景呼叫，回傳完整文字（schema 給了就是 JSON 字串）。
+
+        被取消 ⇒ 拋 BackgroundCancelled；其他失敗照常拋（呼叫端記錄、下次再做）。
+        schema：LM Studio `response_format: json_schema`（GGUF 走 llama.cpp grammar 取樣，
+        輸出被硬性限制在 schema 內）。
+        """
+        import http.client
+        import json as _json
+        if self._cancel.is_set():
+            raise BackgroundCancelled()
+        body = dict(model=self.model, messages=messages, max_tokens=max_tokens,
+                    temperature=self.params.get("temperature", 0.0),
+                    top_p=self.params.get("top_p", 1.0), stream=True)
+        for k in ("top_k", "min_p", "repeat_penalty"):
+            if self.params.get(k) is not None:
+                body[k] = self.params[k]
+        if schema is not None:
+            body["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": purpose, "strict": True, "schema": schema}}
+        parts: list[str] = []
+        resp = None
+        conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout_s)
+        try:
+            with timed(f"LLM背景[{purpose}]", model=self.model, purpose=purpose):
+                conn.connect()
+                with self._lock:
+                    self._sock = conn.sock
+                if self._cancel.is_set():
+                    raise BackgroundCancelled()
+                conn.request("POST", self._path, body=_json.dumps(body).encode("utf-8"),
+                             headers={"Content-Type": "application/json",
+                                      "Authorization": f"Bearer {LLM_CONFIG['api_key']}"})
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}：{resp.read()[:200]!r}")
+                for raw in resp:
+                    if self._cancel.is_set():
+                        raise BackgroundCancelled()
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    ch = (_json.loads(data).get("choices") or [{}])[0]
+                    piece = (ch.get("delta") or {}).get("content")
+                    if piece:
+                        parts.append(piece)
+        except BackgroundCancelled:
+            raise
+        except Exception as e:
+            if self._cancel.is_set():
+                raise BackgroundCancelled() from e
+            raise
+        finally:
+            with self._lock:
+                self._sock = None
+            if resp is not None:
+                resp.close()   # socket 在 Connection: close 時歸 response 所有，只關 conn 會漏
+            conn.close()
+        if self._cancel.is_set():
+            raise BackgroundCancelled()
+        return "".join(parts).strip()

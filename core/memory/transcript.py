@@ -31,7 +31,7 @@ from core.memory.clean import clean_text
 
 logger = setup_logger("Transcript")
 
-_COLS = ("serial", "ts", "role", "content", "hash", "source", "kind", "situation")
+_COLS = ("serial", "ts", "role", "content", "hash", "source", "kind", "situation", "speaker_id")
 # 🆕 2026-09-25：寫入時多一欄 clean（由 clean_text() 從 content 算出）。
 # ⚠️ 只加在寫入端；讀取端的 _COLS 不動——壓縮與預寫區都不認識 clean。
 _WRITE_COLS = _COLS + ("clean",)
@@ -97,12 +97,12 @@ class Transcript:
                 ).fetchone()
                 vals = (s, rec.get("ts") or "", rec["role"], rec["content"], h,
                         rec.get("source"), rec.get("kind"), rec.get("situation"),
-                        clean_text(rec["content"]))
+                        rec.get("speaker_id"), clean_text(rec["content"]))
 
                 if row is None:
                     self.cx.execute(
                         f"INSERT INTO transcript({','.join(_WRITE_COLS)}) "
-                        f"VALUES(?,?,?,?,?,?,?,?,?)", vals)
+                        f"VALUES(?,?,?,?,?,?,?,?,?,?)", vals)
                     written += 1
                 elif row["hash"] == h:
                     skipped += 1
@@ -114,7 +114,7 @@ class Transcript:
                     # ⚠️ **所以它要大聲**：正常運行不該出現，出現就是有東西壞過。
                     self.cx.execute(
                         "UPDATE transcript SET ts=?, role=?, content=?, hash=?, "
-                        "source=?, kind=?, situation=?, clean=? WHERE serial=?",
+                        "source=?, kind=?, situation=?, speaker_id=?, clean=? WHERE serial=?",
                         vals[1:] + (s,))
                     repaired += 1
                     logger.error(
@@ -153,4 +153,3 @@ class Transcript:
 
     def count(self) -> int:
         return self.cx.execute("SELECT COUNT(*) c FROM transcript").fetchone()["c"]
-

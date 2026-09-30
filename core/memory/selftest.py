@@ -35,6 +35,9 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 def mm(d: str, **kw) -> MemoryManager:
     kw.setdefault("embed_enabled", False)   # 向量那一路另有專段測（用假模型）
+    # 🔺 2026-09-30：本檔測的是準 v3 的讀取路徑 ⇒ 明開 v3、關 v4（config 預設已改成準 v4）。
+    #    準 v4 的自測在 core/memory/selftest_v4.py。
+    kw.setdefault("cfg_override", {"v3_recall": True, "v3_opening": True, "v4_enabled": False})
     return MemoryManager(None, db_path=os.path.join(d, "memory.db"),
                          test_db_path=os.path.join(d, "memory_test.db"), **kw)
 

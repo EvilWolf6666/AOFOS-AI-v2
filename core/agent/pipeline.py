@@ -279,6 +279,9 @@ class Pipeline:
         ⭐ 附帶好處：**記憶的欄位集是它自己的規格，不該隨 Event 新增欄位而漂移。**
         """
         user_input = event.payload
+        # 準 v4：背景判斷先讓出推論槽（LM Studio 單槽，背景請求在跑會讓本輪排隊）。
+        # 恢復在 finalize_turn（輸出之後）。
+        self.memory.bg_pause()
         context = self.memory.get_context(user_input)
         messages = self.persona.build_messages(context, user_input)
         reply, printed = self._chat_streamed(messages)
@@ -303,7 +306,14 @@ class Pipeline:
         目前仍為同步執行，尖峰只是被移到下一次輸入之前。
 
         壓縮失敗不得中斷主流程。
+
+        🆕 2026-09-30 準 v4：這裡恢復背景判斷（輪次開始時 bg_pause）。
+        🔴 必須在輸出之後——早了背景請求會跟還沒送完的對話搶推論槽。
         """
+        try:
+            self.memory.bg_resume()
+        except Exception as e:
+            console.emit(f"[背景記憶恢復失敗，不影響本輪對話：{e}]")
         try:
             if self.memory.needs_compress():
                 console.emit(self.COMPRESS_WAIT_MESSAGE)
@@ -354,6 +364,7 @@ class Pipeline:
         """
         description = event.payload
         placeholder = EVENT_CONFIG["user_placeholder"]
+        self.memory.bg_pause()   # 同 handle_turn
         suffix = EVENT_CONFIG["observation_prompt_suffix"]
 
         context = self.memory.get_context(placeholder)
@@ -371,7 +382,7 @@ class Pipeline:
             self.memory.add_turn(
                 placeholder, reply,
                 source=event.source, kind=event.kind, situation=description,
+                user_speaker=None,   # 準 v4：沒有人說話（user 那則是 placeholder）
             )
 
         return TurnResult(reply=reply, printed=printed)
-

@@ -30,7 +30,7 @@ from core.memory.db import get_meta, set_meta, write_txn
 
 logger = setup_logger("PreWrite")
 
-_COLS = ("serial", "ts", "role", "content", "hash", "source", "kind", "situation")
+_COLS = ("serial", "ts", "role", "content", "hash", "source", "kind", "situation", "speaker_id")
 
 
 def content_hash(content: str) -> str:
@@ -85,9 +85,10 @@ class PreWrite:
                     t.get("source") or None,
                     t.get("kind") or None,
                     t.get("situation") or None,
+                    t.get("speaker_id") or None,
                 ))
             self.cx.executemany(
-                f"INSERT INTO pre_write({','.join(_COLS)}) VALUES(?,?,?,?,?,?,?,?)", rows
+                f"INSERT INTO pre_write({','.join(_COLS)}) VALUES(?,?,?,?,?,?,?,?,?)", rows
             )
             set_meta(self.cx, "next_serial", start + len(turns))
         return serials

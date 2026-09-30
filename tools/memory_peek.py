@@ -7,6 +7,8 @@
 
 ⭐ 以測試模式開啟：日常區唯讀、寫入只進測試區，結束時測試區整包丟棄。
    向量那一路關閉（省 18 s 載入）⇒ 看到的是「字面檢索」那一路的結果。
+   🔺 2026-09-30 準 v4：主題檢索靠向量，本工具關了向量 ⇒ 下面的 messages 不含主題；
+      主題表另外直接列出（唯讀）。準 v3 撈原句若在 config 關了，messages 會是空的——正常。
 """
 import sqlite3
 import sys
@@ -24,6 +26,17 @@ def main() -> None:
                         "ORDER BY serial DESC LIMIT 30").fetchall()[::-1]:
         print(f'{r["serial"]:>4} {r["ts"][:16]} {r["role"][:4]:<4} {r["content"]}'
               + (f'  ［{r["situation"]}］' if r["situation"] else ""))
+    try:
+        print("\n══ 準 v4 主題（每件最新版；✗＝已被取代）══")
+        for r in cx.execute("SELECT t.* FROM topic t JOIN (SELECT root, MAX(id) mid FROM topic "
+                            "GROUP BY root) m ON t.id = m.mid ORDER BY t.id DESC LIMIT 30"
+                            ).fetchall()[::-1]:
+            print(f'  {"✗" if r["valid_to"] else " "}#{r["root"]} [{r["type"]}|{r["attr_key"] or "-"}] '
+                  f'{r["text"]}  ← serial {r["first_serial"]}–{r["last_serial"]} {(r["event_ts"] or "")[:16]}')
+        done = cx.execute("SELECT value FROM meta WHERE key='judged_upto'").fetchone()
+        print(f"  （背景判斷已處理到 serial {done[0] if done else 0}）")
+    except sqlite3.OperationalError as e:
+        print(f"  （還沒有主題表：{e}）")
     try:
         print("\n══ 事件層 ══")
         for r in cx.execute("SELECT * FROM episode ORDER BY id"):
@@ -49,4 +62,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
