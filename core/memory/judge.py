@@ -137,6 +137,7 @@ class BackgroundJudge:
         self.stats = {"segments": 0, "built": 0, "skipped": 0, "topics": 0, "cancelled": 0,
                       "cancels_live": 0, "parse_bad": 0, "errors": 0, "backlog": 0}
         self._backlog_warned = False
+        self._working = False          # 正在判一段（給 /status 看，不參與任何決策）
         self._thread = threading.Thread(target=self._run, name="memory-judge", daemon=True)
         self._thread.start()
 
@@ -189,11 +190,13 @@ class BackgroundJudge:
         if self._thread.is_alive():
             logger.error(f"背景判斷執行緒沒有在 {timeout}s 內結束")
 
-    def status(self) -> str:
+    def status(self, pending: int | None = None) -> str:
+        """pending：呼叫端即時查的待判句數；None 時退回上一次判斷時的快照（可能過時）。"""
         s = self.stats
         state = "停用" if self._path is None and self._want_path is None else (
-            "暫停" if self._paused_at is not None else "待命")
-        return (f"背景判斷{state}：待判 {s['backlog']} 句｜段 {s['segments']}（建 {s['built']}／"
+            "判斷中" if self._working else "暫停" if self._paused_at is not None else "待命")
+        n = f"{pending}" if pending is not None else f"{s['backlog']}（上次判斷時）"
+        return (f"背景判斷{state}：待判 {n} 句｜段 {s['segments']}（建 {s['built']}／"
                 f"不建 {s['skipped']}）｜主題 {s['topics']}｜取消 {s['cancelled']}"
                 f"（切斷進行中 {s['cancels_live']}）｜解析丟行 {s['parse_bad']}｜錯誤 {s['errors']}")
 
@@ -244,7 +247,11 @@ class BackgroundJudge:
                     self._wake.wait(w)
                     self._wake.clear()
                     continue
-                did = self._step()
+                self._working = True
+                try:
+                    did = self._step()
+                finally:
+                    self._working = False
                 if not did:   # 沒有講完的段：等新句子（notify）或等它變「講完了」
                     self._wake.wait(max(0.5, self.cfg["judge_segment_close_s"] / 2))
                     self._wake.clear()
@@ -282,6 +289,8 @@ class BackgroundJudge:
         text = render_segment(seg, self.names)
         first, last = seg[0]["serial"], seg[-1]["serial"]
         mt = cfg["judge_max_tokens"]
+        # 開始也記一行：量「撞取消」時要知道背景此刻在跑（完成那行要等呼叫結束才出現）
+        logger.info(f"背景判斷開始 serial {first}–{last}（{len(seg)} 句）")
         decide_raw = self.llm.call(
             self._messages(text, self._decide_instruction()),
             purpose="記憶判斷", max_tokens=mt["decide"], schema=DECIDE_SCHEMA)

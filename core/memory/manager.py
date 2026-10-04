@@ -41,7 +41,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-from config import MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE
+from config import MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE, WM_DROP_ROUNDS
 from core.llm_client import BackgroundLLM
 from core.logger import setup_logger, timed
 from core.memory.db import connect
@@ -51,6 +51,7 @@ from core.memory.judge import BackgroundJudge
 from core.memory.pre_write import PreWrite
 from core.memory.recall import RecallIndex, check_fts5, format_blocks
 from core.memory.topic_index import TopicSearch
+from core.memory.topics import TopicStore
 from core.memory.transcript import Transcript
 
 logger = setup_logger("MemoryManager")
@@ -163,6 +164,9 @@ class MemoryManager:
         self._v3_recall, self._v3_opening = cfg["v3_recall"], cfg["v3_opening"]
         self._v4 = cfg["v4_enabled"]
         self._spk = cfg["speaker_ids"]
+        # 滑動視窗兩個參數的正本在 config 頂層；cfg_override 只給自測固定舊行為用
+        self._wm_max = cfg.get("wm_max_rounds", MAX_WORKING_MEMORY)
+        self._wm_drop = max(1, min(cfg.get("wm_drop_rounds", WM_DROP_ROUNDS), self._wm_max))
         self._daily_path = db_path or cfg["db_path"]
         self._test_path = test_db_path or cfg["test_db_path"]
         self._top_k = cfg["top_k"]
@@ -384,13 +388,23 @@ class MemoryManager:
                 f"{type(e).__name__}: {e}")
 
     def _slide(self) -> None:
-        """滑動視窗：超過 MAX_WORKING_MEMORY 輪時，丟掉最舊的**已落地**紀錄。
+        """滑動視窗：超過上限輪數時，**一次**丟掉最舊的 WM_DROP_ROUNDS 輪（只丟已落地的）。
 
+        ⭐ 一次丟一批而不是每輪丟一輪：送給模型的開頭只在丟的那一輪改變 ⇒ 其餘輪次吃得到
+           LM Studio 的提示詞快取（每輪丟一輪時，滿了之後每輪 TTFT 多 2.5～3 秒，2026-10-04 實測）。
         🔴 **沒有 serial 的一律不丟**（寫入失敗的那些）——丟了就真的沒了。
         """
-        limit = MAX_WORKING_MEMORY * 2
-        while len(self.working_memory) > limit and "serial" in self.working_memory[0]:
+        limit = self._wm_max * 2
+        if len(self.working_memory) <= limit:
+            return
+        # 超出上限的那一刻共有 max+1 輪 ⇒ 丟 K 輪後剩 max+1−K（K=1 即舊行為：維持在 max）
+        target = (self._wm_max + 1 - self._wm_drop) * 2
+        dropped = 0
+        while len(self.working_memory) > target and "serial" in self.working_memory[0]:
             self.working_memory.pop(0)
+            dropped += 1
+        logger.info(f"Working Memory 滑出最舊 {dropped // 2} 輪（剩 {len(self.working_memory) // 2} 輪；"
+                    f"下一輪會整段重讀一次）")
         if len(self.working_memory) > limit:
             logger.error(
                 f"Working Memory {len(self.working_memory)} 則超過上限 {limit}："
@@ -599,7 +613,12 @@ class MemoryManager:
             tv = f"｜主題未補向量 {tp}"
         except Exception as e:  # noqa: BLE001
             tv = f"｜主題積壓查詢失敗：{type(e).__name__}"
-        return f"{v3}｜{self._judge.status()}{tv}"
+        try:
+            pend = TopicStore(self._write_store()._cx, writable=False).pending_count()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"待判句數查詢失敗：{type(e).__name__}: {e}")
+            pend = None
+        return f"{v3}｜{self._judge.status(pend)}{tv}"
 
     def _status_v3(self) -> str:
         if self._emb is None:
