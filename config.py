@@ -136,7 +136,15 @@ LMSTUDIO_LOAD_PARAMS = {
 # ─────────────────────────────────────────────────────────────
 
 # 記憶
-MAX_WORKING_MEMORY = 10      # Working Memory 保留輪數（超過 ×2 則觸發壓縮）
+# Working Memory 滑動視窗（core/memory/manager.py 的 _slide）。
+# 🔺 2026-10-04：10 輪／每次丟 1 輪 → 20 輪／每次丟 10 輪。
+#    理由（實測，Windows）：每輪丟 1 輪會讓送給模型的開頭每輪都變 ⇒ LM Studio 提示詞快取對不上、
+#    整段重讀，滿 10 輪後**每輪** TTFT 多 2.5～3 秒。一次丟一批 ⇒ 快取每 WM_DROP_ROUNDS 輪才斷一次。
+#    剛丟完時她看得到 MAX＋1−DROP 輪（現為 11，不少於舊上限 10）。
+# ⚠️ 上限受 context 8192 約束：人格約 550＋回覆保留 300＋記憶區塊約 200 token；她回覆變長時每輪
+#    可到 300 token 以上 ⇒ 20 輪是安全值。超過 8192 時 LM Studio「截斷中間」會**靜默**切掉對話。
+MAX_WORKING_MEMORY = 20      # 最多保留幾輪（一輪＝一問一答）
+WM_DROP_ROUNDS = 10          # 超過上限時一次丟掉最舊的幾輪（1＝舊行為，每輪都斷快取）
 MAX_SUMMARY_SENTENCES = 8    # Compressed Memory 上限句數，避免無限累積
 COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user/assistant 各算一則）
 
@@ -387,7 +395,7 @@ TEST_CONFIG = {
     "disable_stream": True,
 
     # 評測專用：貪婪解碼。temperature=0 + top_k=1 直接取機率最高的 token，
-    # 隨機性從源頭消失，不依賴 seed（本環境 seed 實測無效）。
+    # 隨機性從源頭消失，不依賴 seed（目前這台機器上 seed 看起來無效；非定論，見 LLM_CONFIG["seed"]）。
     # frequency_penalty 是必要配套——貪婪解碼會出現退化迴圈，而 repeat_penalty
     # 只施加一次固定懲罰擋不住，需隨出現次數累加才壓得下來。
     #

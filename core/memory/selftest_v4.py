@@ -2,7 +2,7 @@
 """
 準 v4 自測：`python -m core.memory.selftest_v4`
 
-全部在暫存資料夾、對假 LLM 伺服器（fake_llm_server）與假 embedding 跑，不碰 data/、不碰 LM Studio。
+全部在暫存資料夾、對假 LLM 伺服器（本檔 FakeLLM）與假 embedding 跑，不碰 data/、不碰 LM Studio。
 涵蓋：切段／解析（純函式）、主題表（屬性鍵機械取代、版本、進度原子性）、speaker_id 落地、
 端到端（閒置 → 判斷 → 建主題 → 向量 → 注入）、取消（prefill 中／串流中）、施測隔離、
 暫停逾時保險、壞輸出。
@@ -11,18 +11,79 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core.llm_client import BackgroundLLM
 from core.memory.db import connect
-from core.memory.fake_llm_server import FakeLLM
 from core.memory.judge import parse_topics, split_segment
 from core.memory.manager import MemoryManager
 from core.memory.topics import TopicStore
+
+
+# ── 假 LLM 伺服器（只給本自測用，不接任何真服務；2026-10-04 由 fake_llm_server.py 併入）──
+# 模擬 LM Studio 的兩段延遲：送出回應標頭前的 prefill，以及逐 token 串流；
+# 記錄每個請求是「送完」還是「被客戶端中途斷線」，用來驗證 BackgroundLLM 的取消。
+
+class FakeLLM:
+    def __init__(self) -> None:
+        self.prefill_s = 0.0          # 回應標頭前的延遲（模擬 prefill）
+        self.token_s = 0.0            # 每個 chunk 之間的延遲
+        self.responder = lambda req: "OK"   # req(dict) → 回應文字
+        self.log: list[dict] = []     # 每個請求：{purpose, status: done/aborted, body}
+        self._srv = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self.base_url = f"http://127.0.0.1:{self._srv.server_address[1]}/v1"
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._srv.shutdown()
+        self._srv.server_close()
+
+    def _handler(self):
+        fake = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # 安靜
+                pass
+
+            def do_POST(self):  # noqa: N802
+                n = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(n) or b"{}")
+                entry = {"body": req, "status": "started"}
+                fake.log.append(entry)
+                time.sleep(fake.prefill_s)
+                text = fake.responder(req)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    for i, ch in enumerate(_chunks(text)):
+                        if i:
+                            time.sleep(fake.token_s)
+                        data = {"id": "x", "object": "chat.completion.chunk", "created": 0,
+                                "model": req.get("model", "m"),
+                                "choices": [{"index": 0, "delta": {"content": ch},
+                                             "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    entry["status"] = "done"
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    entry["status"] = "aborted"
+
+        return H
+
+
+def _chunks(text: str, size: int = 2) -> list[str]:
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
 
 _fail = 0
 TZ = timezone(timedelta(hours=8))
@@ -168,6 +229,19 @@ def main() -> int:
           items == [{"type": "狀態", "attr_key": "邪狼.住地", "text": "邪狼住高雄"},
                     {"type": "事件", "attr_key": None, "text": "貓很胖"}] and bad == 1, f"{items} {bad}")
 
+    print("\n[滑動視窗：一次丟一批]")
+    with tempfile.TemporaryDirectory() as d:
+        m = MemoryManager(None, db_path=os.path.join(d, "m.db"), test_db_path=os.path.join(d, "t.db"),
+                          embed_enabled=False,
+                          cfg_override={"v4_enabled": False, "wm_max_rounds": 20, "wm_drop_rounds": 10})
+        sizes = []
+        for i in range(31):
+            m.add_turn(f"u{i}", f"a{i}")
+            sizes.append(len(m.working_memory) // 2)
+        m.compress_on_exit()
+        check("滿 20 輪後一次丟 10 輪、之後再長回 20（開頭只在丟的那輪改變）",
+              sizes[:20] == list(range(1, 21)) and sizes[20:31] == list(range(11, 21)) + [11], str(sizes))
+
     print("\n[主題表]")
     with tempfile.TemporaryDirectory() as d:
         cx = connect(os.path.join(d, "t.db"))
@@ -205,6 +279,7 @@ def main() -> int:
             turn(m, "我家的貓很胖", "好可愛")
             ok = wait(lambda: judged(m)[0] == judged(m)[1] == 4)
             check("閒置後背景判完（judged_upto 追上 landed_upto）", ok, str(judged(m)))
+            check("/status 待判句數即時（判完＝0）", "待判 0 句" in m.status_text(), m.status_text())
             ok = wait(lambda: "主題未補向量 0" in m.status_text() and "主題 2" in m.status_text())
             check("建 2 件主題並補完向量", ok, m.status_text())
             cx = connect(m.memory_path)
@@ -274,6 +349,8 @@ def main() -> int:
             turn(m, "施測題：我住在高雄", "好")
             time.sleep(1.0)
             check("施測中不判（測試區沒有主題表）", not has_table(m.memory_path, "topic"))
+            check("/status 即時顯示施測區待判 2 句（背景停用、不判）", "待判 2 句" in m.status_text(),
+                  m.status_text())
             inj = injected(m.get_context("你住哪"))
             check("施測中仍讀得到日常區主題", "台北" in inj, inj)
             m.set_test_mode(False)

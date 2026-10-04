@@ -97,6 +97,13 @@ class TopicStore:
             "AND retired = 0 ORDER BY serial LIMIT ?", (self.judged_upto, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def pending_count(self) -> int:
+        """已落地、還沒判斷過的原句數（/status 即時查；主題表還沒建＝全部都還沒判）。"""
+        return self.cx.execute(
+            "SELECT COUNT(*) c FROM transcript WHERE serial > ? AND retired = 0 AND serial <= "
+            "COALESCE((SELECT value FROM meta WHERE key='landed_upto'), 0)",
+            (self.judged_upto,)).fetchone()["c"]
+
     def mark_judged(self, serial: int) -> None:
         """推進 judged_upto。⚠️ 只在該段的主題**已寫入**（或判定不建）之後呼叫。"""
         with write_txn(self.cx):
