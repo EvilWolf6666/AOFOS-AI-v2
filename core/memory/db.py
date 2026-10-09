@@ -4,8 +4,8 @@
 
 一個檔、多張表：`pre_write`（預寫區佇列）／`transcript`（原文存放區，永久）／
 `topic`／`topic_vec`／`topic_fts`（準 v4 主題與其索引，topics.py／topic_index.py 持有）／
-`episode`（事件層，衍生）／`meta`（`next_serial`、`landed_upto`＝N、`judged_upto`、
-`compressed_upto`＝M——M 是 v1 壓縮的進度，🔺 2026-10-09 起沒有人推進，留著是因為已寫進既有 DB）。
+`episode`（事件層，衍生）／`meta`（`next_serial`、`landed_upto`＝N、`judged_upto`）。
+🔺 2026-10-09：v1 壓縮的進度 `compressed_upto`（M）已移除；舊 DB 的 meta 裡那一列留著、沒人讀。
 
 🔴 **為什麼是同一個 DB 檔**：讓「原文寫進 transcript ＋ 推進 N」落在**同一個交易**裡
    ——分成兩個檔就沒有交易保證，那個「原文寫成功但 N 沒更新」的窗口會回來。
@@ -79,14 +79,14 @@ CREATE TABLE IF NOT EXISTS transcript (
 --    「誰在場」由同一段對話的 speaker_id 收集推出，不另存（兩份會對不上）。
 --    舊列不回填：當時只有邪狼在用，但「猜的值」與「記錄到的值」長得一樣，寧可留 NULL。
 
--- 單一鍵值表：next_serial（下一個可用號）／landed_upto（N）／compressed_upto（M）
+-- 單一鍵值表：next_serial（下一個可用號）／landed_upto（N）／judged_upto（topics.py 建）
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY,
     value INTEGER NOT NULL
 );
 """
 
-_DEFAULT_META = {"next_serial": 1, "landed_upto": 0, "compressed_upto": 0}
+_DEFAULT_META = {"next_serial": 1, "landed_upto": 0}
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -292,11 +292,6 @@ def _selftest() -> int:  # noqa: C901
             cx.execute("UPDATE pre_write SET content=? WHERE serial=2",
                        (pend[1]["content"],))
 
-        print("\n── 壓縮範圍（M < serial ≤ N）──")
-        check("尚未壓縮 ⇒ 取得全部 3 筆", len(t.pending_compress()) == 3)
-        t.mark_compressed(2)
-        check("M=2 之後只剩 1 筆", [x["serial"] for x in t.pending_compress()] == [3])
-
         print("\n── 預寫區清除 ──")
         removed = w.purge_upto(t.landed_upto)
         check("清掉已落地的 3 筆", removed == 3 and w.backlog() == 0)
@@ -338,8 +333,7 @@ def _selftest() -> int:  # noqa: C901
         w2, t2 = PreWrite(cx2), Transcript(cx2)
         check("next_serial 續得回來", get_meta(cx2, "next_serial") == 84,
               f"next_serial={get_meta(cx2, 'next_serial')}")
-        check("N／M 續得回來", (t2.landed_upto, t2.compressed_upto) == (3, 2),
-              f"N={t2.landed_upto} M={t2.compressed_upto}")
+        check("N 續得回來", t2.landed_upto == 3, f"N={t2.landed_upto}")
         check("積壓筆數續得回來", w2.backlog() == 80)
         cx2.close()
     finally:

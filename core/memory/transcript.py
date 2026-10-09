@@ -14,10 +14,14 @@
 「你上次去高雄也是三天」這種**她自己講過的話**，抽成「邪狼曾去高雄三天」之後
 就回指不了。⚠️ 粒度＝**一則**（一個 user／assistant 對是兩則）。
 
-🔴 **本模組同時持有 checkpoint（N／M）**，而這是刻意的：
+🔴 **本模組同時持有 checkpoint N（landed_upto）**，而這是刻意的：
    「原文落地 ＋ 推進 N」必須在**同一個交易**裡——拆成兩個模組就拆成兩段，
    那個「原文寫成功但 N 沒更新」的窗口會回來。
    ⇒ 📌 檔名表原本列的 `checkpoint.py` 因此**不獨立成檔**（結構改動，在此聲明）。
+🔺 2026-10-09：v1 壓縮的 checkpoint M（`compressed_upto`）與 `pending_compress()`／`mark_compressed()`
+   隨 v1 殘留清理移除；既有 DB 的 meta 裡那一列留著不動（沒人讀）。它當時寫下的教訓——
+   「一條狀態如果只靠某個東西還留著來表示，它就是沒被寫下來」——由準 v4 的 `judged_upto`
+   （core/memory/topics.py）沿用：背景判斷的進度明寫在 meta，不靠「還沒建主題」推斷。
 """
 
 from __future__ import annotations
@@ -33,12 +37,12 @@ logger = setup_logger("Transcript")
 
 _COLS = ("serial", "ts", "role", "content", "hash", "source", "kind", "situation", "speaker_id")
 # 🆕 2026-09-25：寫入時多一欄 clean（由 clean_text() 從 content 算出）。
-# ⚠️ 只加在寫入端；讀取端的 _COLS 不動——壓縮與預寫區都不認識 clean。
+# ⚠️ 只加在寫入端：預寫區不認識 clean（它由本檔落地時才算）。
 _WRITE_COLS = _COLS + ("clean",)
 
 
 class Transcript:
-    """原文存放區 ＋ 兩個 checkpoint。**每個執行緒傳入自己的連線。**"""
+    """原文存放區 ＋ checkpoint N。**每個執行緒傳入自己的連線。**"""
 
     def __init__(self, cx: sqlite3.Connection) -> None:
         self.cx = cx
@@ -49,23 +53,6 @@ class Transcript:
     def landed_upto(self) -> int:
         """N：原文已落地到哪個 serial。producer 據此清預寫區。"""
         return get_meta(self.cx, "landed_upto")
-
-    @property
-    def compressed_upto(self) -> int:
-        """M：已壓縮到哪個 serial。
-
-        ⚠️ **它必須被明寫，不能靠「預寫區還留著」來表示。** 舊設計用「兩件都成功
-        才清預寫區」隱含地記住這件事——🔺 而那是錯的理由：原文一旦落地就是永久
-        權威副本，**早清預寫區丟不掉任何原文**；早清真正會丟的是「還有哪些沒壓縮」
-        這個**狀態**。⇒ 一條狀態如果只靠「某個東西還留著」來表示，它就是沒被寫下來。
-        """
-        return get_meta(self.cx, "compressed_upto")
-
-    def mark_compressed(self, serial: int) -> None:
-        """推進 M。⚠️ **必須在 `_compress()` 成功回傳之後、交易之外呼叫**
-        （見 `db.py` 末的交易紀律）。"""
-        with write_txn(self.cx):
-            set_meta(self.cx, "compressed_upto", serial)
 
     # ── 落地 ────────────────────────────────────────────────────
 
@@ -136,20 +123,6 @@ class Transcript:
                 "landed_upto": self.landed_upto}
 
     # ── 讀取 ────────────────────────────────────────────────────
-
-    def pending_compress(self, limit: int = 0) -> list[dict]:
-        """取出「已落地但還沒壓縮」的原文（M < serial ≤ N）。
-
-        ⭐ **壓縮讀的是這裡，不是預寫區** ——原文已經是永久副本，
-        壓縮失敗隨時可以從這裡重讀，**不需要預寫區替它留著**。
-        """
-        sql = (f"SELECT {','.join(_COLS)} FROM transcript "
-               f"WHERE serial > ? AND serial <= ? AND retired = 0 ORDER BY serial")
-        args: tuple = (self.compressed_upto, self.landed_upto)
-        if limit:
-            sql += " LIMIT ?"
-            args += (limit,)
-        return [{k: r[k] for k in _COLS} for r in self.cx.execute(sql, args)]
 
     def count(self) -> int:
         return self.cx.execute("SELECT COUNT(*) c FROM transcript").fetchone()["c"]
