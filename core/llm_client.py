@@ -158,8 +158,7 @@ class LLMClient:
         if usage is None:
             return
 
-        # completion_tokens 貼齊上限時，輸出極可能是被截斷而非自然結束；
-        # 對 compress 而言這代表「淘汰：」那段可能整段消失
+        # completion_tokens 貼齊上限時，輸出極可能是被截斷而非自然結束
         if usage.completion_tokens >= max_tokens:
             logger.warning(
                 f"輸出可能被截斷（purpose={purpose}，"
@@ -168,11 +167,11 @@ class LLMClient:
 
         # ── 輸入側預算 ──
         # prompt 與本次允許的輸出必須「一起」裝進 context，故分子是兩者之和，
-        # 不是 prompt 單獨對 context 的佔比。compress 的 max_tokens 為 800，
-        # prompt 到 7400 就已無餘裕——用固定百分比會漏掉這種情形。
+        # 不是 prompt 單獨對 context 的佔比——max_tokens 調大的用途，prompt 還沒到
+        # 固定百分比就已無餘裕，用固定百分比會漏掉這種情形。
         #
         # ⚠️ 溢出的後果不是報錯，是 llama.cpp 靜默截掉 context 的「中間」段，
-        #    也就是 Compressed Memory 與早期對話（見 config.LMSTUDIO_LOAD_PARAMS
+        #    也就是人格 prompt 之後的早期對話（Working Memory 前段；見 config.LMSTUDIO_LOAD_PARAMS
         #    的 max_concurrent_predictions 註解）。整份記憶消失且無任何徵兆。
         #
         # ⚠️ usage.prompt_tokens 是否為「截斷前」的原始長度未經證實。若後端回報
@@ -186,7 +185,7 @@ class LLMClient:
                     f"⚠ context 溢出（purpose={purpose}）："
                     f"prompt={usage.prompt_tokens} + max_tokens={max_tokens} "
                     f"= {needed} > context_length={self.context_length}。"
-                    f"摘要與早期對話可能已被靜默截掉，本次輸出不可信"
+                    f"早期對話可能已被靜默截掉，本次輸出不可信"
                 )
             elif needed > self.context_length * _CONTEXT_WARN_RATIO:
                 logger.warning(
@@ -227,12 +226,13 @@ class LLMClient:
         """
         purpose 只影響計時標籤與輸出長度上限，不影響請求的其他內容。
 
-        存在理由：_compress() 內部也呼叫本方法，兩者在計時紀錄中同名就無法分辨
-        「這次呼叫是回應使用者，還是在壓縮記憶」——而這正是判斷 _compress 是否
-        落在延遲路徑上所需的資訊。新增呼叫點時記得傳入對應 purpose。
+        存在理由：同一個方法若有多種用途，計時紀錄同名就分不出「這次呼叫是回應使用者，
+        還是別的處理」——而那正是判斷某個呼叫是否落在延遲路徑上所需的資訊。
+        新增呼叫點時記得傳入對應 purpose。（🔺 2026-10-09：v1 的 `_compress` 已移除，
+        目前只有對話在用；背景判斷走下方 BackgroundLLM，計時標籤是「LLM背景[…]」。）
 
         on_delta：逐段輸出的回呼，收到的是**已完成繁簡處理**的片段。傳 None
-        （預設）即走原本的一次性路徑，_compress() 等沒有觀眾的呼叫點不需要改。
+        （預設）即走原本的一次性路徑，沒有觀眾的呼叫點不需要改。
 
         ⚠️ 本模組刻意不 import core.console——輸出到哪裡是終端層的事。回呼由
         呼叫端提供，日後要同時餵 TTS 與畫面時也只需換那個回呼。
@@ -358,7 +358,7 @@ class LLMClient:
             self._warned_no_usage = True
             logger.warning(
                 "串流回應未帶 usage，本次起串流路徑的『輸出截斷』與『context 溢出』"
-                "兩項檢查皆未執行。context 若溢出，摘要與早期對話會被靜默截掉而無徵兆。"
+                "兩項檢查皆未執行。context 若溢出，早期對話會被靜默截掉而無徵兆。"
                 "若需要這兩項保障，將 LLM_CONFIG['stream'] 設為 False。"
             )
 

@@ -54,17 +54,9 @@ LLM_CONFIG = {
     "temperature": 0.8,
     "max_tokens": 300,
 
-    # 各用途的輸出長度上限，未列出的用途沿用上方 max_tokens。
-    #
-    # ⚠️ compress 需一次輸出「摘要 8 句 + 淘汰清單」兩段。中文在 Llama tokenizer 下
-    #    約 1 token/字，300 上限會讓「淘汰：」整段被截斷，而
-    #    _parse_compress_result() 找不到該標記時不報錯、安靜回傳「無」——
-    #    淘汰內容因此永遠寫不進 RAG，且無任何徵兆。
-    #    徵兆在 memory_manager._compress() 的 log：若長期只出現「本次壓縮無淘汰
-    #    內容」而從不出現「本次壓縮淘汰內容（將轉存 RAG）」，優先懷疑這裡。
-    "max_tokens_by_purpose": {
-        "compress": 800,
-    },
+    # 各用途的輸出長度上限，未列出的用途沿用上方 max_tokens（llm_client 依 purpose 查）。
+    # 🔺 2026-10-09 移除 v1 的 "compress": 800（Compressed Memory 已於 2026-09-26 移出，無呼叫點）。
+    "max_tokens_by_purpose": {},
     "top_p": 0.95,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
@@ -82,8 +74,8 @@ LLM_CONFIG = {
 
     # ── 串流輸出 ──
     # True 時逐 token 印出。不影響 KPI（端到端 <500ms），只影響等待期間的體感。
-    # ⚠️ 只作用於有接串流回呼的呼叫點（目前僅 handle_turn / handle_observation）；
-    #    _compress() 一律走非串流。施測時由 TEST_CONFIG["disable_stream"] 強制關閉。
+    # ⚠️ 只作用於有接串流回呼的呼叫點（目前僅 handle_turn / handle_observation）。
+    #    施測時由 TEST_CONFIG["disable_stream"] 強制關閉。（背景判斷另走 BackgroundLLM，一律串流。）
     "stream": True,
 }
 
@@ -145,23 +137,19 @@ LMSTUDIO_LOAD_PARAMS = {
 #    可到 300 token 以上 ⇒ 20 輪是安全值。超過 8192 時 LM Studio「截斷中間」會**靜默**切掉對話。
 MAX_WORKING_MEMORY = 20      # 最多保留幾輪（一輪＝一問一答）
 WM_DROP_ROUNDS = 10          # 超過上限時一次丟掉最舊的幾輪（1＝舊行為，每輪都斷快取）
-MAX_SUMMARY_SENTENCES = 8    # Compressed Memory 上限句數，避免無限累積
-COMPRESS_BATCH_SIZE = 12     # 觸發壓縮時一次取出的訊息則數（user/assistant 各算一則）
 
-# ── 記憶：準 v3 最小記憶切片（core/memory/manager.py）──────────
-# 🟩 最小可行：每項的目標形與升級條件見《現況》〈🔒 隔離區〉記憶模塊〈準 v3〉〈十二〉。
-# ⚠️ 上面三個參數中 manager.py 只讀 MAX_WORKING_MEMORY（當滑動視窗輪數）；
-#    MAX_SUMMARY_SENTENCES／COMPRESS_BATCH_SIZE 與下方 RAG_* 只剩 v1 的 rag.py 與
-#    tools/ 診斷腳本在讀，v1 移出後即無讀者（保留不刪：刪了那幾支腳本 import 會炸）。
+# ── 記憶（core/memory/manager.py；準 v4，《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）──────────
+# 🔺 2026-10-09 準 v3 讀取路徑淘汰：撈原句（top_k／neighbor_n／RRF）、原句向量、開場的
+#    原句（carry_rounds）與 v3_recall／v3_opening 開關的參數已刪。開場的狀態與上一場關鍵詞留下。
+# 🔺 2026-10-09 一併移除 v1 遺留、已無讀者的參數：MAX_SUMMARY_SENTENCES、COMPRESS_BATCH_SIZE、
+#    RAG_TOP_K／RAG_SIMILARITY_THRESHOLD／RAG_INCLUDE_SEED、TEST_CONFIG 的 memory_path／disable_rag。
 MEMORY_CONFIG = {
     # 日常區與測試區是兩個獨立檔。/test on 時「讀取共用、寫入分流」（第八章 舊C8（已結案））：
     # 讀兩個、寫只寫測試區；進出測試模式時整包丟棄測試區。
     "db_path": os.path.join(PROJECT_ROOT, "data", "memory.db"),
     "test_db_path": os.path.join(PROJECT_ROOT, "data", "memory_test.db"),
-    "top_k": 3,              # 🟩 命中幾則
-    "neighbor_n": 2,         # 🟩 命中一則帶出前後各幾則
-    "max_query_terms": 64,   # 🟩 查詢最多取幾個 bigram（長輸入防 OR 爆量）
-    # 注入時的說話者稱呼。⚠️ 只影響注入文字，不寫進資料庫——改了不需遷移。
+    "max_query_terms": 64,   # 主題關鍵字那一路：查詢最多取幾個 bigram（長輸入防 OR 爆量）
+    # 說話者稱呼（審核工具印原句時用）。⚠️ 只影響顯示文字，不寫進資料庫——改了不需遷移。
     "speaker_labels": {"user": "邪狼", "assistant": "奧狐"},
 
     # ── 注入格式（prompt 版：不訓練，靠區塊自帶說明；2026-09-27 邪狼裁定）──
@@ -173,35 +161,25 @@ MEMORY_CONFIG = {
     #    施測變數（SPT 在比較序列開跑後不得改動），記憶說明跟著記憶走才不互相牽動。
     "block_note": "（以下是你記得的過去，不是對方現在說的話；和現在的話題有關才用，用自己的話帶出來，不要照抄原句。）",
 
-    # ── 組合 7：結構化狀態＋開場帶入（程式算、不經 LLM）──
-    "carry_rounds": 3,        # 開場帶入上一場最後幾輪
-    "opening_turns": 3,       # 本場前幾輪帶狀態與上一場；之後不帶（避免每輪同一段字被照唸）
+    # ── 開場（程式算、不經 LLM）：上次聊天多久以前／今天聊過幾次／那次幾輪＋上一場關鍵詞 ──
+    "opening_turns": 3,       # 本場前幾輪帶開場；之後不帶（避免每輪同一段字被照唸）
 
-    # ── 組合 9 甲：事件層（程式切段、程式挑關鍵詞與代表句，不經 LLM）──
+    # ── 事件層（程式切段、程式挑關鍵詞與代表句，不經 LLM；代表句照存、不注入）──
     "episode_gap_minutes": 30,   # 兩句相隔超過這麼久就切成新的一段
     "episode_keywords": 6,       # 每段挑幾個關鍵詞
-    "episode_reps": 2,           # 每段挑幾句代表句（只挑使用者的話）
+    "episode_reps": 2,           # 每段挑幾句代表句（只挑使用者的話；存進事件層，目前不注入）
 
-    # ── 組合 6：向量檢索（與 bigram＋FTS5 以 RRF 合併）──
+    # ── 主題向量的 embedding 模型 ──
     # 2026-09-27 Windows 實測：import 14.5s＋載入 3.6s（只在開程式時、背景進行）、
     # 單句 33 ms、常駐約 800 MB；掛著時 LLM 總耗時差約 1.7%（prompt 743 token）。
     # ⚠️ 對話變長時記憶體壓力會變，屆時要重量。
     "embed_enabled": True,
     "embed_model": "paraphrase-multilingual-MiniLM-L12-v2",
-    # 低於此餘弦相似度的向量候選不採用。0.55 是同一顆模型在 v1 RAG 上
-    # 2026-08-07 第三輪實測定的「地板」（《歸檔》E0009～E0012）。
-    "embed_min_sim": 0.55,
-    "embed_candidates": 20,      # 向量路先取幾名再進 RRF
-    "rrf_k": 60,                 # RRF 常數（慣用值）
 
     # ══ 準 v4（2026-09-30，《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）══════════════
     # 寫入端：原句全存（同準 v3）＋背景判斷「這段有沒有值得記的事」→ 有就建主題（transcript 的索引）。
-    # 讀取端：主題向量比對 → 注入最新有效版本的主題句（重寫＝第 4 步，尚未實作）。
-    #
-    # 準 v3 的讀取路徑可逆關閉（程式碼保留）：
-    "v3_recall": False,          # 字面＋原句向量 RRF 撈原句。False 時也不再補算原句向量
-    "v3_opening": False,         # 開場帶「狀態／上一場」
-    "v4_enabled": True,
+    # 讀取端：主題兩路檢索 → 注入最新有效版本的主題句（重寫＝第 4 步，尚未實作）。
+    "v4_enabled": True,          # 關掉＝只存原句、不判不撈（自測用）
 
     # 說話者 ID（寫進 transcript.speaker_id）。觀眾之後用平台 ID，不在這裡列。
     # ⚠️ 顯示名只影響送給背景模型與注入的文字，改了不需遷移。
@@ -241,23 +219,8 @@ MEMORY_CONFIG = {
     #    每多一件約多 20～30 token prefill。三個值都是 🟨 起始值，待量測校準。
     "topic_vec_k": 3,
     "topic_bm25_k": 1,
-    "topic_min_sim": 0.45,        # 向量那一路的下限（主題句短、語意集中，先比原句的 0.55 低）
+    "topic_min_sim": 0.45,        # 向量那一路的下限（主題句短、語意集中，先比 v1 RAG 原句的 0.55 低）
 }
-
-# RAG
-RAG_TOP_K = 3
-RAG_SIMILARITY_THRESHOLD = 0.55   # 低於此分數的查詢結果直接丟棄
-
-# 種子（人工寫的設定集）是否參與檢索。False = 隔離停用，資料仍在庫裡、不刪。
-#
-# 🔴 目前庫內 64 筆全為種子、淘汰內容 0 筆，故設 False 等同 RAG 暫時查不到東西。
-#    這是刻意的：設定集回答的是「她是誰」（persona 已常駐帶著），
-#    而 RAG 該回答的是「你和她之間發生過什麼」。見《現況》11之2。
-#
-# ⚠️ 過濾條件用「不是 seed」而非「是 compress_evict」：缺 source 欄位的舊資料
-#    依查詢端慣例視為淘汰內容，用後者會把它們一併漏掉。
-# ⚠️ 過濾必須下在向量庫層，不可取回 top_k 之後再篩——名額會先被種子佔掉。
-RAG_INCLUDE_SEED = False
 
 # 輸出後處理
 TEXT_CONFIG = {
@@ -386,15 +349,10 @@ WINDOW_WATCHER_CONFIG = {
 #      core/memory/manager.py  → True 時寫入改走 MEMORY_CONFIG["test_db_path"]
 #                                （讀取共用、寫入分流，第八章 舊C8（已結案））
 #      core/llm_client.py      → True 時套用 llm_overrides
-#    📌 TEST_CONFIG 的 "memory_path"／"disable_rag" 只剩 v1 的 rag.py 在讀，
-#       v1 移出後無讀者。
 
 TEST_MODE = False
 
 TEST_CONFIG = {
-    "memory_path": "data/test_compressed_memory.txt",
-    "disable_rag": True,
-
     # 施測期間強制關閉串流。
     # ⚠️ 「串流與非串流在貪婪解碼下逐字相同」尚未驗證，施測不賭這個假設。
     # 驗證方式（做完即可刪本項）：同一題以 stream=True / False 各跑一次，

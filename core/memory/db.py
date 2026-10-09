@@ -3,7 +3,9 @@
 記憶資料庫的連線與結構（SQLite）。
 
 一個檔、多張表：`pre_write`（預寫區佇列）／`transcript`（原文存放區，永久）／
-`recall_fts`（檢索索引，衍生、可刪重建，由 recall.py 持有）／`meta`（`next_serial`、`landed_upto`＝N、`compressed_upto`＝M）。
+`topic`／`topic_vec`／`topic_fts`（準 v4 主題與其索引，topics.py／topic_index.py 持有）／
+`episode`（事件層，衍生）／`meta`（`next_serial`、`landed_upto`＝N、`judged_upto`、
+`compressed_upto`＝M——M 是 v1 壓縮的進度，🔺 2026-10-09 起沒有人推進，留著是因為已寫進既有 DB）。
 
 🔴 **為什麼是同一個 DB 檔**：讓「原文寫進 transcript ＋ 推進 N」落在**同一個交易**裡
    ——分成兩個檔就沒有交易保證，那個「原文寫成功但 N 沒更新」的窗口會回來。
@@ -189,19 +191,19 @@ def set_meta(cx: sqlite3.Connection, key: str, value: int) -> None:
 #
 # **交易只能包住 DB 操作。LLM 呼叫、網路、睡眠一律在交易之外。**
 #
-# ⚠️ 違反的症狀很具體：`_compress()` 要跑 21～60 秒，若它被包在交易裡，
-#    producer 每一次 append 都要等那把鎖——**而前台會直接感覺到**。
+# ⚠️ 違反的症狀很具體：背景判斷的 LLM 呼叫每段 5～25 秒（v1 的壓縮曾是 21～60 秒），
+#    若它被包在交易裡，producer 每一次 append 都要等那把鎖——**而前台會直接感覺到**。
 #
 # ⭐ **本套件不靠註解維持這條，靠結構**：
-#    `pre_write` 與 `transcript` 的公開方法**一律自己開自己關交易**（用 write_txn），
+#    `pre_write`、`transcript`、`topics` 的公開方法**一律自己開自己關交易**（用 write_txn），
 #    不對外回傳任何可持有的 transaction 物件或 cursor。
 #    ⇒ **呼叫端在結構上拿不到「把 LLM 包進交易」的機會。**
 #    📌 拿不到的東西不會被誤用；靠註解的東西要人記得。
 #
-# ⚠️ 因此 consumer 的迴圈固定切三段：
+# ⚠️ 因此 consumer 的迴圈固定切三段（現行實例：core/memory/judge.py 的背景判斷）：
 #      ① 開交易讀待處理 → 關交易
-#      ② **交易外**呼叫 _compress()（那 60 秒）
-#      ③ 開交易寫結果 ＋ 推進 checkpoint → 關交易
+#      ② **交易外**呼叫 LLM（那 5～25 秒）
+#      ③ 開交易寫結果 ＋ 推進 checkpoint（judged_upto）→ 關交易
 
 
 # ══════════════════════════════════════════════════════════════

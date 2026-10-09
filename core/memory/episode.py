@@ -1,6 +1,9 @@
 # core/memory/episode.py
 """
-事件層（準 v3 組合 9，甲案）：把原句切成一段一段，每段由程式挑關鍵詞與代表句。
+事件層（準 v3 組合 9，甲案；🔺 2026-10-09 準 v3 淘汰時留下，併入準 v4 開場）：
+把原句切成一段一段，每段由程式挑關鍵詞與代表句。
+現在給開場用的只有：上一段的時間（「上次聊天是…」）、段數（今天聊過幾次）、輪數、關鍵詞。
+代表句照算照存（衍生物、可整張重建），但不再注入（邪狼 2026-10-09：開場只留關鍵詞）。
 
 ⭐ **不經 LLM**（2026-09-27 邪狼裁定甲案）：不編造、不用等、內容全是原句。
    「用她的話概括一次」刻意不做——歸納放在讀取端，她拿到代表句後當場自己串。
@@ -24,7 +27,7 @@ from datetime import datetime
 from core.memory.db import write_txn
 import unicodedata
 
-from core.memory.recall import _is_cjk
+from core.memory.bigram import _is_cjk
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS episode (
@@ -79,7 +82,7 @@ def time_bucket(ts: str, now: datetime | None = None) -> str:
 
 
 def _units(text: str) -> list[str]:
-    """一句話 → 中日韓連續段與英數詞（與 recall.bigrams 同一套正規化）。"""
+    """一句話 → 中日韓連續段與英數詞（與 bigram.bigrams 同一套正規化）。"""
     text = unicodedata.normalize("NFKC", text or "").lower()
     out, cur, cjk = [], [], None
     for ch in text + " ":

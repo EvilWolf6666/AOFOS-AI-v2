@@ -129,6 +129,31 @@ def p_build(tokens: list[dict]) -> float | None:
     return min(total, 1.0)
 
 
+def norm_topic(text: str) -> str:
+    """比對用：去空白與句尾標點。只用來判斷「一字不差」，不改存進去的字。"""
+    return "".join(text.split()).rstrip("。．.！!？?～~…")
+
+
+def drop_copies(items: list[dict], *, examples: set[str], existing: set[str]) -> tuple[list[dict], int, int]:
+    """機械過濾（2026-10-09 實跑：模型會把提示詞例子原句寫進無關的段，也會重複建同一件）：
+      ① 與規則檔【例子】的主題句一字不差 ⇒ 丟（照抄例子）
+      ② 與現存（最新有效版）主題一字不差、或同一次輸出裡重複 ⇒ 丟（重複）
+    回傳（留下的, 抄例子數, 重複數）。純函式；確定性，不靠模型自己判斷。
+    ⚠️ 只擋「一字不差」：改了幾個字的照抄擋不到——那是計數之外要人看的。"""
+    keep, copied, dup = [], 0, 0
+    seen = set(existing)
+    for it in items:
+        k = norm_topic(it["text"])
+        if k in examples:
+            copied += 1
+        elif k in seen:
+            dup += 1
+        else:
+            seen.add(k)
+            keep.append(it)
+    return keep, copied, dup
+
+
 def split_answer(text: str) -> tuple[str, str]:
     """回應 → （第一行判斷, 其餘的主題句部分）。第一行看不懂時整段都當主題句部分。"""
     lines = text.strip().splitlines()
@@ -224,6 +249,9 @@ class BackgroundJudge:
         self.names = cfg["speaker_names"]
         self.system, self.types, self.examples = load_prompt(
             cfg["judge_prompt_path"], max_topics=cfg["judge_max_topics"])
+        # 例子的主題句（期望輸出第 2 行起、「類型｜屬性鍵｜主題句」的第三欄）——照抄過濾用
+        self._example_texts = {norm_topic(ln.replace("|", "｜").split("｜")[-1])
+                               for _, out in self.examples for ln in out[1:] if "｜" in ln.replace("|", "｜")}
         self._path: str | None = None
         self._want_path: str | None = None
         self._cx = None
@@ -234,7 +262,7 @@ class BackgroundJudge:
         self._last_activity = time.monotonic()
         self.stats = {"segments": 0, "built": 0, "skipped": 0, "topics": 0, "cancelled": 0,
                       "cancels_live": 0, "parse_bad": 0, "errors": 0, "backlog": 0,
-                      "no_lp": 0, "extra": 0}
+                      "no_lp": 0, "extra": 0, "copied": 0, "dup": 0}
         self._no_lp_warned = False
         self._backlog_warned = False
         self._working = False          # 正在判一段（給 /status 看，不參與任何決策）
@@ -304,6 +332,7 @@ class BackgroundJudge:
         return (f"背景判斷{state}：待判 {n} 句｜段 {s['segments']}（建 {s['built']}／"
                 f"不建 {s['skipped']}）｜主題 {s['topics']}｜取消 {s['cancelled']}"
                 f"（切斷進行中 {s['cancels_live']}）｜補呼叫 {s['extra']}｜缺機率 {s['no_lp']}"
+                f"｜濾掉 抄例子 {s['copied']}／重複 {s['dup']}"
                 f"｜解析丟行 {s['parse_bad']}｜錯誤 {s['errors']}")
 
     # ── 執行緒 ────────────────────────────────────────────────
@@ -400,6 +429,14 @@ class BackgroundJudge:
         said, p, build, items = self._judge(text, first, last)
         thr = cfg["judge_build_threshold"]
 
+        if items:
+            items, copied, dup = drop_copies(items, examples=self._example_texts,
+                                             existing={norm_topic(t["text"]) for t in st.latest()})
+            self.stats["copied"] += copied
+            self.stats["dup"] += dup
+            if copied or dup:
+                logger.warning(f"主題句機械過濾（serial {first}–{last}）：照抄例子 {copied} 件、"
+                               f"與現存重複 {dup} 件，已丟；剩 {len(items)} 件")
         speakers = [r.get("speaker_id") for r in seg]
         ids = st.add_topics(items, first_serial=first, last_serial=last,
                             event_ts=seg[-1]["ts"], speakers=speakers, judged_upto=last)

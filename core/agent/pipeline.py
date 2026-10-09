@@ -72,12 +72,6 @@ class _StreamSink:
 class Pipeline:
     """不負責模組的建立與連線（那是 Agent 的職責），只負責呼叫順序與分流邏輯。"""
 
-    # 🔺 2026-09-27：準 v3 的 needs_compress() 恆為 False ⇒ 這句目前不會印出；
-    #    日後若恢復任何輸出後的長耗時處理，沿用此提示（畫面無動靜會被當成當機）。
-    # 壓縮期間畫面完全沒有動靜，看起來像當機。兩條路徑共用（輪次收尾與離場）。
-    # ⚠️ 寧可寫長不寫短：秒數隨 Working Memory 長度與背景 CPU 競爭浮動，
-    #    提前結束無害，超出提示上限會被當成當機（實測依據見《現況》15之2）。
-    COMPRESS_WAIT_MESSAGE = "[整理記憶中，約需 1 分鐘，請稍候……]"
 
     # 串流輸出的前後綴。⚠️ 必須與 agent.py 的非串流輸出格式逐字元一致，
     # 否則開關 stream 時畫面行距會跳動。
@@ -162,14 +156,8 @@ class Pipeline:
     # ── 指令 handler（簽名統一為 (state, voice_input_factory, arg)）─
 
     def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
-        # ⚠️ compress_on_exit() 不檢查 needs_compress()，只要 working_memory
-        # 非空就壓縮——講兩句話就退出也會等，故此處條件只看「有沒有東西要壓」。
-        # 🔺 2026-09-26：改問 needs_compress()，不自己推「有 WM 就會壓縮」——
-        #    記憶層換成準 v3 切片後離場不再壓縮，舊條件會印一句不成立的「約需 1 分鐘」
-        #    （《現況》二十一章 #7）。要不要等由記憶層回答，本層不猜。
-        if self.memory.needs_compress() and not self.memory.test_mode:
-            console.emit(self.COMPRESS_WAIT_MESSAGE)
-
+        # 離場收尾（補寫原句、關背景判斷、重建事件層；毫秒級，不需要「請稍候」提示）。
+        # 🔺 2026-10-09 v1 壓縮的相容殼（needs_compress／COMPRESS_WAIT_MESSAGE）已移除。
         self.memory.compress_on_exit()
         state.stop()
         return TurnResult(should_exit=True, system_message="掰掰。")
@@ -297,30 +285,17 @@ class Pipeline:
 
     def finalize_turn(self) -> None:
         """
-        輸出後的收尾掛點。🔺 2026-09-27：準 v3 不壓縮，`needs_compress()`／
-        `maybe_compress()` 是相容空殼（恆 False／不做事），本方法目前空轉。
-        以下為 v1 時期的設計理由，日後掛離線處理時仍適用：
-
-        🔴 必須由 Agent 在回應「已經輸出之後」呼叫——這是本方法存在的唯一理由。
-        壓縮是一次完整的 LLM 呼叫，放在輸出前會直接落在使用者等待的路徑上。
-        目前仍為同步執行，尖峰只是被移到下一次輸入之前。
-
-        壓縮失敗不得中斷主流程。
-
-        🆕 2026-09-30 準 v4：這裡恢復背景判斷（輪次開始時 bg_pause）。
-        🔴 必須在輸出之後——早了背景請求會跟還沒送完的對話搶推論槽。
+        輸出後的收尾掛點：恢復背景判斷（輪次開始時 bg_pause）。
+        🔴 必須由 Agent 在回應「已經輸出之後」呼叫——早了背景請求會跟還沒送完的對話搶推論槽。
+        失敗不得中斷主流程。
+        🔺 2026-10-09 v1 壓縮（maybe_compress）的相容殼已移除；日後要在這裡掛任何離線處理，
+           同樣只能放在輸出之後、且不得放在使用者等待的路徑上。
         """
         try:
             self.memory.bg_resume()
         except Exception as e:
-            console.emit(f"[背景記憶恢復失敗，不影響本輪對話：{e}]")
-        try:
-            if self.memory.needs_compress():
-                console.emit(self.COMPRESS_WAIT_MESSAGE)
-            self.memory.maybe_compress()
-        except Exception as e:
             # 此處不用 logger：Pipeline 不持有 logger，錯誤細節已由 MemoryManager 記錄
-            console.emit(f"[記憶壓縮失敗，不影響本輪對話：{e}]")
+            console.emit(f"[背景記憶恢復失敗，不影響本輪對話：{e}]")
 
     # ── 環境事件輪次 ──────────────────────────────────────────────
 
@@ -329,14 +304,14 @@ class Pipeline:
         環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話，故 user 欄位
         填 EVENT_CONFIG["user_placeholder"]（不偽裝成使用者發言），情境改由
         EVENT_CONFIG["observation_role"] 指定的角色帶入。與 handle_turn() 相同，
-        此處只追加記憶不壓縮。
+        此處只追加記憶。
 
         🔴 role 的現行值、待定狀態與兩套 role 定義交錯的問題，唯一記載在
         config.EVENT_CONFIG["observation_role"]，此處不複述——改動前讀該處。
 
         情境訊息只存在於這次呼叫，不寫入 Working Memory。
-        ⚠️ 已知會造成兩個症狀（連續觸發時模型照抄前一組回應、`_compress` 讀不到
-        情境導致摘要抓不到事件）。待 observation 類訓練資料就緒後重新評估——
+        ⚠️ 已知症狀：連續觸發時模型照抄前一組回應（v1 時另有「壓縮讀不到情境」，
+        壓縮已移除）。待 observation 類訓練資料就緒後重新評估——
         模型學到「U 空時看情境說話」可能即可壓過複製傾向，故不預先修。
 
         🔴 情境訊息一律 append 在歷史「之後」、緊鄰生成點，順序不可前移。
@@ -354,7 +329,7 @@ class Pipeline:
         「她突然說了一段話而沒有人知道為什麼」的紀錄。
         ⚠️ **但模型看到的東西完全不變**：`get_context()` 會把非標準欄位投影掉
         （見 core/memory/manager.py 的 get_context）——**那個投影是本做法成立的前提，
-        不是防禦性程式碼**。而「要不要把情境餵給模型／餵給 _compress」是另一個
+        不是防禦性程式碼**。而「要不要把情境餵給模型」是另一個
         決定（方案 α），待 observation 類訓練資料就緒後再議，本次不做。
 
         ⚠️ **observation 輪次不做記憶檢索，這是實際行為但尚未確認是否應該如此。**

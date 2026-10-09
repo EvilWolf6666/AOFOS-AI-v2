@@ -27,8 +27,8 @@ import math
 from config import MEMORY_CONFIG
 from core.llm_client import BackgroundLLM
 from core.memory.db import connect
-from core.memory.judge import (_FORCE_BUILD, load_prompt, p_build, parse_topics, split_answer,
-                               split_segment)
+from core.memory.judge import (_FORCE_BUILD, drop_copies, load_prompt, norm_topic, p_build,
+                               parse_topics, split_answer, split_segment)
 from core.memory.manager import MemoryManager
 from core.memory.topic_index import TopicSearch, fill_fts
 from core.memory.topics import SCHEMA as TOPIC_SCHEMA
@@ -151,6 +151,9 @@ def responder(req: dict):
         return "我覺得要建\n其他｜無｜邪狼說了亂碼判斷"
     if "解析不了" in seg:
         return "建\n這段很有意思喔", BUILD             # 沒有 ｜ ⇒ 解析不出
+    if "抄例子" in seg:                              # 照抄規則檔例子＋與現存重複＋一件新的
+        return ("建\n身分｜無｜邪狼是奧狐的哥哥，也是奧狐的創造者。\n狀態｜無｜邪狼住在高雄\n"
+                "事件｜無｜邪狼說了抄例子的事"), BUILD
     lines = []
     if "高雄" in seg:
         lines.append("狀態｜邪狼.住地｜邪狼住在高雄")
@@ -159,7 +162,7 @@ def responder(req: dict):
     if "貓" in seg:
         lines.append("事件|無|邪狼家的貓很胖")      # 半形 | 也要吃
     if "阿凱" in seg:
-        lines.append("狀態｜無｜邪狼的朋友阿凱下次會來直播")
+        lines.append("狀態｜無｜阿凱下次會來邪狼的直播")
     return "建\n" + ("\n".join(lines) or "其他｜無｜沒什麼"), BUILD
 
 
@@ -210,7 +213,7 @@ def injected(ctx: list[dict]) -> str:
 
 
 def mm(d: str, fake: FakeLLM, **over) -> MemoryManager:
-    cfg = {"v3_recall": False, "v3_opening": False, "v4_enabled": True,
+    cfg = {"v4_enabled": True,
            "judge_idle_s": 0.2, "judge_segment_close_s": 0, "judge_pause_timeout_s": 60}
     cfg.update(over)
     return MemoryManager(None, db_path=os.path.join(d, "memory.db"),
@@ -273,6 +276,13 @@ def main() -> int:
     check("沒有 logprobs ⇒ None", p_build([]) is None and p_build([{"token": "建", "logprob": 0.0}]) is None)
     check("第一行判斷與主題句分開", split_answer("建\n狀態｜無｜x") == ("建", "狀態｜無｜x")
           and split_answer("不建") == ("不建", "") and split_answer("嗯\n狀態｜無｜x")[0] == "?")
+
+    items = [{"text": "邪狼是奧狐的哥哥，也是奧狐的創造者。"}, {"text": "邪狼 住在高雄"},
+             {"text": "新的一件"}, {"text": "新的一件！"}]
+    keep, cp, dp = drop_copies(items, examples={norm_topic("邪狼是奧狐的哥哥，也是奧狐的創造者")},
+                               existing={norm_topic("邪狼住在高雄")})
+    check("機械過濾：照抄例子、與現存重複、同次重複都丟（忽略空白與句尾標點）",
+          [k["text"] for k in keep] == ["新的一件"] and (cp, dp) == (1, 2), f"{keep} {cp} {dp}")
 
     print("\n[判斷：規則檔（真的 prompts/memory_judge.txt）]")
     system, types, examples = load_prompt(MEMORY_CONFIG["judge_prompt_path"], max_topics=5)
@@ -505,7 +515,9 @@ def main() -> int:
             fake.token_s = 0.0
             m.bg_resume()
             ok = wait(lambda: judged(m)[0] == 18)
-            check("恢復後整段重判完成（冪等：主題不重複）", ok and "主題 7" in m.status_text(), m.status_text())
+            # 這段的主題句（邪狼家的貓很胖）與前面建過的一字不差 ⇒ 被重複過濾丟掉，主題數不變
+            check("恢復後整段重判完成（冪等：主題不重複；與現存一字不差的被過濾）",
+                  ok and "主題 6" in m.status_text() and "重複 1" in m.status_text(), m.status_text())
 
             print("\n[施測隔離]")
             before = judged(m)[0]
@@ -533,7 +545,12 @@ def main() -> int:
             ok = wait(lambda: judged(m)[0] == 4 and "主題未補向量 0" in m.status_text())
             inj = injected(m.get_context("阿凱什麼時候來"))
             check("向量下限調到撈不到 ⇒ 仍由關鍵字撈回專有名詞那件、且只有配額內 1 件",
-                  ok and "阿凱下次會來直播" in inj and "高雄" not in inj, inj)
+                  ok and "阿凱下次會來" in inj and "高雄" not in inj, inj)
+            turn(m, "這段會抄例子", "嗯")
+            ok = wait(lambda: judged(m)[0] == 6)
+            st_ = m.status_text()
+            check("實際判斷時：照抄規則檔例子的、與現存重複的被丟，新的那件照建",
+                  ok and "濾掉 抄例子 1／重複 1" in st_ and "主題 3" in st_, st_)
             m.compress_on_exit()
             h = open_handles(d)
             check("離場後沒有任何連線還開著", not h, str(h))
@@ -549,7 +566,7 @@ def main() -> int:
                   a_.try_acquire() and held_by_other(lk) and not RunLock(lk).try_acquire()
                   and (a_.release() or True) and not held_by_other(lk))
             m = MemoryManager(None, db_path=db, test_db_path=os.path.join(d, "t.db"), embed_enabled=False,
-                              cfg_override={"v3_recall": False, "v3_opening": False, "v4_enabled": False})
+                              cfg_override={"v4_enabled": False})
             for u in ("我住在高雄", "我家的貓很胖", "今天天氣不錯"):
                 m.add_turn(u, "嗯")
             m.compress_on_exit()
@@ -572,7 +589,7 @@ def main() -> int:
                   and "不啟動" in lines[0], str(lines))
             hold.release()
             m = MemoryManager(None, db_path=db, test_db_path=os.path.join(d, "t.db"), embed_enabled=False,
-                              cfg_override={"v3_recall": False, "v3_opening": False, "v4_enabled": False})
+                              cfg_override={"v4_enabled": False})
             m.add_turn("我搬到台北了", "恭喜")
             m.compress_on_exit()
             fake.prefill_s = 3.0
@@ -591,8 +608,11 @@ def main() -> int:
             aborted = wait(lambda: fake.log[-1]["status"] == "aborted", 5.0)
             hold.release()
             fake.prefill_s = 0.0
-            check("跑到一半 AOFOS 啟動 ⇒ 1 秒內取消手上的呼叫並結束（伺服器看到斷線）",
-                  res == [0] and dt < 1.0 and aborted and "偵測到 AOFOS 啟動" in lines[-1],
+            # ⚠️ 門檻是「假伺服器 prefill 3 秒＋1」而不是 1 秒：Windows 上 shutdown() 不會打斷別條執行緒
+            #    卡著的 recv（Linux 會），要等伺服器下一次寫入才返回（2026-10-09 Windows 實測 2.77 秒）。
+            #    斷線本身（FIN）在取消當下就送出 ⇒ 伺服器端照樣看得到；只是 worker 本身晚一點結束。
+            check("跑到一半 AOFOS 啟動 ⇒ 取消手上的呼叫並結束（伺服器看到斷線；Windows 最多等到伺服器下一次回應）",
+                  res == [0] and dt < 4.0 and aborted and "偵測到 AOFOS 啟動" in lines[-1],
                   f"res={res} dt={dt:.2f} aborted={aborted} {lines[-1:]}")
             h = open_handles(d)
             check("worker 結束後沒有連線還開著（鎖檔除外）", [x for x in h if not x.startswith("aofos.run")] == [], str(h))

@@ -12,7 +12,7 @@
 
 🆕 2026-10-09 關鍵字那一路（邪狼裁兩路並用，《現況》〈🔒 隔離區〉準 v4 檢索列）：
    `topic_fts`（FTS5，rowid＝topic.id）＝主題句的 bigram，**與準 v3 撈原句同一個切法**
-   （core/memory/recall.py 的 `bigrams()`／`_match_expr()`，寫入與查詢必須同一個函式）。
+   （core/memory/bigram.py 的 `bigrams()`／`_match_expr()`，寫入與查詢必須同一個函式）。
    同樣是衍生物、可重建；由判斷執行緒建完主題順手補（`fill_fts`）。
    合併方式不在本檔：兩路各自回名單，由 manager 依各路配額取聯集（不重排）。
 """
@@ -23,7 +23,7 @@ import sqlite3
 
 from core.logger import setup_logger
 from core.memory.db import write_txn
-from core.memory.recall import _match_expr, bigrams
+from core.memory.bigram import _match_expr, bigrams
 from core.memory.topics import TopicStore
 
 logger = setup_logger("MemoryTopicIndex")
