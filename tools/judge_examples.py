@@ -22,7 +22,7 @@ import time
 
 from config import MEMORY_CONFIG
 from core.llm_client import BackgroundLLM
-from core.memory.judge import build_messages, load_prompt, p_build, split_answer
+from core.memory.judge import build_messages, load_prompt, norm_topic, p_build, split_answer
 
 # （對話，「／」分句；期望輸出：第一行建／不建，之後是期望主題句）——不得與提示詞【例子】重複
 HELD_OUT: list[tuple[str, list[str]]] = [
@@ -47,6 +47,7 @@ def main(argv: list[str]) -> int:
     cases = [("未見過", d, o) for d, o in HELD_OUT]
     if "--all" in argv:
         cases += [("提示詞內", d, o) for d, o in examples]
+    ex_texts = {norm_topic(ln.replace("|", "｜").split("｜")[-1]) for _, o in examples for ln in o[1:]}
     llm = BackgroundLLM(params=cfg["judge_params"])
     thr = cfg["judge_build_threshold"]
     rows, wrong = [], 0
@@ -67,7 +68,8 @@ def main(argv: list[str]) -> int:
         for ln in want_lines[1:]:
             print(f"      期望：{ln}")
         for ln in body.strip().splitlines():
-            print(f"      模型：{ln}")
+            mark = "　⛔照抄例子（正式判斷會濾掉）" if norm_topic(ln.replace("|", "｜").split("｜")[-1]) in ex_texts else ""
+            print(f"      模型：{ln}{mark}")
         rows.append({"group": group, "dialog": dialog, "want": want_lines, "said": said, "p_build": p,
                      "decided": got, "ok": hit, "seconds": round(dt, 2), "raw": out, "logprobs": lps})
     os.makedirs("logs", exist_ok=True)

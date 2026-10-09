@@ -13,6 +13,7 @@
       閒置門檻＝0（AOFOS 已關，沒有要等的對話）；不載 embedding（省 18 秒與約 800 MB）——
       主題的關鍵字索引照補，向量由 AOFOS 下次開啟後的背景判斷順手補（補完之前向量那一路撈不到這些新主題）。
   · 一段只有在「最後一句已過 judge_segment_close_s」才算講完，所以 AOFOS 剛關時最多等那麼久才開判。
+  · 人工審核不在這裡做：判完若有待審的，只提醒去開 start/審核.bat。
   · 連續出錯 3 次（例如 LM Studio 沒載模型）⇒ 結束並回 1（.bat 會停住讓你看訊息）。
 """
 from __future__ import annotations
@@ -65,6 +66,9 @@ def main(*, db_path: str | None = None, llm=None, cfg_override: dict | None = No
                 break
             if pend == 0 and not judge.busy:
                 out(f"全部判完：{judge.status(pend)}")
+                n_rev = len(TopicStore(cx, writable=False).pending_review())
+                if n_rev:
+                    out(f"⚠️ 有 {n_rev} 件要取代核心設定的事實在等人工審核：請另外雙擊 start/審核.bat（本程式不做審核）")
                 break
             if time.monotonic() - last_print > 10:
                 out(judge.status(pend))

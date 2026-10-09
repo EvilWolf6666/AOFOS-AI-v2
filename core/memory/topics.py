@@ -112,7 +112,12 @@ class TopicStore:
     def judged_upto(self) -> int:
         if not self._has_table():
             return 0
-        return get_meta(self.cx, _JUDGED_KEY)
+        try:
+            return get_meta(self.cx, _JUDGED_KEY)
+        except KeyError:
+            # 建表與寫入 judged_upto 是先後兩步（ensure_schema）：別條連線剛好夾在中間讀到
+            # ＝還沒判過任何一句。2026-10-09 Windows 自測撞到（judge_worker 主執行緒讀、判斷執行緒建表）。
+            return 0
 
     def pending_rows(self, limit: int) -> list[dict]:
         """已落地、還沒判斷過的原句（serial > judged_upto），依 serial 排序。"""

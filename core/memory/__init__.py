@@ -1,7 +1,8 @@
 # core/memory/
 """
-記憶模組（準 v3 最小記憶切片：原句存放 transcript ／ 預寫區 pre_write ／ 檢索 recall ／
-向量 embed ／ 事件層 episode ／ 清理 clean ／ 資料庫 db，入口 manager）。
+記憶模組（準 v4：原句存放 transcript ／ 預寫區 pre_write ／ 清理 clean ／ 資料庫 db ／
+主題 topics、topic_index ／ 背景判斷 judge ／ 切詞 bigram ／ 向量模型 embed ／ 事件層 episode ／
+執行鎖 run_lock，入口 manager）。🔺 2026-10-09 準 v3 撈原句淘汰，recall.py 移除（切詞留在 bigram.py）。
 
 本套件是記憶這條線的唯一分群：**這幾個檔會一起被改，而且不跟外面一起改**
 ——分群判準是這個，不是行數（《現況》零章第八條）。
@@ -27,8 +28,8 @@
 #    但 tools/ 底下直接 import `core.memory.rag` 的診斷腳本會隨之失效，這是預期的。
 #
 # 🔴 **延後載入（PEP 562），不在本檔頂層 import manager**：頂層 import 會讓
-#    `python -m core.memory.db --selftest`／`-m core.memory.recall` 先經由本檔把
-#    db／recall 載入一次、runpy 再以 __main__ 執行第二份 ⇒ 每次都印
+#    `python -m core.memory.db --selftest` 先經由本檔把
+#    db 載入一次、runpy 再以 __main__ 執行第二份 ⇒ 每次都印
 #    RuntimeWarning（2026-09-26 Windows 實跑撞到）。一個每次都出現的警告會訓練人
 #    忽略警告。⇒ 只有真的取用 `core.memory.MemoryManager` 時才 import。
 __all__ = ["MemoryManager"]
@@ -39,5 +40,3 @@ def __getattr__(name: str):
         from core.memory.manager import MemoryManager
         return MemoryManager
     raise AttributeError(f"module 'core.memory' has no attribute {name!r}")
-
-
