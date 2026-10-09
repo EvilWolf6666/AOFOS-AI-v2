@@ -208,22 +208,26 @@ MEMORY_CONFIG = {
     "speaker_ids": {"user": "evilwolf", "assistant": "aofos"},
     "speaker_names": {"evilwolf": "邪狼", "aofos": "奧狐"},
 
-    # 🟨 佔位：「什麼值得記」的類型，待邪狼提供（六類）後替換。
-    #    模型回了清單外的類型 ⇒ 照存並記 WARNING（不丟，原句可重判）。
-    "topic_types": ["狀態", "事件", "偏好", "約定", "關係", "其他"],
-    # 🟨 佔位：判斷準則說明（會放進背景判斷的指示末段）。
-    "judge_criteria": "值得記：關於人的事實或狀態（住哪、做什麼、身體、計畫）、發生過的事、"
-                      "喜好厭惡、約定與承諾、兩人關係的變化。不值得記：寒暄、純玩笑、"
-                      "沒有新資訊的附和。",
+    # 「什麼值得記」：類型、判準、例子全部在這個檔（2026-10-09 邪狼定，直接排版改這個檔即可，不用碰程式）。
+    #    類型名稱的唯一來源是檔內【類型】段；模型回了清單外的類型 ⇒ 照存並記 WARNING。
+    #    ⚠️ 例子越多，每段背景判斷的 prefill 越長（規則在前、連續判好幾段時吃得到快取）。
+    "judge_prompt_path": os.path.join(PROJECT_ROOT, "prompts", "memory_judge.txt"),
 
     # 背景判斷（乙：同一顆對話模型，閒置時跑、一開口就取消）
     "judge_in_test_mode": False,  # 施測時不跑：日常區在施測中必須靜止，且背景呼叫會搶推論槽
-    "judge_idle_s": 8.0,          # 最後一次輪次收尾後閒置多久才開始背景判斷
+    # 最後一次輪次收尾後閒置多久才開始背景判斷。🔺 2026-10-09 8 → 60（邪狼）：最近 20 輪在
+    #    Working Memory 裡、同場本來就記得，主題晚點建不影響；拉長＝少被開口取消、少搶推理槽。
+    "judge_idle_s": 60.0,
     "judge_segment_max": 12,      # 一段最多幾句（原句數，雙方合計）
     "judge_segment_gap_minutes": 30,  # 兩句相隔超過這麼久就切段（同事件層）
     "judge_segment_close_s": 60,  # 最後一句距今超過這麼久，這段才算「講完了」可以判
     "judge_max_topics": 5,        # 一段最多建幾件事
-    "judge_max_tokens": {"decide": 16, "topics": 200},
+    "judge_max_tokens": 220,      # 一次呼叫：第一行判斷＋最多 judge_max_topics 行主題句
+    # 建不建看機率：P(建)＝第一行是「建」或「不確定」的機率（logprobs 算，judge.py p_build）。
+    # 🟨 起始值，不是結論：待第 6 點（實跑累積 P(建) 樣本）校準。低於 0.5＝寧可多建。
+    #    2026-10-09 探測：「我是你哥也是你的創造者」在沒給判準的提示下 P(建)≈0.37。
+    "judge_build_threshold": 0.3,
+    "judge_top_logprobs": 5,      # 每個 token 要幾個候選（算 P(建) 只看前兩個 token）
     # 背景一律貪婪（可重現）。🔴 取樣參數全部明帶、不靠 LM Studio GUI 的值（沒帶的會套 GUI 預設，
     #    GUI 一改就靜默改變背景行為）。重複懲罰在貪婪下仍會改變選字（主題句要照抄人名）⇒ 1.0。
     #    ⭐ 單一來源在這裡；GUI 不需要跟著改（對話用的 LLM_CONFIG 同樣全部明帶）。
@@ -232,9 +236,12 @@ MEMORY_CONFIG = {
     "judge_backlog_warn": 200,    # 待判原句超過這麼多句 ⇒ WARNING（背景跟不上或死掉）
     "judge_pause_timeout_s": 300, # 暫停超過這麼久沒被恢復 ⇒ 自動恢復並 WARNING（收尾掛點漏呼叫的保險）
 
-    # 讀取
-    "topic_top_k": 3,
-    "topic_min_sim": 0.45,        # 🟨 暫定：主題句比原句短、語意集中，地板先比 0.55 低，待回憶題校準
+    # 讀取：向量＋關鍵字兩路一律並行，各取自己的配額、聯集去重、不重排（2026-10-09 邪狼裁）。
+    #    注入最多 topic_vec_k＋topic_bm25_k 件（兩路撈到同一件時只算一件、空位不遞補）。
+    #    每多一件約多 20～30 token prefill。三個值都是 🟨 起始值，待量測校準。
+    "topic_vec_k": 3,
+    "topic_bm25_k": 1,
+    "topic_min_sim": 0.45,        # 向量那一路的下限（主題句短、語意集中，先比原句的 0.55 低）
 }
 
 # RAG

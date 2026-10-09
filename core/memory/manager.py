@@ -104,7 +104,7 @@ class _Store:
                     ensure_schema(self._cx)
             if self._emb is not None and self._v3_vec:
                 self.vsearch = VectorSearch(self._cx, self._emb)
-            if self._emb is not None and self._v4:
+            if self._v4:   # 向量關閉時仍建：關鍵字那一路不需要向量
                 self.tsearch = TopicSearch(self._cx, self._emb)
         return self
 
@@ -191,7 +191,7 @@ class MemoryManager:
             if self._v3_recall:   # 原句向量只給準 v3 撈原句用；關了就不補算
                 self._worker = VectorWorker(self._emb)
         elif self._v4:
-            logger.warning("準 v4 開著但向量關閉：主題照建，但讀取端撈不到任何主題")
+            logger.warning("準 v4 開著但向量關閉：主題照建，讀取端只剩關鍵字那一路")
 
         # 準 v4 背景判斷（乙：同一顆對話模型，閒置時跑、一開口就取消）
         self._judge: BackgroundJudge | None = None
@@ -575,29 +575,44 @@ class MemoryManager:
             return ""
 
     def _topics(self, query: str) -> str:
-        """準 v4 讀取：主題向量比對 → 最新有效版本的主題句，依事件時間排列。
+        """準 v4 讀取：向量＋關鍵字兩路，**各取自己的配額、聯集去重、不重新排名**，依事件時間排列。
 
+        🔺 2026-10-09 邪狼裁（《現況》〈🔒 隔離區〉準 v4 檢索列）：兩路一律並行；不用 RRF——
+           RRF 讓兩路搶同一組名額，只有一路命中的（例：關鍵字逐字命中的專有名詞）可能被擠掉。
+           去重空出的名額不遞補（遞補就得決定「下一名給誰」，又回到排名次）。
+        ⭐ 兩路各自的命中名單寫 debug log ⇒ 日後可離線重算 RRF 比對，不必重跑對話。
         ⚠️ 第 4 步「依當下狀況重寫」尚未實作：現在注入的是建立時的主題句本身。
         ⭐ 時間只給口語時間感（time_bucket），庫裡存絕對時間（準 v4 決策）。
         """
         try:
-            if self._emb is None or not self._emb.ready.is_set():
+            cfg = self._cfg
+            stores = [st for st in self._read_stores() if st.tsearch is not None]
+            qvec = None
+            if self._emb is not None and self._emb.ready.is_set():
+                qvec = self._emb.encode([query])[0]
+            # (store 序號, topic id) 當鍵：測試模式讀兩個 DB，id 會撞
+            vec, kw = [], []
+            for si, st in enumerate(stores):
+                if qvec is not None:
+                    vec += [(si, t, s) for t, s in st.tsearch.search(
+                        qvec, top_k=cfg["topic_vec_k"], min_sim=cfg["topic_min_sim"])]
+                kw += [(si, t, s) for t, s in st.tsearch.search_bm25(
+                    query, top_k=cfg["topic_bm25_k"], max_terms=self._max_terms)]
+            vec = sorted(vec, key=lambda h: -h[2])[: cfg["topic_vec_k"]]
+            kw = kw[: cfg["topic_bm25_k"]]   # 各 DB 的 bm25 尺度不同，不跨庫比分數：寫入區優先
+            picked: dict[tuple[int, int], dict] = {}
+            for si, t, _ in vec + kw:
+                picked.setdefault((si, t["id"]), t)
+            logger.debug(f"主題命中 向量 {[(si, t['id'], round(s, 3)) for si, t, s in vec]}"
+                         f"｜關鍵字 {[(si, t['id'], round(s, 3)) for si, t, s in kw]}"
+                         f"｜聯集 {len(picked)} 件{'' if qvec is not None else '（向量未就緒）'}")
+            if not picked:
                 return ""
-            qvec = self._emb.encode([query])[0]
-            hits = []
-            for st in self._read_stores():
-                if st.tsearch is not None:
-                    hits += st.tsearch.search(qvec, top_k=self._cfg["topic_top_k"],
-                                              min_sim=self._cfg["topic_min_sim"])
-            hits = sorted(hits, key=lambda h: -h[1])[: self._cfg["topic_top_k"]]
-            if not hits:
-                return ""
-            hits.sort(key=lambda h: h[0]["event_ts"] or "")
+            hits = sorted(picked.values(), key=lambda t: t["event_ts"] or "")
             lines = ["[相關記憶] 你記得的事（括號是事情發生的時候）："]
-            for t, _ in hits:
+            for t in hits:
                 b = time_bucket(t["event_ts"] or "")
                 lines.append(f"· {'（' + b + '）' if b else ''}{t['text']}")
-            logger.debug(f"主題命中 {len(hits)} 件：{[(t['id'], round(s, 3)) for t, s in hits]}")
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
             logger.error(f"主題取回失敗，本輪不注入：{type(e).__name__}: {e}")

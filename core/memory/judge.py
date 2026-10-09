@@ -2,12 +2,16 @@
 """
 準 v4 寫入端的背景判斷（乙：同一顆對話模型，閒置時跑、一開口就取消）。
 
-一段對話 → 兩次呼叫：
-  ① 判斷類：「這段有沒有值得記的事」——`response_format: json_schema`，enum 限死
-     ["建","不建","不確定"]；「不確定」當「建」（寧可多建：主題是可重建的索引，漏建才救不回來）。
-  ② 生成類：主題句——純文字「類型｜屬性鍵｜主題句」一行一件，**JSON 由 Python 組**
-     （生成類不套 schema：輸出越短越快，這是延遲考量，《歸檔》準 v4 決策）。
-  ⭐ prompt 順序＝「對話片段在前、指示在後」：兩次呼叫前綴相同 ⇒ 第二次吃到 prompt cache。
+一段對話 → **一次呼叫**（🔺 2026-10-09 改，舊做法 json_schema 兩段式見《歸檔》D0033）：
+  第一行「建／不建／不確定」，要建就接著一行一件「類型｜屬性鍵｜主題句」，**JSON 由 Python 組**。
+  · 建不建看**機率不看字**：由第一行的 logprobs 算 P(建)（「不確定」那條路算進建，寧可多建——
+    主題是可重建的索引，漏建才救不回來），**只有一個門檻**（config `judge_build_threshold`）。
+  · 模型答「不建」但 P(建) 過門檻 ⇒ 它沒寫主題句 ⇒ 補一次呼叫要它寫。
+  · 拿不到 logprobs ⇒ WARNING（只記一次）＋計數，退回看文字（不確定／看不懂都當建）。
+  · 不用 json_schema：LM Studio 在格式限制下回的是限制「之前」的分布，讀不出選項機率，
+    而且同一段結論會變（2026-10-09 實測，《現況》11之2 己）。
+  ⭐ prompt 順序＝「規則在前（system，固定不變）、對話片段在後」：規則是每段共用的前綴，
+    連續判好幾段時吃得到 prompt cache。規則、類型、例子都在 prompts/memory_judge.txt（邪狼直接排版）。
 
 取消（乙能不能成立的關鍵）：
   · Pipeline 在輪次**開始**呼叫 pause() ⇒ BackgroundLLM.cancel() 切斷連線；
@@ -23,7 +27,8 @@
 
 from __future__ import annotations
 
-import json
+import math
+import os
 import threading
 import time
 from datetime import datetime
@@ -31,19 +36,110 @@ from datetime import datetime
 from core.llm_client import BackgroundCancelled
 from core.logger import setup_logger
 from core.memory.db import connect
-from core.memory.topic_index import fill_vectors
+from core.memory.topic_index import fill_fts, fill_vectors
 from core.memory.topics import TopicStore
 
 logger = setup_logger("MemoryJudge")
 
-DECIDE_SCHEMA = {
-    "type": "object",
-    "properties": {"decision": {"type": "string", "enum": ["建", "不建", "不確定"]}},
-    "required": ["decision"],
-    "additionalProperties": False,
-}
+_FORCE_BUILD = "這段要建：第一行寫「建」，接著逐件寫主題句。"
 
-_SYSTEM = "你是記憶整理助手。只依照指示輸出，不要多說任何話。"
+
+# ── 提示詞檔（prompts/memory_judge.txt）────────────────────────
+
+def load_prompt(path: str, *, max_topics: int) -> tuple[str, list[str], list[tuple[str, list[str]]]]:
+    """讀判斷規則檔 → （system 文字, 類型名稱清單, 例子[(對話, 期望輸出的各行)]）。
+
+    ⭐ 類型名稱的單一來源就是這個檔的【類型】段（「名稱：說明」每行一個）——config 不另列一份。
+    ⭐ 例子格式：「對話：…」一行，接「輸出：」，之後到下一個「對話：」為止是期望輸出（第一行建／不建）。
+       🔺 2026-10-09 實測：例子只寫「→ 建：身分」時，模型照抄類型說明、欄位錯位、編造事實
+       ⇒ 例子改成完整輸出格式。
+    🔴 檔案不在、或【類型】段解析不出任何類型 ⇒ 直接拋（啟動就失敗，不帶著空規則默默跑）。
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"記憶判斷規則檔不存在：{path}（config MEMORY_CONFIG['judge_prompt_path']）")
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    sections: dict[str, list[str]] = {}
+    cur = None
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("【") and s.endswith("】"):
+            cur = s[1:-1]
+            sections[cur] = []
+        elif cur is not None and s:
+            sections[cur].append(s)
+    types = [ln.split("：", 1)[0].strip() for ln in sections.get("類型", []) if "：" in ln]
+    if not types:
+        raise ValueError(f"記憶判斷規則檔的【類型】段解析不出任何類型（每行「名稱：說明」）：{path}")
+    examples: list[tuple[str, list[str]]] = []
+    for ln in sections.get("例子", []):
+        if ln.startswith("對話："):
+            examples.append((ln[3:].strip(), []))
+        elif examples and ln != "輸出：":
+            examples[-1][1].append(ln)
+    return raw.replace("{最多幾件}", str(max_topics)).strip(), types, examples
+
+
+def build_messages(system: str, segment: str, *, force: bool = False) -> list[dict]:
+    """正式判斷與 tools/judge_examples.py 共用（驗證工具不另寫一份送法）。
+    ⭐ 規則在前（每段共用的前綴）、片段在後；補呼叫只在最後多一句。"""
+    user = f"【對話片段】\n{segment}"
+    if force:
+        user += f"\n\n{_FORCE_BUILD}"
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+# ── 讀機率 ────────────────────────────────────────────────────
+
+def classify(word: str) -> str:
+    """第一行的字 → 建／不建／不確定／?（看不懂）。"""
+    w = word.strip().lstrip("「『*").strip()
+    if w.startswith("建"):
+        return "建"
+    if w.startswith(("不確", "不确")):
+        return "不確定"
+    if w.startswith("不建"):
+        return "不建"
+    return "?"
+
+
+def p_build(tokens: list[dict]) -> float | None:
+    """由輸出 token 的 logprobs 算 P(建)＝P(建)＋P(不確定)。拿不到分布回 None。
+
+    第一個非空白 token 的候選：「建…」與「不確…」直接算；「不」要乘上第二個 token 是「確」的機率——
+    ⚠️ 那個條件機率只有在模型**實際選了「不」**時才看得到；選了「建」時「不」底下的「不確定」路徑
+       看不到、不算（此時 P(建) 已過半，不影響判斷）。
+    純函式 ⇒ 自測直接餵資料。
+    """
+    i = 0
+    while i < len(tokens) and not (tokens[i].get("token") or "").strip():
+        i += 1
+    if i >= len(tokens) or not tokens[i].get("top_logprobs"):
+        return None
+    first = tokens[i]
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+    total = 0.0
+    for c in first["top_logprobs"]:
+        t, p = (c.get("token") or "").strip(), math.exp(c["logprob"])
+        if t.startswith("建") or t.startswith(("不確", "不确")):
+            total += p
+        elif t == "不" and (first.get("token") or "").strip() == "不" and nxt and nxt.get("top_logprobs"):
+            total += p * sum(math.exp(cc["logprob"]) for cc in nxt["top_logprobs"]
+                             if (cc.get("token") or "").strip().startswith(("確", "确")))
+    return min(total, 1.0)
+
+
+def split_answer(text: str) -> tuple[str, str]:
+    """回應 → （第一行判斷, 其餘的主題句部分）。第一行看不懂時整段都當主題句部分。"""
+    lines = text.strip().splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return "?", ""
+    head = classify(lines[0])
+    if head == "?":
+        return "?", "\n".join(lines)
+    return head, "\n".join(lines[1:])
 
 
 def _parse_ts(ts: str | None):
@@ -126,6 +222,8 @@ class BackgroundJudge:
         self.emb = emb
         self.cfg = cfg
         self.names = cfg["speaker_names"]
+        self.system, self.types, self.examples = load_prompt(
+            cfg["judge_prompt_path"], max_topics=cfg["judge_max_topics"])
         self._path: str | None = None
         self._want_path: str | None = None
         self._cx = None
@@ -135,7 +233,9 @@ class BackgroundJudge:
         self._paused_at: float | None = None
         self._last_activity = time.monotonic()
         self.stats = {"segments": 0, "built": 0, "skipped": 0, "topics": 0, "cancelled": 0,
-                      "cancels_live": 0, "parse_bad": 0, "errors": 0, "backlog": 0}
+                      "cancels_live": 0, "parse_bad": 0, "errors": 0, "backlog": 0,
+                      "no_lp": 0, "extra": 0}
+        self._no_lp_warned = False
         self._backlog_warned = False
         self._working = False          # 正在判一段（給 /status 看，不參與任何決策）
         self._thread = threading.Thread(target=self._run, name="memory-judge", daemon=True)
@@ -162,6 +262,11 @@ class BackgroundJudge:
             time.sleep(0.02)
         logger.error(f"背景判斷執行緒沒有在 {timeout}s 內放開 DB（{self._path}）")
         return False
+
+    @property
+    def busy(self) -> bool:
+        """正在判一段（給 tools/judge_worker.py 判斷「做完了沒」）。"""
+        return self._working
 
     def notify(self) -> None:
         self._wake.set()
@@ -198,7 +303,8 @@ class BackgroundJudge:
         n = f"{pending}" if pending is not None else f"{s['backlog']}（上次判斷時）"
         return (f"背景判斷{state}：待判 {n} 句｜段 {s['segments']}（建 {s['built']}／"
                 f"不建 {s['skipped']}）｜主題 {s['topics']}｜取消 {s['cancelled']}"
-                f"（切斷進行中 {s['cancels_live']}）｜解析丟行 {s['parse_bad']}｜錯誤 {s['errors']}")
+                f"（切斷進行中 {s['cancels_live']}）｜補呼叫 {s['extra']}｜缺機率 {s['no_lp']}"
+                f"｜解析丟行 {s['parse_bad']}｜錯誤 {s['errors']}")
 
     # ── 執行緒 ────────────────────────────────────────────────
 
@@ -270,7 +376,8 @@ class BackgroundJudge:
         cfg = self.cfg
         if self._cx is None:
             self._cx = connect(self._path)
-        st = TopicStore(self._cx)             # 首次：建表＋judged_upto
+        st = TopicStore(self._cx)             # 首次：建表＋judged_upto（舊表補 status 欄）
+        fill_fts(self._cx)                    # 首次：補上舊主題的關鍵字索引（衍生物，冪等）
         if self.emb is not None and self.emb.ready.is_set():
             fill_vectors(self._cx, self.emb)
         rows = st.pending_rows(cfg["judge_segment_max"] * 20)
@@ -288,27 +395,10 @@ class BackgroundJudge:
 
         text = render_segment(seg, self.names)
         first, last = seg[0]["serial"], seg[-1]["serial"]
-        mt = cfg["judge_max_tokens"]
         # 開始也記一行：量「撞取消」時要知道背景此刻在跑（完成那行要等呼叫結束才出現）
         logger.info(f"背景判斷開始 serial {first}–{last}（{len(seg)} 句）")
-        decide_raw = self.llm.call(
-            self._messages(text, self._decide_instruction()),
-            purpose="記憶判斷", max_tokens=mt["decide"], schema=DECIDE_SCHEMA)
-        try:
-            decision = json.loads(decide_raw)["decision"]
-        except (ValueError, KeyError, TypeError):
-            logger.warning(f"判斷輸出不是預期 JSON，當「不確定」：{decide_raw[:80]!r}")
-            decision = "不確定"
-
-        items: list[dict] = []
-        if decision != "不建":
-            out = self.llm.call(self._messages(text, self._topic_instruction()),
-                                purpose="記憶主題", max_tokens=mt["topics"])
-            items, bad = parse_topics(out, types=cfg["topic_types"], max_n=cfg["judge_max_topics"])
-            self.stats["parse_bad"] += bad
-            if not items:
-                logger.warning(f"判「{decision}」但主題句解析不出任何一件（serial {first}–{last}），"
-                               f"本段視為不建；原句仍在、可重判：{out[:120]!r}")
+        said, p, build, items = self._judge(text, first, last)
+        thr = cfg["judge_build_threshold"]
 
         speakers = [r.get("speaker_id") for r in seg]
         ids = st.add_topics(items, first_serial=first, last_serial=last,
@@ -316,29 +406,53 @@ class BackgroundJudge:
         self.stats["segments"] += 1
         self.stats["built" if items else "skipped"] += 1
         self.stats["topics"] += len(ids)
-        logger.info(f"背景判斷 serial {first}–{last}：{decision}，建 {len(ids)} 件")
-        if ids and self.emb is not None and self.emb.ready.is_set():
-            fill_vectors(self._cx, self.emb)
+        # 🔴 第 6 點（定門檻）的資料來源就是這一行：P(建)、模型自己的答案、結果
+        pb = "—" if p is None else f"{p:.3f}"
+        logger.info(f"背景判斷 serial {first}–{last}：模型答「{said}」P(建)={pb}（門檻 {thr}）"
+                    f"→ {'建' if build else '不建'}，建 {len(ids)} 件")
+        if ids:
+            fill_fts(self._cx)
+            if self.emb is not None and self.emb.ready.is_set():
+                fill_vectors(self._cx, self.emb)
         return True
 
-    # ── 提示詞 ────────────────────────────────────────────────
+    def _judge(self, text: str, first: int, last: int) -> tuple[str, float | None, bool, list[dict]]:
+        """一段 → （模型自己的答案, P(建), 建不建, 主題）。會打 1～2 次 LLM（可被取消）。"""
+        cfg = self.cfg
+        out, lps = self.llm.call_lp(self._messages(text), purpose="記憶判斷",
+                                    max_tokens=cfg["judge_max_tokens"],
+                                    top_logprobs=cfg["judge_top_logprobs"])
+        said, body = split_answer(out)
+        p = p_build(lps)
+        thr = cfg["judge_build_threshold"]
+        if p is None:
+            self.stats["no_lp"] += 1
+            if not self._no_lp_warned:
+                logger.warning("背景判斷拿不到 logprobs（LM Studio 串流沒附？），改看文字判斷："
+                               "「不確定」與看不懂都當建。只記這一次，次數見 /status「缺機率」")
+                self._no_lp_warned = True
+            build = said != "不建"
+        else:
+            build = p >= thr
+        if said == "?":
+            logger.warning(f"判斷第一行看不懂（serial {first}–{last}）：{out[:80]!r}")
 
-    @staticmethod
-    def _messages(segment: str, instruction: str) -> list[dict]:
-        # ⭐ 片段在前、指示在後：兩次呼叫前綴相同（prompt cache）
-        return [{"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": f"【對話片段】\n{segment}\n\n【指示】\n{instruction}"}]
+        items: list[dict] = []
+        if build:
+            if said == "不建":   # 機率過門檻、但模型自己答了不建 ⇒ 它沒寫主題句，補一次
+                self.stats["extra"] += 1
+                out = self.llm.call(self._messages(text, force=True), purpose="記憶主題",
+                                    max_tokens=cfg["judge_max_tokens"])
+                body = split_answer(out)[1]
+            items, bad = parse_topics(body, types=self.types, max_n=cfg["judge_max_topics"])
+            self.stats["parse_bad"] += bad
+            if not items:
+                logger.warning(f"判建但主題句解析不出任何一件（serial {first}–{last}），"
+                               f"本段視為不建；原句仍在、可重判：{out[:120]!r}")
 
-    def _decide_instruction(self) -> str:
-        return (f"上面這段對話裡，有沒有值得長期記住的事？\n{self.cfg['judge_criteria']}\n"
-                "有就回「建」，沒有就回「不建」，拿不準回「不確定」。")
+        return said, p, build, items
 
-    def _topic_instruction(self) -> str:
-        types = "、".join(self.cfg["topic_types"])
-        return ("把上面這段對話裡值得長期記住的事逐件寫下來，一行一件，格式：\n"
-                "類型｜屬性鍵｜主題句\n"
-                f"· 類型只能是：{types}\n"
-                "· 屬性鍵：這件事若是某人會變動的狀態（住哪、工作、身體狀況…），寫「人名.屬性」，"
-                "例如「邪狼.住地」；不是狀態就寫「無」\n"
-                "· 主題句：一句話說完一件事，主詞寫出名字（不要用你、我、他），不要加入對話裡沒有的內容\n"
-                f"· 最多 {self.cfg['judge_max_topics']} 行，不要編號、不要其他說明")
+    # ── 提示詞 ──────────────────────────────────────────────
+
+    def _messages(self, segment: str, *, force: bool = False) -> list[dict]:
+        return build_messages(self.system, segment, force=force)

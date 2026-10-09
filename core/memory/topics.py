@@ -21,6 +21,13 @@
   · 判斷「是不是同一件事的新狀態」需要語意，那一步已經搭在標主題那次呼叫裡（產出 attr_key）。
   · 檢索預設跳過 `valid_to IS NOT NULL` 的列；原句照留。
 
+鎖定與人工審核（2026-10-09 邪狼裁，《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）：
+  · `status`：normal（一般）／locked（鎖定）／pending（待審）／rejected（駁回）。
+  · 背景判斷寫進來的新事實若要**機械取代一件鎖定的事**（同屬性鍵），不直接取代：
+    新的那件寫成 pending、`replaces` 指向被它挑戰的鎖定 root，等人工審核（tools/memory_review.py）。
+  · 檢索只看 normal／locked；pending、rejected 不注入（原句照留，駁回的列也不刪）。
+  ⚠️ 目前沒有任何路徑會產生 locked（世界觀灌入未做，《現況》17之1）⇒ 欄位先在、機制先不會被觸發。
+
 🔴 **交易紀律同 db.py**：公開方法自己開自己關交易，不對外回傳 cursor。
 """
 
@@ -51,7 +58,9 @@ CREATE TABLE IF NOT EXISTS topic (
     speakers      TEXT,                  -- 這段原句裡出現過的 speaker_id（逗號分隔，排序過）
     valid_to      TEXT,                  -- 被同 attr_key 新事實取代的時間；NULL＝仍有效
     superseded_by INTEGER,               -- 取代它的那件事的 root
-    retired       INTEGER NOT NULL DEFAULT 0
+    retired       INTEGER NOT NULL DEFAULT 0,
+    status        TEXT    NOT NULL DEFAULT 'normal',  -- normal／locked／pending／rejected
+    replaces      INTEGER                -- pending 才有：它要取代的鎖定 root
 );
 CREATE INDEX IF NOT EXISTS topic_root ON topic(root);
 CREATE INDEX IF NOT EXISTS topic_attr ON topic(attr_key) WHERE attr_key IS NOT NULL;
@@ -62,8 +71,19 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+_LIVE = "('normal','locked')"   # 會被檢索的狀態
+
+
 def ensure_schema(cx: sqlite3.Connection) -> None:
     cx.executescript(SCHEMA)
+    # 2026-10-09 前建的表沒有 status／replaces ⇒ 補欄位（既有列一律 normal，行為不變）。
+    # ⚠️ 這是對正式記憶檔的結構改動：第一次跑新版前先備份 data/memory.db。
+    cols = {r[1] for r in cx.execute("PRAGMA table_info(topic)")}
+    for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'normal'"), ("replaces", "INTEGER")):
+        if col not in cols:
+            with write_txn(cx):
+                cx.execute(f"ALTER TABLE topic ADD COLUMN {col} {ddl}")
+            logger.warning(f"主題表補欄位 {col}（舊表遷移，既有列不變）")
     with write_txn(cx):
         cx.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, 0)", (_JUDGED_KEY,))
 
@@ -80,6 +100,11 @@ class TopicStore:
     def _has_table(self) -> bool:
         return self.cx.execute(
             "SELECT 1 FROM sqlite_master WHERE name='topic'").fetchone() is not None
+
+    def _live_cond(self, alias: str = "t") -> str:
+        """檢索條件。唯讀開啟的舊表（施測中的日常區、還沒被新版開過）沒有 status 欄 ⇒ 不篩。"""
+        cols = {r[1] for r in self.cx.execute("PRAGMA table_info(topic)")}
+        return f"AND {alias}.status IN {_LIVE}" if "status" in cols else ""
 
     # ── 背景判斷的進度 ─────────────────────────────────────────
 
@@ -121,6 +146,8 @@ class TopicStore:
 
         items：[{text, type, attr_key}]；空清單＝這段判了不建，只推進度。
         回傳新列的 id。
+        ⚠️ 要取代的舊事實裡有**鎖定**的 ⇒ 鎖定的那件不動，新的這件寫成 pending 等人工審核
+           （非鎖定的照常取代）。
         """
         now = _now_iso()
         spk = ",".join(sorted({s for s in speakers if s}))
@@ -137,9 +164,17 @@ class TopicStore:
                 ids.append(tid)
                 if it.get("attr_key"):
                     # 同屬性鍵、仍有效、而且是「更早發生」的事 ⇒ 被取代（整個 root 的所有版本）
-                    olds = [r["root"] for r in self.cx.execute(
-                        "SELECT DISTINCT root FROM topic WHERE attr_key=? AND valid_to IS NULL "
-                        "AND root<>? AND last_serial < ?", (it["attr_key"], tid, first_serial))]
+                    rows = self.cx.execute(
+                        "SELECT root, MAX(status='locked') locked FROM topic WHERE attr_key=? "
+                        f"AND valid_to IS NULL AND status IN {_LIVE} AND root<>? AND last_serial < ? "
+                        "GROUP BY root ORDER BY root", (it["attr_key"], tid, first_serial)).fetchall()
+                    olds = [r["root"] for r in rows if not r["locked"]]
+                    locked = [r["root"] for r in rows if r["locked"]]
+                    if locked:
+                        self.cx.execute("UPDATE topic SET status='pending', replaces=? WHERE id=?",
+                                        (locked[0], tid))
+                        logger.warning(f"屬性鍵「{it['attr_key']}」碰到鎖定的 #{locked[0]}："
+                                       f"新事實 #{tid} 改為待審，等人工審核（start/審核.bat）")
                     if olds:
                         self.cx.execute(
                             f"UPDATE topic SET valid_to=?, superseded_by=? WHERE root IN "
@@ -173,8 +208,45 @@ class TopicStore:
         cond = "" if include_superseded else "AND t.valid_to IS NULL"
         rows = self.cx.execute(
             "SELECT t.* FROM topic t JOIN (SELECT root, MAX(id) mid FROM topic GROUP BY root) m "
-            f"ON t.id = m.mid WHERE t.retired = 0 {cond} ORDER BY t.id").fetchall()
+            f"ON t.id = m.mid WHERE t.retired = 0 {self._live_cond()} {cond} "
+            "ORDER BY t.id").fetchall()
         return [dict(r) for r in rows]
+
+    # ── 人工審核（tools/memory_review.py）────────────────────────
+
+    def pending_review(self) -> list[dict]:
+        """待審的事實，舊的先。"""
+        if not self._has_table():
+            return []
+        return [dict(r) for r in self.cx.execute(
+            "SELECT * FROM topic WHERE status='pending' ORDER BY id").fetchall()]
+
+    def lock(self, topic_id: int) -> None:
+        """把一件事（整個 root）設為鎖定。目前只給自測與日後的世界觀灌入用。"""
+        with write_txn(self.cx):
+            self.cx.execute("UPDATE topic SET status='locked' WHERE root=(SELECT root FROM topic "
+                            "WHERE id=?) AND status='normal'", (topic_id,))
+
+    def approve(self, topic_id: int) -> None:
+        """通過：被挑戰的鎖定事實標為被取代，新的這件接手鎖定。同一個交易。"""
+        now = _now_iso()
+        with write_txn(self.cx):
+            t = self.cx.execute("SELECT * FROM topic WHERE id=? AND status='pending'",
+                                (topic_id,)).fetchone()
+            if t is None:
+                raise KeyError(f"topic id={topic_id} 不是待審")
+            if t["replaces"] is not None:
+                self.cx.execute("UPDATE topic SET valid_to=?, superseded_by=? WHERE root=?",
+                                (now, t["root"], t["replaces"]))
+            self.cx.execute("UPDATE topic SET status='locked' WHERE id=?", (topic_id,))
+
+    def reject(self, topic_id: int) -> None:
+        """駁回：不刪列（原句與判斷紀錄都留著），只是永遠不進檢索。"""
+        with write_txn(self.cx):
+            n = self.cx.execute("UPDATE topic SET status='rejected' WHERE id=? AND status='pending'",
+                                (topic_id,)).rowcount
+            if n != 1:
+                raise KeyError(f"topic id={topic_id} 不是待審")
 
     def get(self, ids: list[int]) -> list[dict]:
         if not ids or not self._has_table():

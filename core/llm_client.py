@@ -470,6 +470,17 @@ class BackgroundLLM:
         schema：LM Studio `response_format: json_schema`（GGUF 走 llama.cpp grammar 取樣，
         輸出被硬性限制在 schema 內）。
         """
+        return self.call_lp(messages, purpose=purpose, max_tokens=max_tokens, schema=schema)[0]
+
+    def call_lp(self, messages: list, *, purpose: str, max_tokens: int,
+                schema: dict | None = None, top_logprobs: int = 0) -> tuple[str, list[dict]]:
+        """同 call()，另回傳每個輸出 token 的 logprobs（OpenAI 格式的 `logprobs.content` 逐項）。
+
+        top_logprobs＝0 時不要求 logprobs，回傳空清單。
+        ⚠️ 2026-10-09 LM Studio 實測（非串流、純文字）有回 `top_logprobs`；**串流下會不會逐塊附上未實測**
+           ⇒ 拿不到時回空清單，由呼叫端大聲處理（judge.py 會記 WARNING 並退回看文字）。
+        ⚠️ 用了 json_schema 時回的是格式限制「之前」的分布，讀不出選項機率（同日實測），兩者不要合用。
+        """
         import http.client
         import json as _json
         if self._cancel.is_set():
@@ -477,6 +488,9 @@ class BackgroundLLM:
         body = dict(model=self.model, messages=messages, max_tokens=max_tokens,
                     temperature=self.params.get("temperature", 0.0),
                     top_p=self.params.get("top_p", 1.0), stream=True)
+        if top_logprobs:
+            body["logprobs"] = True
+            body["top_logprobs"] = top_logprobs
         for k in ("top_k", "min_p", "repeat_penalty"):
             if self.params.get(k) is not None:
                 body[k] = self.params[k]
@@ -484,6 +498,7 @@ class BackgroundLLM:
             body["response_format"] = {"type": "json_schema", "json_schema": {
                 "name": purpose, "strict": True, "schema": schema}}
         parts: list[str] = []
+        lps: list[dict] = []
         resp = None
         conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout_s)
         try:
@@ -512,6 +527,8 @@ class BackgroundLLM:
                     piece = (ch.get("delta") or {}).get("content")
                     if piece:
                         parts.append(piece)
+                    if top_logprobs:
+                        lps.extend((ch.get("logprobs") or {}).get("content") or [])
         except BackgroundCancelled:
             raise
         except Exception as e:
@@ -526,4 +543,4 @@ class BackgroundLLM:
             conn.close()
         if self._cancel.is_set():
             raise BackgroundCancelled()
-        return "".join(parts).strip()
+        return "".join(parts).strip(), lps
