@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# .bat/.cmd must stay CRLF: cmd.exe mis-parses LF-only batch files (labels, parentheses) without a clear error
+*.bat text eol=crlf
+*.cmd text eol=crlf

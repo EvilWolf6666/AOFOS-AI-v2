@@ -13,12 +13,24 @@ from __future__ import annotations
 # 因為 tools/ 底下的腳本直接 import config、完全不經過 main.py（《歸檔》I0026）。
 import config  # noqa: F401
 
+import sys  # noqa: E402
+
 from core.agent.agent import Agent  # noqa: E402
+from core.memory.run_lock import RunLock, lock_path  # noqa: E402
 
 
 def main() -> None:
-    agent = Agent()
-    agent.run()
+    # 執行期間持有「AOFOS 正在執行」鎖：獨立終端的背景判斷（tools/judge_worker.py）看到就讓出推理槽並結束。
+    # 拿不到＝已經有另一個 AOFOS 在跑（兩個同時寫同一個記憶檔不行）。
+    lock = RunLock(lock_path(config.MEMORY_CONFIG["db_path"]))
+    if not lock.acquire():
+        print("⚠️ 已經有另一個 AOFOS 在執行（記憶檔被占用中），本次不啟動。")
+        sys.exit(1)
+    try:
+        agent = Agent()
+        agent.run()
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

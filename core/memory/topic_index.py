@@ -9,6 +9,12 @@
 
 ⚠️ 執行緒分工同 embed.py：寫 `topic_vec` 在背景（判斷執行緒建完主題順手算）；
    主執行緒只讀、只編碼查詢句。
+
+🆕 2026-10-09 關鍵字那一路（邪狼裁兩路並用，《現況》〈🔒 隔離區〉準 v4 檢索列）：
+   `topic_fts`（FTS5，rowid＝topic.id）＝主題句的 bigram，**與準 v3 撈原句同一個切法**
+   （core/memory/recall.py 的 `bigrams()`／`_match_expr()`，寫入與查詢必須同一個函式）。
+   同樣是衍生物、可重建；由判斷執行緒建完主題順手補（`fill_fts`）。
+   合併方式不在本檔：兩路各自回名單，由 manager 依各路配額取聯集（不重排）。
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import sqlite3
 
 from core.logger import setup_logger
 from core.memory.db import write_txn
+from core.memory.recall import _match_expr, bigrams
 from core.memory.topics import TopicStore
 
 logger = setup_logger("MemoryTopicIndex")
@@ -26,6 +33,10 @@ CREATE TABLE IF NOT EXISTS topic_vec (
     id    INTEGER PRIMARY KEY,     -- topic.id（每個版本各一個向量）
     model TEXT NOT NULL,
     v     BLOB NOT NULL            -- float32、已正規化
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS topic_fts USING fts5(
+    tokens,                        -- bigrams(topic.text)；rowid＝topic.id
+    tokenize = 'unicode61 remove_diacritics 0'
 );
 """
 
@@ -66,8 +77,21 @@ def fill_vectors(cx: sqlite3.Connection, emb, batch: int = 32) -> int:
         n += len(rows)
 
 
+def fill_fts(cx: sqlite3.Connection) -> int:
+    """補主題句的關鍵字索引（背景執行緒呼叫）。回傳補了幾筆。"""
+    ensure_schema(cx)
+    rows = cx.execute("SELECT id, text FROM topic WHERE id > "
+                      "(SELECT COALESCE(MAX(rowid), 0) FROM topic_fts) ORDER BY id").fetchall()
+    if rows:
+        with write_txn(cx):
+            cx.executemany("INSERT INTO topic_fts(rowid, tokens) VALUES(?, ?)",
+                           [(r["id"], bigrams(r["text"])) for r in rows])
+    return len(rows)
+
+
 class TopicSearch:
-    """主執行緒用：增量讀 `topic_vec`，只在「每個 root 的最新有效版本」裡找。"""
+    """主執行緒用：增量讀 `topic_vec`，只在「每個 root 的最新有效版本」裡找。
+    emb 可為 None（向量關閉）：此時只有 search_bm25 有作用。"""
 
     def __init__(self, cx: sqlite3.Connection, emb) -> None:
         self.cx = cx
@@ -78,8 +102,11 @@ class TopicSearch:
         self._max = 0
         self._faiss = _load_faiss()
         self._index = None
+        self._fts_warned = False
 
     def _refresh(self) -> None:
+        if self.emb is None:
+            return
         if self.cx.execute("SELECT 1 FROM sqlite_master WHERE name='topic_vec'").fetchone() is None:
             return
         np = self.emb._np
@@ -122,8 +149,32 @@ class TopicSearch:
                 out.append((t, s))
         return out
 
+    def search_bm25(self, query: str, *, top_k: int, max_terms: int) -> list[tuple[dict, float]]:
+        """關鍵字那一路：回傳 [(topic, bm25 分數)]，越相關越前（分數越小越相關，FTS5 慣例）。
+        只含最新版、未被取代、未退役、非待審／駁回的。索引表不存在（唯讀舊庫）⇒ 記一次 WARNING、回空。"""
+        expr = _match_expr(bigrams(query), max_terms)
+        if not expr or top_k <= 0:
+            return []
+        if self.cx.execute("SELECT 1 FROM sqlite_master WHERE name='topic_fts'").fetchone() is None:
+            if not self._fts_warned:
+                logger.warning("這個 DB 還沒有主題關鍵字索引（背景判斷建主題時才補；唯讀不代建），本區只走向量那一路")
+                self._fts_warned = True
+            return []
+        live = {t["id"]: t for t in self.store.latest()}
+        out: list[tuple[dict, float]] = []
+        for r in self.cx.execute("SELECT rowid AS id, bm25(topic_fts) AS score FROM topic_fts "
+                                 "WHERE topic_fts MATCH ? ORDER BY score, rowid", (expr,)):
+            t = live.get(r["id"])
+            if t is not None:
+                out.append((t, float(r["score"])))
+                if len(out) >= top_k:
+                    break
+        return out
+
     def pending(self) -> int:
-        """還沒有向量的主題數（積壓）。"""
+        """還沒有向量的主題數（積壓）。向量關閉時回 0（沒有東西要補）。"""
+        if self.emb is None:
+            return 0
         if self.cx.execute("SELECT 1 FROM sqlite_master WHERE name='topic'").fetchone() is None:
             return 0
         if self.cx.execute("SELECT 1 FROM sqlite_master WHERE name='topic_vec'").fetchone() is None:
