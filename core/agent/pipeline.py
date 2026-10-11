@@ -267,7 +267,7 @@ class Pipeline:
         ⭐ 附帶好處：**記憶的欄位集是它自己的規格，不該隨 Event 新增欄位而漂移。**
         """
         user_input = event.payload
-        # 準 v4：背景判斷先讓出推論槽（LM Studio 單槽，背景請求在跑會讓本輪排隊）。
+        # 準 v4：背景判斷先讓出推論槽（推理後端單槽，背景請求在跑會讓本輪排隊）。
         # 恢復在 finalize_turn（輸出之後）。
         self.memory.bg_pause()
         context = self.memory.get_context(user_input)
@@ -361,3 +361,4 @@ class Pipeline:
             )
 
         return TurnResult(reply=reply, printed=printed)
+

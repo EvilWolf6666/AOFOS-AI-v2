@@ -30,25 +30,71 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────────────────────
-# LLM 連線與推理參數
+# 推理後端：llama-server（llama.cpp 官方伺服器）
 # ─────────────────────────────────────────────────────────────
-# 所有影響輸出的參數一律在此明確指定並隨 request 送出。
-# ⚠️ LM Studio 預設參數綁在「各模型」而非全域。未明確帶入者，換模型時會各自吃到
-#    不同預設值，跨模型比較靜默失效且無警告。
+# 🔺 2026-10-10 由 LM Studio 換成 llama-server（舊的 LMSTUDIO_LOAD_PARAMS 已移除，
+#    LM Studio 時期的 GUI 設定值見《現況》13之2）。
+# 本區是載入層參數的**唯一來源**：tools/start_llama_server.py 讀它組啟動指令、
+#    LLMClient 讀它當 context 預算分母、backend_check 啟動時拿它比對實際載入狀態。
+# ⚠️ 改了本區任何值 ⇒ 重開 llama-server（start\啟動推理後端.bat）才生效；
+#    改了載入參數，延遲量測要重量（《現況》〈📐 規則〉三）。
+# 換模型：改 "model" 與 "alias" → 重開 llama-server → 重開 AOFOS。
 
-LLM_CONFIG = {
-    "base_url": "http://localhost:1234/v1",
-    "api_key": "lm-studio",
-
-    # 模型識別碼。本機可用清單由 LLMClient 啟動時列出：
+LLAMA_SERVER = {
+    # 必須與執行檔一致，啟動腳本會跑 --version 比對，不符即停（文件記的版號才是真的）。
+    "build": "b11541",
+    "exe": r"C:\Users\EvilWolf\Desktop\AI-project\AOFOS-AI\llama.cpp\llama-server.exe",
+    # v3 GGUF（沿用 LM Studio 下載的檔案，不另存一份）。
+    "model": r"C:\Users\EvilWolf\.lmstudio\models\EvilWolf1956\Aofos_v3_Q4_K_M\Aofos_v3_Q4_K_M.gguf",
+    # 模型識別碼：server 回應裡的 model 欄位＝這個值，LLMClient 拿它比對。
+    #   沿用 LM Studio 時期的命名，舊 log 與施測紀錄才對得上：
     #   "aofos_v3"                               ← 實驗組（LoRA v3 合併版）
     #   "aofos_v2" / "aofos_v1"                  ← LoRA v2 / v1
     #   "meta-llama-3.1-8b-instruct-abliterated" ← 對照組 A（無 LoRA 底模）
     #   "meta-llama-3.1-8b-instruct"             ← 對照組 B（官方版）
-    #
-    # ⚠️ 換模型流程：Eject 舊模型 → 載入新模型 → 於 GUI 重設載入層參數
-    #    （見 LMSTUDIO_LOAD_PARAMS）→ 才改這一行。JIT 已關閉，順序顛倒會直接報錯。
-    "model": "aofos_v4_colab",
+    "alias": "aofos_v3",
+    "host": "127.0.0.1",
+    "port": 8080,
+
+    # ── 載入參數。🔺 2026-10-11 依 tools/chat_probe 四組單一變數實驗定（GTX 1650，n=1／組）──
+    # ⚠️ 換設備整組重量（〈📐 規則〉三：延遲結論不可跨設備轉移）。
+    # context 與卸載層數皆為 VRAM 約束下的結果（GTX 1650 4GB），模型標稱支援 131072。
+    "ctx": 8192,
+    "ngl": 17,            # 16GB 級顯卡到位後改 99（整顆上 GPU）
+    # ⚠️ 必須為 1。平行槽位會切分總 context（4 槽時單次只剩 2048），且批次不保證逐位一致。
+    "parallel": 1,
+    # CPU 執行緒（-t；處理 prompt 的 -tb 沒另設時跟著它）。3 → 4（＝實體核心數）：
+    #   少於約 32 token 的 prefill 走 CPU 那幾層，每輪 3.4 → 2.8 秒；生成速度不變（約 5 tok/s，
+    #   推測卡在記憶體頻寬，非 CPU）。≥32 token 時 llama.cpp 改把 CPU 層的計算搬上 GPU，快一個量級。
+    "threads": 4,
+    # 邏輯批次。2048 → 512：server 似乎做完一批才檢查取消（推測，log 時間點吻合），
+    #   背景判斷被打斷後讓出推理槽 12～13 → 4.8 秒；大段 prefill 速度不變（664 tok 都是 7.9 秒）。
+    "batch": 512,
+    "ubatch": 512,        # 實體批次（LM Studio physical_batch_size）；不得大於 batch
+    "flash_attn": "on",   # on／off／auto
+    # 附加參數。-cram＝RAM 提示詞快取上限（MiB，server 預設 8192）：對話與背景判斷輪流用同一推理槽，
+    #   靠它把彼此的前綴存在 RAM、切回來不必整段重算（2026-10-11 log 確認有在作用）。
+    #   壓到 1024：系統 RAM 只有 8GB 級時，預設上限可能吃光記憶體而開始換頁。
+    # ⚠️ 單一變數實驗也加在這裡；--cache-reuse 屬片段式重用，可能有偏差 ⇒ 施測時不得加（《現況》11之2 己）。
+    "extra_args": ["-cram", "1024"],
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# LLM 連線與推理參數
+# ─────────────────────────────────────────────────────────────
+# 所有影響輸出的參數一律在此明確指定並隨 request 送出。
+# ⚠️ 沒帶的參數會吃 server 預設值，或 GGUF 內嵌的取樣值（general.sampling.*，《現況》第五章 #5）
+#    ——換模型時會各自不同，跨模型比較靜默失效且無警告。
+
+LLM_CONFIG = {
+    # 由 LLAMA_SERVER 組出，host／port 只存一份。
+    "base_url": f"http://{LLAMA_SERVER['host']}:{LLAMA_SERVER['port']}/v1",
+    # llama-server 沒開 --api-key 時不檢查；OpenAI SDK 要求非空才填。
+    "api_key": "local",
+
+    # 換模型改 LLAMA_SERVER，這裡跟著走（不得另寫一份）。
+    "model": LLAMA_SERVER["alias"],
 
     # ── 標準 OpenAI 參數（以具名參數送出）──
     "temperature": 0.8,
@@ -61,12 +107,13 @@ LLM_CONFIG = {
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
 
-    # 固定 seed 可消除同一顆模型自身的隨機波動；設 None 表示不固定。
-    # 註：目前這台機器、目前的測法下 seed 看起來無效（不是定論：多測幾次或換設備可能不同），
-    #    評測因此改用貪婪解碼，見 TEST_CONFIG。
-    "seed": 42,
+    # 日常一律 None（每次請求隨機）。
+    # 🔺 2026-10-11 由 42 改 None：LM Studio 時期 seed 實測看起來無效；llama-server 會照 seed 執行，
+    #    固定 seed 讓每次請求用同一串亂數，內容不同的輸入連續 5 輪抽出同一句「你好，哥！」（2026-10-11 實測）。
+    #    施測不靠 seed：TEST_CONFIG 用貪婪解碼，結果本來就固定。
+    "seed": None,
 
-    # ── LM Studio 專屬參數（透過 extra_body 送出）──
+    # ── 非 OpenAI 標準的取樣參數（llama-server 原生支援；SDK 要經 extra_body 送出）──
     # 值設為 None 的欄位不會被送出。
     "top_k": 40,
     "repeat_penalty": 1.1,
@@ -81,49 +128,6 @@ LLM_CONFIG = {
 
 
 # ─────────────────────────────────────────────────────────────
-# LM Studio 載入層參數（紀錄用，非設定用）
-# ─────────────────────────────────────────────────────────────
-# ⚠️ 這些值無法經 OpenAI 相容 API 設定，只能在 LM Studio GUI 手動設；此處僅供
-#    版控與啟動 log 存證。
-# 🔴 載入新模型時 LM Studio 會依檔案大小「自動」改掉 GPU 卸載層數與 context 且不
-#    警告——對照組會跑在不同卸載層數上。每次換模型後務必手動改回下列數值。
-
-LMSTUDIO_LOAD_PARAMS = {
-    # ── Context and Offload ──
-    # 兩者皆為 VRAM 約束下的結果，非任意選定（模型標稱支援 131072）。
-    # 被自動改掉時 GUI 的記憶體估計值會跟著變，可據此反查。
-    "context_length": 8192,
-    "gpu_offload_layers": 17,
-
-    # ── Advanced（載入層）──
-    "cpu_thread_pool": 3,
-    "evaluation_batch_size": 2048,
-    "physical_batch_size": 512,
-    # ⚠️ 必須為 1。批次處理不保證逐位一致；且平行槽位會「切分」總 context
-    #    （parallel=4 時 8192 實際單次僅 2048），溢出時截掉的是中間。
-    "max_concurrent_predictions": 1,
-    "unified_kv_cache": True,
-    "context_checkpoints": 32,           # prompt 快取；會影響重複前綴的延遲量測
-    "rope_freq_base": "自動",
-    "rope_freq_scale": "自動",
-    "kv_cache_offload_to_gpu": True,
-    "keep_model_in_memory": True,
-    "try_mmap": True,
-    "gui_seed": 42,                      # 已於 GUI 固定；目前實測看起來無效（非定論，見 LLM_CONFIG["seed"]）
-    "speculative_decoding": "off",
-    "flash_attention": True,
-    "kv_cache_quantization": None,
-
-    # ── Inference（推理層，僅紀錄；實際一律由 LLM_CONFIG 覆蓋）──
-    "gui_system_prompt": "",             # 必須留空，人格一律由專案端注入
-    "reasoning_budget": "Unrestricted",
-    "context_overflow": "截斷中間",
-    "stop_strings": [],
-    "structured_output": False,
-}
-
-
-# ─────────────────────────────────────────────────────────────
 # 對話行為參數
 # ─────────────────────────────────────────────────────────────
 
@@ -134,7 +138,8 @@ LMSTUDIO_LOAD_PARAMS = {
 #    整段重讀，滿 10 輪後**每輪** TTFT 多 2.5～3 秒。一次丟一批 ⇒ 快取每 WM_DROP_ROUNDS 輪才斷一次。
 #    剛丟完時她看得到 MAX＋1−DROP 輪（現為 11，不少於舊上限 10）。
 # ⚠️ 上限受 context 8192 約束：人格約 550＋回覆保留 300＋記憶區塊約 200 token；她回覆變長時每輪
-#    可到 300 token 以上 ⇒ 20 輪是安全值。超過 8192 時 LM Studio「截斷中間」會**靜默**切掉對話。
+#    可到 300 token 以上 ⇒ 20 輪是安全值。超過 8192 時 LM Studio 時期是「截斷中間」**靜默**切掉對話；
+#    llama-server 超過時是報錯還是截斷，未實測（換後端後待驗）。
 MAX_WORKING_MEMORY = 20      # 最多保留幾輪（一輪＝一問一答）
 WM_DROP_ROUNDS = 10          # 超過上限時一次丟掉最舊的幾輪（1＝舊行為，每輪都斷快取）
 
@@ -160,6 +165,18 @@ MEMORY_CONFIG = {
     # 區塊第一行的自我說明。⚠️ 刻意放在區塊裡、不改人格 prompt——人格 prompt 是
     #    施測變數（SPT 在比較序列開跑後不得改動），記憶說明跟著記憶走才不互相牽動。
     "block_note": "（以下是你記得的過去，不是對方現在說的話；和現在的話題有關才用，用自己的話帶出來，不要照抄原句。）",
+    # 說明放哪（2026-10-11 邪狼裁定試 "fixed"；單一變數，改回 "inline" 即完全回到舊行為）：
+    #   "inline"＝block_note 放在每輪的區塊裡（舊做法）。區塊每輪不同又不留在歷史，
+    #            說明連同區塊每輪都要重算（實測每輪重算 222～314 token、約 3 秒，GTX 1650）。
+    #   "fixed" ＝改送 fixed_note：一則永遠不變的 system 訊息，緊接在人格之後 ⇒ 每輪吃得到快取；
+    #            區塊只留標記與會變的那幾行。⚠️ 說明離區塊變遠，「記憶≠對方現在說的話」的效果要重測。
+    # ⚠️ 兩組對照施測必須同值（它改變 prompt 結構）。
+    "note_position": "fixed",
+    # {open}／{close} 由 block_open／block_close 代入（標記只存一份）。⚠️ 用詞是 Claude 擬的草稿，可直接改；
+    #    稱呼用「妳」跟人格 prompt 一致（舊 block_note 用「你」，inline 模式照舊不動）。
+    "fixed_note": "對話裡用 {open} 和 {close} 包起來的段落，是妳記得的過去，不是對方現在說的話；"
+                  "和現在的話題有關才用，用自己的話帶出來，不要照抄原句。"
+                  "[相關記憶] 每一條前面括號裡的，是那件事發生的時候。",
 
     # ── 開場（程式算、不經 LLM）：上次聊天多久以前／今天聊過幾次／那次幾輪＋上一場關鍵詞 ──
     "opening_turns": 3,       # 本場前幾輪帶開場；之後不帶（避免每輪同一段字被照唸）
@@ -206,9 +223,9 @@ MEMORY_CONFIG = {
     #    2026-10-09 探測：「我是你哥也是你的創造者」在沒給判準的提示下 P(建)≈0.37。
     "judge_build_threshold": 0.3,
     "judge_top_logprobs": 5,      # 每個 token 要幾個候選（算 P(建) 只看前兩個 token）
-    # 背景一律貪婪（可重現）。🔴 取樣參數全部明帶、不靠 LM Studio GUI 的值（沒帶的會套 GUI 預設，
-    #    GUI 一改就靜默改變背景行為）。重複懲罰在貪婪下仍會改變選字（主題句要照抄人名）⇒ 1.0。
-    #    ⭐ 單一來源在這裡；GUI 不需要跟著改（對話用的 LLM_CONFIG 同樣全部明帶）。
+    # 背景一律貪婪（可重現）。🔴 取樣參數全部明帶、不靠後端預設值（沒帶的會套 server 預設或
+    #    GGUF 內嵌值，換模型就靜默改變背景行為）。重複懲罰在貪婪下仍會改變選字（主題句要照抄人名）⇒ 1.0。
+    #    ⭐ 單一來源在這裡（對話用的 LLM_CONFIG 同樣全部明帶）。
     "judge_params": {"temperature": 0.0, "top_k": 1, "top_p": 1.0, "min_p": 0.0,
                      "repeat_penalty": 1.0},
     "judge_backlog_warn": 200,    # 待判原句超過這麼多句 ⇒ WARNING（背景跟不上或死掉）
@@ -274,6 +291,8 @@ EVENT_CONFIG = {
     #                （渲染出 <|start_header_id|>tool，模型沒見過）
     #    v3 曾有 tool → ipython 映射分支，v4 沒有——依 v3 時代的推理做決定會出錯。
     # ⚠️ 讀完《現況》第八章 P8 之前不要改這個值。
+    # ⚠️ 上述兩條實測都是 LM Studio 時期的。換 llama-server 後（2026-10-11，tools/chat_probe）：
+    #    "tool" 不被拒（沒有 400、有正常回應）；v3 template 實際怎麼渲染 tool 這則仍未看（/apply-template 可查）。
     "observation_role": "tool",
 
     # 註："test_observations" 腳手架已移除（《現況》第八章 舊C4（已結案））。日後若再需要手動注入情境，
@@ -360,7 +379,7 @@ TEST_CONFIG = {
     "disable_stream": True,
 
     # 評測專用：貪婪解碼。temperature=0 + top_k=1 直接取機率最高的 token，
-    # 隨機性從源頭消失，不依賴 seed（目前這台機器上 seed 看起來無效；非定論，見 LLM_CONFIG["seed"]）。
+    # 隨機性從源頭消失，不依賴 seed（日常 seed 為 None，見 LLM_CONFIG["seed"]）。
     # frequency_penalty 是必要配套——貪婪解碼會出現退化迴圈，而 repeat_penalty
     # 只施加一次固定懲罰擋不住，需隨出現次數累加才壓得下來。
     #
@@ -411,3 +430,4 @@ PERSONA_CONFIG = {
     "name": "奧狐",
     "language": "繁體中文",
 }
+

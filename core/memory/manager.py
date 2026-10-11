@@ -141,6 +141,11 @@ class MemoryManager:
         self._test_path = test_db_path or cfg["test_db_path"]
         self._max_terms = cfg["max_query_terms"]
         self._open, self._close, self._note = cfg["block_open"], cfg["block_close"], cfg["block_note"]
+        # 說明放在哪（config 的 note_position）："fixed" 時說明是開頭一則不變的 system 訊息
+        if cfg["note_position"] not in ("fixed", "inline"):
+            raise ValueError(f"MEMORY_CONFIG['note_position'] 只能是 fixed／inline：{cfg['note_position']!r}")
+        self._fixed_note = (cfg["fixed_note"].format(open=self._open, close=self._close)
+                            if cfg["note_position"] == "fixed" else None)
         self._opening_turns = cfg["opening_turns"]
         self._ep_cfg = {"gap": cfg["episode_gap_minutes"], "kw": cfg["episode_keywords"],
                         "reps": cfg["episode_reps"]}
@@ -400,15 +405,20 @@ class MemoryManager:
         return {"role": turn["role"], "content": turn["content"]}
 
     def get_context(self, user_input: str = "") -> list[dict]:
-        """Working Memory → 一個 `⟦記憶⟧` 區塊（追加在尾端、本輪輸入之前）。
+        """〔固定說明〕＋ Working Memory ＋ 一個 `⟦記憶⟧` 區塊（追加在尾端、本輪輸入之前）。
 
         ⚠️ 順序依「變動頻率由低到高」：記憶區塊每輪不同，放尾端才不會讓
            WM 落在 prompt cache 斷點之後（prompt cache 比對的是最長共同前綴）。
+        ⚠️ 區塊不留在 WM ⇒ 下一輪快取斷在「上一輪區塊原本的位置」，區塊裡的字每輪都重算。
+           note_position="fixed" 時，不變的說明改成開頭一則 system 訊息、**每輪都送**
+           （有沒有區塊都送：時有時無會讓開頭變動，快取反而斷得更早）。
         ⚠️ user_input 為空（observation 輪次的 placeholder）時不做檢索；
            但本場開頭的開場（狀態＋上一場關鍵詞）照帶（它不依賴輸入）。
         """
         with timed("記憶組裝"):
             context = [self._to_message(m) for m in self.working_memory]
+            if self._fixed_note:
+                context.insert(0, {"role": "system", "content": self._fixed_note})
             sections = []
             if self._session_turns < self._opening_turns:
                 opening = self._opening()
@@ -419,8 +429,9 @@ class MemoryManager:
                 if top:
                     sections.append(top)
             if sections:
+                head = [self._open] if self._fixed_note else [self._open, self._note]
                 context.append({"role": "system", "content": "\n".join(
-                    [self._open, self._note, *sections, self._close])})
+                    [*head, *sections, self._close])})
         return context
 
     def _opening(self) -> str:
@@ -492,7 +503,8 @@ class MemoryManager:
             if not picked:
                 return ""
             hits = sorted(picked.values(), key=lambda t: t["event_ts"] or "")
-            lines = ["[相關記憶] 你記得的事（括號是事情發生的時候）："]
+            # fixed：「括號是什麼」已在固定說明裡，區塊只留標籤（少重算的字）
+            lines = ["[相關記憶]" if self._fixed_note else "[相關記憶] 你記得的事（括號是事情發生的時候）："]
             for t in hits:
                 b = time_bucket(t["event_ts"] or "")
                 lines.append(f"· {'（' + b + '）' if b else ''}{t['text']}")
@@ -543,3 +555,4 @@ class MemoryManager:
             except Exception as e:  # noqa: BLE001
                 logger.error(f"離場時事件層重建失敗：{type(e).__name__}: {e}")
         self._daily.close()
+

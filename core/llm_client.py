@@ -1,19 +1,19 @@
 # core/llm_client.py
-# 透過 OpenAI 相容 API 連接 LM Studio 本機模型
+# 透過 OpenAI 相容 API 連接本機推理後端（2026-10-10 起為 llama-server；之前為 LM Studio）
 
 import time
 from typing import Callable, Optional
 
 from openai import OpenAI
 
-from config import LLM_CONFIG, LMSTUDIO_LOAD_PARAMS, TEST_CONFIG, TEST_MODE
-from core.backend_check import verify_lmstudio
+from config import LLAMA_SERVER, LLM_CONFIG, TEST_CONFIG, TEST_MODE
+from core.backend_check import verify_llamaserver
 from core.logger import setup_logger, timed
 from core.text_utils import fix_traditional
 
 logger = setup_logger("LLMClient")
 
-# LM Studio 專屬、非 OpenAI 標準的參數，需透過 extra_body 送出；
+# 非 OpenAI 標準的取樣參數（llama-server 原生支援），需透過 extra_body 送出；
 # 直接當具名參數傳會被 SDK 丟掉或報錯。
 _EXTRA_BODY_KEYS = ("top_k", "repeat_penalty", "min_p")
 
@@ -31,7 +31,7 @@ class LLMClient:
         )
         self.model = LLM_CONFIG["model"]
 
-        # 所有影響輸出的參數都在此固定，不留給 LM Studio 的模型預設值決定。
+        # 所有影響輸出的參數都在此固定，不留給後端預設值或 GGUF 內嵌取樣值決定。
         # 少帶一個 = 少鎖一個變數，切換模型時會靜默改變行為。
         self.temperature = LLM_CONFIG["temperature"]
         self.max_tokens = LLM_CONFIG["max_tokens"]
@@ -41,9 +41,9 @@ class LLMClient:
         self.seed = LLM_CONFIG.get("seed")
         self.max_tokens_by_purpose = LLM_CONFIG.get("max_tokens_by_purpose", {})
 
-        # 輸入側預算的分母。與 verify_lmstudio 取自同一處，故不會有兩份真相。
-        # 為 None 時（未來換後端而該欄位不存在）輸入側檢查自動停用，不報錯。
-        self.context_length = LMSTUDIO_LOAD_PARAMS.get("context_length")
+        # 輸入側預算的分母。與 llama-server 啟動參數、verify_llamaserver 取自同一處，故不會有兩份真相。
+        # 為 None 時輸入側檢查自動停用，不報錯。
+        self.context_length = LLAMA_SERVER.get("ctx")
 
         # 值為 None 的欄位不送出
         self.extra_body = {
@@ -66,19 +66,23 @@ class LLMClient:
             f"top_p={self.top_p} max_tokens={self.max_tokens} seed={self.seed} "
             f"extra_body={self.extra_body}"
         )
-        if self.seed is None:
-            logger.warning("seed 未固定，同一顆模型的多次輸出會有隨機差異，不適合做對照組比較")
+        if self.seed is not None:
+            # llama-server 會照 seed 執行：固定 seed＝每次請求同一串亂數，日常對話會一再抽出同一句（2026-10-11 實測）
+            logger.warning(f"seed 固定為 {self.seed}：日常對話容易反覆出現同一句；施測請用 /test on（貪婪解碼）")
 
-        # 載入層參數無法由本程式設定，只能記錄，讓每份 log 都能還原當時環境
-        logger.info(f"LM Studio 載入層參數（需人工於 GUI 對齊）：{LMSTUDIO_LOAD_PARAMS}")
+        # 載入層參數記進 log，讓每份 log 都能還原當時環境（server 由 tools/start_llama_server.py 依同一份設定啟動）
+        logger.info(f"llama-server 載入參數（config.LLAMA_SERVER）：{LLAMA_SERVER}")
 
         # 後端專屬的環境查驗，換推理後端時只需替換 backend_check 內的函式
-        verify_lmstudio(
+        verify_llamaserver(
             self.client,
             LLM_CONFIG["base_url"],
             self.model,
-            LMSTUDIO_LOAD_PARAMS.get("context_length"),
+            expected_ctx=LLAMA_SERVER.get("ctx"),
+            expected_slots=LLAMA_SERVER.get("parallel"),
+            expected_model_path=LLAMA_SERVER.get("model"),
         )
+        self._warned_no_timings = False
 
         # config.TEST_MODE 開啟時，啟動即套用評測推理參數（與 /test on 走同一條路徑）。
         # 🔺 2026-09-28 修：先前只有記憶層讀 TEST_MODE，推理參數與串流仍是日常值，
@@ -141,7 +145,7 @@ class LLMClient:
             logger.info(f"實際回應模型：{actual}")
             self._logged_actual_model = True
 
-        # 不一致代表 LM Studio 用了別顆模型，整批實驗數據失效，故每次都警告
+        # 不一致代表後端跑的不是 config 指定那顆，整批實驗數據失效，故每次都警告
         if actual and actual != self.model:
             logger.error(
                 f"⚠ 實際回應模型（{actual}）與 config 指定（{self.model}）不一致，"
@@ -171,8 +175,9 @@ class LLMClient:
         # 固定百分比就已無餘裕，用固定百分比會漏掉這種情形。
         #
         # ⚠️ 溢出的後果不是報錯，是 llama.cpp 靜默截掉 context 的「中間」段，
-        #    也就是人格 prompt 之後的早期對話（Working Memory 前段；見 config.LMSTUDIO_LOAD_PARAMS
-        #    的 max_concurrent_predictions 註解）。整份記憶消失且無任何徵兆。
+        #    也就是人格 prompt 之後的早期對話（Working Memory 前段）。整份記憶消失且無任何徵兆。
+        #    ⚠️ 上述是 LM Studio 時期的行為；llama-server 溢出時是報錯還是截斷未實測——
+        #       若是報錯，chat() 會回空字串並記 ERROR，反而是大聲的。
         #
         # ⚠️ usage.prompt_tokens 是否為「截斷前」的原始長度未經證實。若後端回報
         #    的是截斷後的值，下方 needed > context 那條永遠不會觸發，實際發揮
@@ -200,6 +205,30 @@ class LLMClient:
             f"completion={usage.completion_tokens} total={usage.total_tokens} "
             f"context={self.context_length}"
         )
+
+    def _log_timings(self, obj, purpose: str) -> None:
+        """記下 llama-server 回應自帶的 timings（server 端自己量的 prefill／生成時間）。
+
+        存在理由：本程式量的 TTFT 混了 HTTP 與 SDK 開銷；server 端數字能把兩者分開
+        （《參考庫》A.2「原生 timing 可分離 wrapper 開銷」）。cache_n＝本次重用快取的
+        prompt token 數，可直接驗證 Working Memory 一次丟一批的快取效果（config.WM_DROP_ROUNDS）。
+        timings 不是 OpenAI 標準欄位，SDK 放在 model_extra。拿不到只警告一次。
+        """
+        timings = (getattr(obj, "model_extra", None) or {}).get("timings") if obj is not None else None
+        if not timings:
+            if not self._warned_no_timings:
+                self._warned_no_timings = True
+                logger.warning("回應沒有 timings 欄位：本次起只有本程式量的 TTFT，分不出 server 與傳輸開銷。")
+            return
+        logger.info(
+            f"server timings[{purpose}]：prompt {timings.get('prompt_n')} tok／{timings.get('prompt_ms', 0):.0f} ms"
+            f"（快取重用 {timings.get('cache_n')} tok）｜生成 {timings.get('predicted_n')} tok／"
+            f"{timings.get('predicted_ms', 0):.0f} ms（{timings.get('predicted_per_second', 0):.1f} tok/s）"
+        )
+
+    def _seed_kw(self) -> dict:
+        """seed 為 None 時整個欄位不送（不送 null）：交給後端每次隨機。"""
+        return {} if self.seed is None else {"seed": self.seed}
 
     def _should_stream(self, on_delta) -> bool:
         """
@@ -264,12 +293,13 @@ class LLMClient:
                 top_p=self.top_p,
                 frequency_penalty=self.frequency_penalty,
                 presence_penalty=self.presence_penalty,
-                seed=self.seed,
+                **self._seed_kw(),
                 extra_body=self.extra_body,
             )
 
         self._check_model(getattr(response, "model", None))
         self._check_usage(getattr(response, "usage", None), purpose, max_tokens)
+        self._log_timings(response, purpose)
 
         reply = (response.choices[0].message.content or "").strip()
         reply = fix_traditional(reply)
@@ -311,6 +341,7 @@ class LLMClient:
         raw_parts: list[str] = []     # 模型原始輸出（未轉換）
         usage = None
         actual_model = None
+        last_with_timings = None      # llama-server 把 timings 附在最後幾個 chunk
 
         with timed(f"LLM呼叫[{purpose}]", model=self.model, purpose=purpose):
             stream = self.client.chat.completions.create(
@@ -321,7 +352,7 @@ class LLMClient:
                 top_p=self.top_p,
                 frequency_penalty=self.frequency_penalty,
                 presence_penalty=self.presence_penalty,
-                seed=self.seed,
+                **self._seed_kw(),
                 extra_body=self.extra_body,
                 stream=True,
                 stream_options={"include_usage": True},
@@ -332,6 +363,8 @@ class LLMClient:
                     usage = chunk.usage
                 if actual_model is None:
                     actual_model = getattr(chunk, "model", None)
+                if (getattr(chunk, "model_extra", None) or {}).get("timings"):
+                    last_with_timings = chunk
 
                 # 帶 usage 的收尾 chunk 其 choices 為空陣列，不可直接取 [0]
                 if not getattr(chunk, "choices", None):
@@ -350,6 +383,7 @@ class LLMClient:
                 on_delta(shown)
 
         self._check_model(actual_model)
+        self._log_timings(last_with_timings, purpose)
 
         if usage is not None:
             self._check_usage(usage, purpose, max_tokens)
@@ -396,12 +430,14 @@ class LLMClient:
 #     這次請求的 HTTP 連線；共用 client 會連帶影響對話那一條。
 #   · 參數不同：判斷與標主題一律貪婪解碼、輸出上限很低，不跟著日常取樣參數走。
 #
-# 🔴 **為什麼取消這麼重要**：LM Studio 只有一個推理槽（Max Concurrent Predictions=1）。
+# 🔴 **為什麼取消這麼重要**：推理後端只有一個推理槽（config.LLAMA_SERVER["parallel"]＝1）。
 #    背景呼叫還在跑時使用者開口，對話那一次會排在它後面，**多等一次 5～15 秒**。
 #    ⇒ 取消若做不出來，準 v4 裁決是直接改上小模型（甲），見《現況》〈🔒 隔離區〉〈準 v4〉。
-#    ⚠️ 本類別能保證的是「我們這端立刻放手、連線關掉」；LM Studio 收到斷線後
-#       會不會立刻停止生成是它的行為（《現況》11之2 己：串流下靠偵測斷線停止，屬外部查證、未實測）
-#       ⇒ Windows 實測時要看：取消後下一次對話的 TTFT 有沒有被拖長。
+#    ⚠️ 本類別能保證的是「我們這端立刻放手、連線關掉」；後端何時真的停是它的行為：
+#       · LM Studio：實測取消有讓出（2026-10-04，《現況》11之2 己）。
+#       · llama-server（2026-10-11，server log）：**正在做的那一批 prefill 不會被打斷**，做完那批才停。
+#         batch 2048 時取消後還要排隊 12～25 秒；batch 改 512 後 4.8 秒（config.LLAMA_SERVER["batch"]）。
+#         ⇒ 量法：tools/chat_probe 的「排隊」欄（TTFT 扣掉 server 自算的 prompt 時間）。
 
 class BackgroundCancelled(Exception):
     """背景呼叫被取消（使用者開口）。不是錯誤，呼叫端照常跳過本次工作即可。"""
@@ -477,8 +513,9 @@ class BackgroundLLM:
         """同 call()，另回傳每個輸出 token 的 logprobs（OpenAI 格式的 `logprobs.content` 逐項）。
 
         top_logprobs＝0 時不要求 logprobs，回傳空清單。
-        ⚠️ 2026-10-09 LM Studio 實測（非串流、純文字）有回 `top_logprobs`；**串流下會不會逐塊附上未實測**
-           ⇒ 拿不到時回空清單，由呼叫端大聲處理（judge.py 會記 WARNING 並退回看文字）。
+        ⚠️ 2026-10-09 LM Studio 實測（非串流、純文字）有回 `top_logprobs`；2026-10-11 llama-server
+           串流下逐塊附上（tools/judge_examples 讀得到 P(建)）。
+           ⇒ 拿不到時仍回空清單，由呼叫端大聲處理（judge.py 會記 WARNING 並退回看文字）。
         ⚠️ 用了 json_schema 時回的是格式限制「之前」的分布，讀不出選項機率（同日實測），兩者不要合用。
         """
         import http.client
@@ -544,3 +581,4 @@ class BackgroundLLM:
         if self._cancel.is_set():
             raise BackgroundCancelled()
         return "".join(parts).strip(), lps
+

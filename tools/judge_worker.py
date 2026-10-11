@@ -1,20 +1,20 @@
 # tools/judge_worker.py
 """
-獨立終端的背景判斷：AOFOS 關了、LM Studio 模型還開著時，把還沒判的原句判完（2026-10-09 邪狼）。
+獨立終端的背景判斷：AOFOS 關了、llama-server 還開著時，把還沒判的原句判完（2026-10-09 邪狼）。
 
 用法：雙擊 start/背景判斷.bat（或 python -m tools.judge_worker）。判完自動結束。
 
 規則：
   · AOFOS 開著時**不跑**：開始前看到 AOFOS 在執行就直接結束；跑到一半 AOFOS 啟動了
     （每 0.5 秒檢查一次「AOFOS 正在執行」鎖，core/memory/run_lock.py）⇒ 立刻取消手上那次呼叫、結束。
-    理由：本程式收不到「使用者開口」的取消訊號，留著會讓對話排在它後面（LM Studio 只有一個推理槽）。
+    理由：本程式收不到「使用者開口」的取消訊號，留著會讓對話排在它後面（推理後端只有一個推理槽）。
   · 同時只准一個 worker（另一把鎖），避免兩個一起判同一個 DB。
   · 判斷邏輯與 AOFOS 裡的完全同一份（core/memory/judge.py 的 BackgroundJudge），只差：
       閒置門檻＝0（AOFOS 已關，沒有要等的對話）；不載 embedding（省 18 秒與約 800 MB）——
       主題的關鍵字索引照補，向量由 AOFOS 下次開啟後的背景判斷順手補（補完之前向量那一路撈不到這些新主題）。
   · 一段只有在「最後一句已過 judge_segment_close_s」才算講完，所以 AOFOS 剛關時最多等那麼久才開判。
   · 人工審核不在這裡做：判完若有待審的，只提醒去開 start/審核.bat。
-  · 連續出錯 3 次（例如 LM Studio 沒載模型）⇒ 結束並回 1（.bat 會停住讓你看訊息）。
+  · 連續出錯 3 次（例如 llama-server 沒開）⇒ 結束並回 1（.bat 會停住讓你看訊息）。
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def main(*, db_path: str | None = None, llm=None, cfg_override: dict | None = No
                 break
             pend = st.pending_count()
             if judge.stats["errors"] >= 3:
-                out(f"連續出錯，停止（LM Studio 有載模型嗎？）：{judge.status(pend)}")
+                out(f"連續出錯，停止（llama-server 有開嗎？）：{judge.status(pend)}")
                 rc = 1
                 break
             if pend == 0 and not judge.busy:
@@ -84,3 +84,4 @@ def main(*, db_path: str | None = None, llm=None, cfg_override: dict | None = No
 
 if __name__ == "__main__":
     sys.exit(main())
+

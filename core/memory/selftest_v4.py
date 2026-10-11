@@ -2,13 +2,13 @@
 """
 準 v4 自測：`python -m core.memory.selftest_v4`
 
-全部在暫存資料夾、對假 LLM 伺服器（本檔 FakeLLM）與假 embedding 跑，不碰 data/、不碰 LM Studio。
+全部在暫存資料夾、對假 LLM 伺服器（本檔 FakeLLM）與假 embedding 跑，不碰 data/、不碰真的推理後端。
 涵蓋：切段／解析（純函式）、主題表（屬性鍵機械取代、版本、進度原子性）、speaker_id 落地、
 端到端（閒置 → 判斷 → 建主題 → 向量 → 注入）、取消（prefill 中／串流中）、施測隔離、
 暫停逾時保險、壞輸出。
 🆕 2026-10-09：判斷一次呼叫＋logprobs 算 P(建)（含「答不建但機率過門檻 ⇒ 補一次」與「拿不到機率」）、
 規則檔解析（用真的 prompts/memory_judge.txt）、關鍵字那一路與配額聯集、鎖定／待審／人工審核、舊表遷移。
-⚠️ 不測「真的 LM Studio 斷線後會不會停止運算」——那要在 Windows 實測（看取消後下一輪對話 TTFT）。
+⚠️ 不測「真的推理後端斷線後會不會停止運算」——那要在 Windows 實測（看取消後下一輪對話 TTFT）。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import math
 from config import MEMORY_CONFIG
 from core.llm_client import BackgroundLLM
 from core.memory.db import connect
-from core.memory.judge import (_FORCE_BUILD, drop_copies, load_prompt, norm_topic, p_build,
+from core.memory.judge import (_FORCE_BUILD, drop_copies, fallback_topic, load_prompt, norm_topic, p_build,
                                parse_topics, split_answer, split_segment)
 from core.memory.manager import MemoryManager
 from core.memory.topic_index import TopicSearch, fill_fts
@@ -151,6 +151,8 @@ def responder(req: dict):
         return "我覺得要建\n其他｜無｜邪狼說了亂碼判斷"
     if "解析不了" in seg:
         return "建\n這段很有意思喔", BUILD             # 沒有 ｜ ⇒ 解析不出
+    if "全抄" in seg:                                # 只寫了照抄的例子 ⇒ 濾光 ⇒ 退回原句
+        return "建\n身分｜無｜邪狼是奧狐的哥哥，也是奧狐的創造者", BUILD
     if "抄例子" in seg:                              # 照抄規則檔例子＋與現存重複＋一件新的
         return ("建\n身分｜無｜邪狼是奧狐的哥哥，也是奧狐的創造者。\n狀態｜無｜邪狼住在高雄\n"
                 "事件｜無｜邪狼說了抄例子的事"), BUILD
@@ -209,7 +211,9 @@ def has_table(path: str, name: str) -> bool:
 
 
 def injected(ctx: list[dict]) -> str:
-    return "\n".join(m["content"] for m in ctx if m["role"] == "system" and "⟦記憶⟧" in m["content"])
+    # 只認以 block_open 開頭的區塊：固定說明（note_position="fixed"）也提到標記，但不是注入內容
+    return "\n".join(m["content"] for m in ctx
+                     if m["role"] == "system" and m["content"].startswith(MEMORY_CONFIG["block_open"]))
 
 
 def mm(d: str, fake: FakeLLM, **over) -> MemoryManager:
@@ -283,6 +287,10 @@ def main() -> int:
                                existing={norm_topic("邪狼住在高雄")})
     check("機械過濾：照抄例子、與現存重複、同次重複都丟（忽略空白與句尾標點）",
           [k["text"] for k in keep] == ["新的一件"] and (cp, dp) == (1, 2), f"{keep} {cp} {dp}")
+
+    fb = fallback_topic("（對話時間：2026-10-10 12:00）\n邪狼：你的生日就定在 3 月 11 號吧。\n\n奧狐：好！")
+    check("退回原句：去掉時間標頭、各句以／接起、說話者保留、無屬性鍵",
+          fb == {"type": "原句", "attr_key": None, "text": "邪狼：你的生日就定在 3 月 11 號吧。／奧狐：好！"}, str(fb))
 
     print("\n[判斷：規則檔（真的 prompts/memory_judge.txt）]")
     system, types, examples = load_prompt(MEMORY_CONFIG["judge_prompt_path"], max_topics=5)
@@ -470,18 +478,19 @@ def main() -> int:
 
             turn(m, "這句解析不了", "嗯")
             ok = wait(lambda: judged(m)[0] == 12)
-            check("主題句解析不出 ⇒ 視為不建、不卡住、計數", ok and "解析丟行 1" in m.status_text(),
-                  m.status_text())
+            check("主題句解析不出 ⇒ 退回存原句、不卡住、計數",
+                  ok and "解析丟行 1" in m.status_text() and "退回原句 1" in m.status_text()
+                  and "主題 5" in m.status_text(), m.status_text())
             turn(m, "亂碼判斷", "嗯")
             ok = wait(lambda: judged(m)[0] == 14)
             check("拿不到機率、第一行看不懂 ⇒ 當建、計數（observation 那段也建了 1 件）",
-                  ok and "主題 5" in m.status_text() and "缺機率 1" in m.status_text(), m.status_text())
+                  ok and "主題 6" in m.status_text() and "缺機率 1" in m.status_text(), m.status_text())
             n0 = len(fake.log)
             turn(m, "邊界的事", "嗯")
             ok = wait(lambda: judged(m)[0] == 16)
             forced = [e for e in fake.log[n0:] if _FORCE_BUILD in e["body"]["messages"][-1]["content"]]
             check("模型答不建、但 P(建) 過門檻 ⇒ 補一次呼叫並建",
-                  ok and len(forced) == 1 and "補呼叫 1" in m.status_text() and "主題 6" in m.status_text(),
+                  ok and len(forced) == 1 and "補呼叫 1" in m.status_text() and "主題 7" in m.status_text(),
                   m.status_text())
             req0 = fake.log[n0]["body"]
             check("判斷請求：要 logprobs、不用 json_schema、規則在 system（片段在後）",
@@ -517,7 +526,7 @@ def main() -> int:
             ok = wait(lambda: judged(m)[0] == 18)
             # 這段的主題句（邪狼家的貓很胖）與前面建過的一字不差 ⇒ 被重複過濾丟掉，主題數不變
             check("恢復後整段重判完成（冪等：主題不重複；與現存一字不差的被過濾）",
-                  ok and "主題 6" in m.status_text() and "重複 1" in m.status_text(), m.status_text())
+                  ok and "主題 7" in m.status_text() and "重複 1" in m.status_text(), m.status_text())
 
             print("\n[施測隔離]")
             before = judged(m)[0]
@@ -550,7 +559,18 @@ def main() -> int:
             ok = wait(lambda: judged(m)[0] == 6)
             st_ = m.status_text()
             check("實際判斷時：照抄規則檔例子的、與現存重複的被丟，新的那件照建",
-                  ok and "濾掉 抄例子 1／重複 1" in st_ and "主題 3" in st_, st_)
+                  ok and "濾掉 抄例子 1／重複 1" in st_ and "主題 3" in st_ and "退回原句 0" in st_, st_)
+            turn(m, "我的生日是全抄那天", "記住了")
+            ok = wait(lambda: judged(m)[0] == 8)
+            st_ = m.status_text()
+            cx = connect(m.memory_path)
+            fb = cx.execute("SELECT text, type, attr_key FROM topic ORDER BY id DESC LIMIT 1").fetchone()
+            cx.close()
+            check("照抄的被濾光 ⇒ 退回存原句（帶說話者、類型「原句」、無屬性鍵），不是建 0 件",
+                  ok and "退回原句 1" in st_ and "主題 4" in st_ and fb is not None
+                  and fb["type"] == "原句" and fb["attr_key"] is None
+                  and "全抄那天" in fb["text"] and "／" in fb["text"] and "對話時間" not in fb["text"],
+                  f"{st_} {dict(fb) if fb else None}")
             m.compress_on_exit()
             h = open_handles(d)
             check("離場後沒有任何連線還開著", not h, str(h))
@@ -636,3 +656,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
