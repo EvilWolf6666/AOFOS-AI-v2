@@ -67,8 +67,9 @@ def mm(d: str, **kw) -> MemoryManager:
 
 
 def block(ctx: list[dict]) -> str:
-    """整個 ⟦記憶⟧ 區塊（沒有就空字串）。"""
-    return "\n".join(m["content"] for m in ctx if m["role"] == "system")
+    """整個 ⟦記憶⟧ 區塊（沒有就空字串）。只認以 block_open 開頭的那則（固定說明不算）。"""
+    return "\n".join(m["content"] for m in ctx
+                     if m["role"] == "system" and m["content"].startswith(MEMORY_CONFIG["block_open"]))
 
 
 def count(path: str) -> int:
@@ -112,9 +113,25 @@ def main() -> int:  # noqa: C901
         m2 = mm(d)   # 新場次
         ctx = m2.get_context("")
         b0 = block(ctx)
-        check("新場次開頭帶狀態（包夾＋自帶說明）",
-              b0.startswith(MEMORY_CONFIG["block_open"]) and MEMORY_CONFIG["block_note"] in b0
+        check("新場次開頭帶狀態（包夾）",
+              b0.startswith(MEMORY_CONFIG["block_open"]) and b0.endswith(MEMORY_CONFIG["block_close"])
               and "[狀態] 上次聊天是剛剛" in b0 and "那次聊了大約" in b0, b0[:300])
+        if MEMORY_CONFIG["note_position"] == "fixed":
+            fixed = ctx[0]["content"] if ctx and ctx[0]["role"] == "system" else ""
+            check("固定說明：在最前面、區塊裡不再帶 block_note",
+                  MEMORY_CONFIG["block_open"] in fixed and not fixed.startswith(MEMORY_CONFIG["block_open"])
+                  and MEMORY_CONFIG["block_note"] not in b0, fixed[:120])
+            check("固定說明：每輪逐字相同（快取前綴不變）",
+                  m2.get_context("")[0] == ctx[0] and m2.get_context("隨便問")[0] == ctx[0])
+        else:
+            check("區塊自帶說明（inline）", MEMORY_CONFIG["block_note"] in b0, b0[:300])
+        mi = mm(d, cfg_override={"v4_enabled": False, "note_position": "inline"})
+        bi = block(mi.get_context(""))
+        check("inline 模式＝舊形狀（說明在區塊第二行、沒有固定說明）",
+              bi.split("\n")[1] == MEMORY_CONFIG["block_note"]
+              and not any(MEMORY_CONFIG["block_open"] in x["content"] and not x["content"].startswith(MEMORY_CONFIG["block_open"])
+                          for x in mi.get_context("")), bi[:200])
+        mi.compress_on_exit()
         check("開場不帶原句（代表句／最後幾句已淘汰）",
               "那次最後幾句" not in b0 and "那次你特別說過" not in b0 and "我上次去高雄" not in b0, b0)
         check("開場不含日期數字", "2026-" not in b0 and "天前" not in b0)
@@ -256,3 +273,4 @@ def main() -> int:  # noqa: C901
 
 if __name__ == "__main__":
     sys.exit(main())
+

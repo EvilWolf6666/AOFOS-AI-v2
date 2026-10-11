@@ -1,10 +1,10 @@
 # tools/judge_examples.py
 """
-例句實測：把句子逐句送真的 LM Studio，看 P(建)、建不建判對沒有、主題句寫得像不像。
+例句實測：把句子逐句送真的推理後端（llama-server），看 P(建)、建不建判對沒有、主題句寫得像不像。
 
 用法：python -m tools.judge_examples            （只跑下方 HELD_OUT：不在提示詞裡的句子）
       python -m tools.judge_examples --all      （另外把 prompts/memory_judge.txt【例子】也跑一遍）
-（LM Studio 照平常載好對話模型。不碰記憶檔；原始回應整份落檔 logs/judge_examples_*.json。）
+（llama-server 照平常開著（start\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/judge_examples_*.json。）
 
 ⭐ 分兩組是為了不「拿考古題考」（2026-10-09 第一次實測 19 句全在提示詞裡、分數偏樂觀）：
    HELD_OUT 刻意不放進提示詞；提示詞的例子只用 --all 順便看。
@@ -68,7 +68,7 @@ def main(argv: list[str]) -> int:
         for ln in want_lines[1:]:
             print(f"      期望：{ln}")
         for ln in body.strip().splitlines():
-            mark = "　⛔照抄例子（正式判斷會濾掉）" if norm_topic(ln.replace("|", "｜").split("｜")[-1]) in ex_texts else ""
+            mark = "　⛔照抄例子（正式判斷會濾掉；整段被濾光時改存原句）" if norm_topic(ln.replace("|", "｜").split("｜")[-1]) in ex_texts else ""
             print(f"      模型：{ln}{mark}")
         rows.append({"group": group, "dialog": dialog, "want": want_lines, "said": said, "p_build": p,
                      "decided": got, "ok": hit, "seconds": round(dt, 2), "raw": out, "logprobs": lps})
@@ -84,3 +84,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+

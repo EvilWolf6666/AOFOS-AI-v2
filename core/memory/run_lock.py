@@ -3,7 +3,7 @@
 「AOFOS 正在執行」的訊號：一個由作業系統持有的檔案鎖（2026-10-09，給 tools/judge_worker.py 用）。
 
 為什麼要它：獨立終端的背景判斷（judge_worker）收不到「使用者開口」的取消訊號——
-它若在 AOFOS 開著時跑，對話就得排在它後面（LM Studio 只有一個推理槽），兩邊也會同時判同一個 DB。
+它若在 AOFOS 開著時跑，對話就得排在它後面（推理後端只有一個推理槽），兩邊也會同時判同一個 DB。
 ⇒ AOFOS 執行期間持有這把鎖；judge_worker 每 0.5 秒試一次，**拿不到＝AOFOS 開著 ⇒ 取消並結束**。
 
 ⭐ 用作業系統的鎖、不用「檔案存不存在」：AOFOS 當掉時鎖由作業系統自動放掉，不會留下一個
@@ -76,3 +76,4 @@ def held_by_other(path: str) -> bool:
         probe.release()
         return False
     return True
+
