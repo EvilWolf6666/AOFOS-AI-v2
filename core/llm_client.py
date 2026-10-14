@@ -447,7 +447,7 @@ class BackgroundLLM:
     """背景專用、可取消的 LLM 呼叫。**只給記憶的背景工作用，不接對話。**
 
     🔴 **刻意不用 OpenAI SDK，改用標準庫 http.client 自己送**：取消要在兩個階段都立刻生效——
-      ① 請求已送出、LM Studio 還在 prefill（連回應標頭都還沒回）
+      ① 請求已送出、後端還在 prefill（連回應標頭都還沒回）
       ② 已在串流
     SDK（httpx）在 ① 階段沒有從別的執行緒中斷的手段（關 client 不會打斷正在等的讀取，
     2026-09-30 用假伺服器實測：取消後仍卡到標頭回來才放手，prefill 3 秒就等 2.5 秒）。
@@ -503,7 +503,7 @@ class BackgroundLLM:
         """送出一次背景呼叫，回傳完整文字（schema 給了就是 JSON 字串）。
 
         被取消 ⇒ 拋 BackgroundCancelled；其他失敗照常拋（呼叫端記錄、下次再做）。
-        schema：LM Studio `response_format: json_schema`（GGUF 走 llama.cpp grammar 取樣，
+        schema：OpenAI 相容的 `response_format: json_schema`（GGUF 走 llama.cpp grammar 取樣，
         輸出被硬性限制在 schema 內）。
         """
         return self.call_lp(messages, purpose=purpose, max_tokens=max_tokens, schema=schema)[0]

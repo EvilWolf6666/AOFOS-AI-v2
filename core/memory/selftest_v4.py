@@ -36,7 +36,7 @@ from core.memory.topics import TopicStore
 
 
 # ── 假 LLM 伺服器（只給本自測用，不接任何真服務；2026-10-04 由 fake_llm_server.py 併入）──
-# 模擬 LM Studio 的兩段延遲：送出回應標頭前的 prefill，以及逐 token 串流；
+# 模擬後端的兩段延遲：送出回應標頭前的 prefill，以及逐 token 串流；
 # 記錄每個請求是「送完」還是「被客戶端中途斷線」，用來驗證 BackgroundLLM 的取消。
 
 class FakeLLM:
@@ -68,7 +68,7 @@ class FakeLLM:
                 time.sleep(fake.prefill_s)
                 got = fake.responder(req)
                 text, spec = got if isinstance(got, tuple) else (got, None)
-                # logprobs 規格：[(實際選的 token, [(候選, 機率), ...]), ...]——模擬 LM Studio 串流逐塊附上
+                # logprobs 規格：[(實際選的 token, [(候選, 機率), ...]), ...]——模擬後端串流逐塊附上
                 pieces: list[tuple[str, dict | None]] = []
                 if spec and req.get("logprobs"):
                     head = "".join(tok for tok, _ in spec)
@@ -591,7 +591,7 @@ def main() -> int:
                 m.add_turn(u, "嗯")
             m.compress_on_exit()
             mk = lambda: BackgroundLLM(base_url=fake.base_url, model="fake", params={"temperature": 0.0})
-            over = {"judge_segment_close_s": 0, "judge_segment_max": 2}
+            over = {"judge_segment_close_s": 0, "judge_segment_max": 2, "v4_enabled": True}
             lines: list[str] = []
             rc = judge_worker.main(db_path=db, llm=mk(), cfg_override=over, poll_s=0.05, out=lines.append)
             cx = connect(db)
@@ -605,9 +605,12 @@ def main() -> int:
             hold = RunLock(lk)
             hold.try_acquire()
             lines = []
-            check("AOFOS 開著 ⇒ 不啟動", judge_worker.main(db_path=db, llm=mk(), out=lines.append) == 0
+            check("AOFOS 開著 ⇒ 不啟動", judge_worker.main(db_path=db, llm=mk(), cfg_override=over, out=lines.append) == 0
                   and "不啟動" in lines[0], str(lines))
             hold.release()
+            lines = []
+            check("v4_enabled 關閉 ⇒ 不啟動", judge_worker.main(db_path=db, llm=mk(), cfg_override={**over, "v4_enabled": False},
+                                                           out=lines.append) == 0 and "不啟動" in lines[0], str(lines))
             m = MemoryManager(None, db_path=db, test_db_path=os.path.join(d, "t.db"), embed_enabled=False,
                               cfg_override={"v4_enabled": False})
             m.add_turn("我搬到台北了", "恭喜")

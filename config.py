@@ -33,7 +33,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # 推理後端：llama-server（llama.cpp 官方伺服器）
 # ─────────────────────────────────────────────────────────────
 # 🔺 2026-10-10 由 LM Studio 換成 llama-server（舊的 LMSTUDIO_LOAD_PARAMS 已移除，
-#    LM Studio 時期的 GUI 設定值見《現況》13之2）。
+#    LM Studio 時期的 GUI 設定值見《歸檔》B0013）。
 # 本區是載入層參數的**唯一來源**：tools/start_llama_server.py 讀它組啟動指令、
 #    LLMClient 讀它當 context 預算分母、backend_check 啟動時拿它比對實際載入狀態。
 # ⚠️ 改了本區任何值 ⇒ 重開 llama-server（start\啟動推理後端.bat）才生效；
@@ -70,7 +70,7 @@ LLAMA_SERVER = {
     # 邏輯批次。2048 → 512：server 似乎做完一批才檢查取消（推測，log 時間點吻合），
     #   背景判斷被打斷後讓出推理槽 12～13 → 4.8 秒；大段 prefill 速度不變（664 tok 都是 7.9 秒）。
     "batch": 512,
-    "ubatch": 512,        # 實體批次（LM Studio physical_batch_size）；不得大於 batch
+    "ubatch": 512,        # 實體批次；不得大於 batch
     "flash_attn": "on",   # on／off／auto
     # 附加參數。-cram＝RAM 提示詞快取上限（MiB，server 預設 8192）：對話與背景判斷輪流用同一推理槽，
     #   靠它把彼此的前綴存在 RAM、切回來不必整段重算（2026-10-11 log 確認有在作用）。
@@ -134,7 +134,7 @@ LLM_CONFIG = {
 # 記憶
 # Working Memory 滑動視窗（core/memory/manager.py 的 _slide）。
 # 🔺 2026-10-04：10 輪／每次丟 1 輪 → 20 輪／每次丟 10 輪。
-#    理由（實測，Windows）：每輪丟 1 輪會讓送給模型的開頭每輪都變 ⇒ LM Studio 提示詞快取對不上、
+#    理由（實測，Windows，LM Studio 時期）：每輪丟 1 輪會讓送給模型的開頭每輪都變 ⇒ 後端的提示詞快取對不上、
 #    整段重讀，滿 10 輪後**每輪** TTFT 多 2.5～3 秒。一次丟一批 ⇒ 快取每 WM_DROP_ROUNDS 輪才斷一次。
 #    剛丟完時她看得到 MAX＋1−DROP 輪（現為 11，不少於舊上限 10）。
 # ⚠️ 上限受 context 8192 約束：人格約 550＋回覆保留 300＋記憶區塊約 200 token；她回覆變長時每輪
@@ -196,7 +196,10 @@ MEMORY_CONFIG = {
     # ══ 準 v4（2026-09-30，《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）══════════════
     # 寫入端：原句全存（同準 v3）＋背景判斷「這段有沒有值得記的事」→ 有就建主題（transcript 的索引）。
     # 讀取端：主題兩路檢索 → 注入最新有效版本的主題句（重寫＝第 4 步，尚未實作）。
-    "v4_enabled": True,          # 關掉＝只存原句、不判不撈（自測用）
+    # 🔺 2026-10-14 關閉（《現況》第八章 P1 第 ② 點）：換判斷模型之前不建主題——v3 判斷不可靠，
+    #    清零後的記憶會再長出垃圾主題。關閉期間原句照存、開場照常；向量模型不載（只有主題用得到）；
+    #    獨立終端的背景判斷（start/背景判斷.bat）也不啟動。重開後，關閉期間存下的原句會被補判。
+    "v4_enabled": False,         # 關掉＝只存原句、不判不撈
 
     # 說話者 ID（寫進 transcript.speaker_id）。觀眾之後用平台 ID，不在這裡列。
     # ⚠️ 顯示名只影響送給背景模型與注入的文字，改了不需遷移。

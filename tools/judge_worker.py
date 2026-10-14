@@ -15,6 +15,7 @@
   · 一段只有在「最後一句已過 judge_segment_close_s」才算講完，所以 AOFOS 剛關時最多等那麼久才開判。
   · 人工審核不在這裡做：判完若有待審的，只提醒去開 start/審核.bat。
   · 連續出錯 3 次（例如 llama-server 沒開）⇒ 結束並回 1（.bat 會停住讓你看訊息）。
+  · config 的 MEMORY_CONFIG["v4_enabled"] 關閉時不啟動（與 AOFOS 一致：關閉期間不建主題）。
 """
 from __future__ import annotations
 
@@ -38,6 +39,9 @@ def main(*, db_path: str | None = None, llm=None, cfg_override: dict | None = No
     run = lock_path(db)
     if held_by_other(run):
         out("AOFOS 正在執行：背景判斷由它自己做，本程式不啟動。")
+        return 0
+    if not cfg["v4_enabled"]:
+        out("MEMORY_CONFIG[\"v4_enabled\"] 關閉中（不建主題），本程式不啟動。")
         return 0
     if not os.path.exists(db):
         out(f"記憶檔不存在：{db}")
