@@ -13,7 +13,7 @@ blind_eval.py — AOFOS 施測記錄表的盲評工具（make / merge）
 理由同《歸檔》C0035 對 `chat_strata.py` 的判定（⚠️ 該檔已移出程式碼庫，
 tools/ 底下現已無此檔，判定本體留在 C0035）：`tools/` 底下的腳本共用 config.py
 唯一入口，而本工具不需要任何設定值，硬接會讓一個純文字處理工具綁上
-`HF_HUB_OFFLINE` 那條啟動路徑。施測時 LM Studio 可能正載著別的模型、
+`HF_HUB_OFFLINE` 那條啟動路徑。施測時推理後端可能正載著別的模型、
 config.py 可能改到一半，本工具不該因此跑不起來。
 
 ⚠️ 日後若有人想「順手」讓它讀 config 取路徑——那就是耦合的入口。
@@ -99,8 +99,10 @@ def fmt_score(v):
 RAW_OPEN, RAW_CLOSE = '<<<', '>>>'
 
 # metadata 區塊裡要抽出來做對照表的欄位
-META_KEYS = ('模型', '量化', 'LoRA', 'GPU 卸載層數', 'GPU 卸載層數 / LM Studio 估計 VRAM',
+META_KEYS = ('模型', '量化', 'LoRA', 'GPU 卸載層數', 'GPU 卸載層數 / 後端回報 VRAM',
              '施測日期')
+# 舊欄名 → 現行欄名（2026-10-14 改名：欄名不綁特定後端；舊施測紀錄照樣抽得到，存成現行欄名）
+META_ALIASES = {'GPU 卸載層數 / LM Studio 估計 VRAM': 'GPU 卸載層數 / 後端回報 VRAM'}
 
 # 計分類別。F（指紋）與 A（語氣）不計分，預設也不進盲評版。
 # 沒有判準檔時的計分類別白名單（v1 題本的形狀）。
@@ -226,10 +228,10 @@ def parse_record(lines):
             continue
 
         if in_meta:
-            for k in META_KEYS:
+            for k in (*META_KEYS, *META_ALIASES):
                 mm = re.match(rf'^\s*{re.escape(k)}\s*[：:]\s*(.*)$', line)
                 if mm and mm.group(1).strip():
-                    groups[gi]['meta'][k] = mm.group(1).strip()
+                    groups[gi]['meta'][META_ALIASES.get(k, k)] = mm.group(1).strip()
 
     if in_raw:
         raise ValueError('檔尾有沒收尾的 <<< 區塊')

@@ -107,7 +107,7 @@ def queue_wait(rec: dict) -> int | None:
     return max(0, round(rec["ttft_ms"] - t["prompt_ms"]))
 
 
-def summarize(rec: dict, memory_note_fixed: bool) -> str:
+def summarize(rec: dict) -> str:
     t = rec.get("timings") or {}
     msgs = rec.get("messages") or []
     sysm = [m["content"] for m in msgs if m["role"] == "system"]
@@ -147,8 +147,8 @@ def main() -> int:
                                              "judge_segment_close_s": PROBE_IDLE_S})
         pipeline = Pipeline(llm, persona, memory)
         rec = Recorder(llm, persona)
-        fixed = config.MEMORY_CONFIG.get("note_position") == "fixed"
-        print(f"note_position={config.MEMORY_CONFIG.get('note_position')}｜seed={llm.seed}")
+        print(f"note_position={config.MEMORY_CONFIG.get('note_position')}｜seed={llm.seed}"
+              f"｜v4_enabled={config.MEMORY_CONFIG['v4_enabled']}")
 
         # 等向量載入：沒載好主題只走關鍵字一路，量到的注入不是平常的樣子
         emb = getattr(memory, "_emb", None)
@@ -166,7 +166,7 @@ def main() -> int:
             pipeline.finalize_turn()
             rec.cur["reply"] = res.reply
             records.append(rec.cur)
-            print(summarize(rec.cur, fixed), flush=True)
+            print(summarize(rec.cur), flush=True)
             return rec.cur
 
         print("\n══ 劇本對話 ══")
@@ -182,7 +182,9 @@ def main() -> int:
                 started = True
                 break
             time.sleep(0.2)
-        if not started:
+        if judge is None:
+            print("⚠️ v4_enabled 關閉（背景判斷不存在）：取消測試略過，下面那輪只是一般對話")
+        elif not started:
             print("⚠️ 120 秒內背景判斷沒開跑：本項沒測到（看 log 的「背景判斷」相關行）")
         else:
             time.sleep(1.0)

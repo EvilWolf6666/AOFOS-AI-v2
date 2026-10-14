@@ -132,7 +132,7 @@ class MemoryManager:
 
         cfg = {**MEMORY_CONFIG, **(cfg_override or {})}
         self._cfg = cfg
-        self._v4 = cfg["v4_enabled"]   # 關掉＝只存原句、不判不撈（自測用）
+        self._v4 = cfg["v4_enabled"]   # 關掉＝只存原句、不判不撈（config 註解：P1 第 ② 點）
         self._spk = cfg["speaker_ids"]
         # 滑動視窗兩個參數的正本在 config 頂層；cfg_override 只給自測固定舊行為用
         self._wm_max = cfg.get("wm_max_rounds", MAX_WORKING_MEMORY)
@@ -154,7 +154,8 @@ class MemoryManager:
 
         # 主題向量的模型在背景載入，載好之前主題只走關鍵字那一路（不擋啟動、不擋對話）
         self._emb: Embedder | None = None
-        if cfg["embed_enabled"] if embed_enabled is None else embed_enabled:
+        # 向量只有主題用得到 ⇒ v4 關閉時不載（省約 800 MB 常駐與開機載入）
+        if self._v4 and (cfg["embed_enabled"] if embed_enabled is None else embed_enabled):
             self._emb = Embedder(cfg["embed_model"], factory=embed_factory)
             self._emb.start()
         elif self._v4:
@@ -346,7 +347,7 @@ class MemoryManager:
         """滑動視窗：超過上限輪數時，**一次**丟掉最舊的 WM_DROP_ROUNDS 輪（只丟已落地的）。
 
         ⭐ 一次丟一批而不是每輪丟一輪：送給模型的開頭只在丟的那一輪改變 ⇒ 其餘輪次吃得到
-           LM Studio 的提示詞快取（每輪丟一輪時，滿了之後每輪 TTFT 多 2.5～3 秒，2026-10-04 實測）。
+           後端的提示詞快取（每輪丟一輪時，滿了之後每輪 TTFT 多 2.5～3 秒，2026-10-04 LM Studio 時期實測）。
         🔴 **沒有 serial 的一律不丟**（寫入失敗的那些）——丟了就真的沒了。
         """
         limit = self._wm_max * 2
