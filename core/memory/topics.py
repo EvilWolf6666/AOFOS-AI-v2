@@ -4,7 +4,8 @@
 
 它是什麼：**原句存放區（transcript）的索引**，不是資料本身。
   · 每一列＝一件事的一句主題句（主詞寫明），帶「指回原句」的 serial 範圍。
-  · 原句永遠在 transcript，一筆不刪；主題表整張壞掉可以從原句重建（重跑背景判斷）。
+  · 原句永遠在 transcript，一筆不刪；日常主題壞掉可以從原句重建（重跑背景判斷）。
+    例外是核心設定與審核結果（status／replaces），見下方〈鎖定與人工審核〉。
     ⇒ 寫入端做的歸納是**可重建的衍生物**，不是不可逆的結論
       （〈📐 規則〉三「歸納放在讀取端」要防的是不可逆，這裡沒有違反）。
 
@@ -22,11 +23,23 @@
   · 檢索預設跳過 `valid_to IS NOT NULL` 的列；原句照留。
 
 鎖定與人工審核（2026-10-09 邪狼裁，《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）：
-  · `status`：normal（一般）／locked（鎖定）／pending（待審）／rejected（駁回）。
-  · 背景判斷寫進來的新事實若要**機械取代一件鎖定的事**（同屬性鍵），不直接取代：
-    新的那件寫成 pending、`replaces` 指向被它挑戰的鎖定 root，等人工審核（tools/memory_review.py）。
-  · 檢索只看 normal／locked；pending、rejected 不注入（原句照留，駁回的列也不刪）。
+  · `status`：normal（日常）／locked（核心設定）／pending（待審）／rejected（駁回）。
+  · 人工審核只管「要不要進核心設定」：背景判斷寫進來的新事實若要**機械取代一件核心設定**
+    （同屬性鍵），不直接取代；新的那件寫成 pending、`replaces` 指向被它挑戰的鎖定 root，
+    等人工審核（tools/memory_review.py）。通過＝取代舊的、成為核心設定；駁回＝不改核心設定。
+  · 駁回的事日後要當日常記憶撈（加註「有人提過、未採用」，同時帶入現行核心設定，矛盾時核心優先；
+    2026-10-09 邪狼裁）。⏸ 這段讀取行為等有鎖定條目時才實作；**現行**檢索只看 normal／locked，
+    pending、rejected 不注入（原句照留，駁回的列也不刪）。
   ⚠️ 目前沒有任何路徑會產生 locked（世界觀灌入未做，《現況》17之1）⇒ 欄位先在、機制先不會被觸發。
+  ⚠️ 核心設定（locked）與審核結果（status／replaces）**不能從原句重建**：前者日後由世界觀灌入、
+     不一定來自對話，後者是人的決定。重建日常主題（重跑背景判斷）前要先把它們另外留下，
+     否則會跟著一起消失。重寫版本（add_version）沿用上一版的 status／replaces。
+
+判斷來源（judge_model／judge_prompt）：
+  · 背景判斷寫進來的源頭列記下「哪顆模型、哪版規則檔」判出來的（模型 alias、規則檔內容雜湊）。
+  · 用途：換判斷模型或改規則檔後，只挑舊來源產的重判，不必整張重來。
+  · NULL＝不是背景判斷寫的（自測、日後的世界觀灌入），或是加欄位之前寫的舊列。
+    重寫版本不填（它是重寫產的、不是判斷產的；來源看它的 root 那一列）。
 
 🔴 **交易紀律同 db.py**：公開方法自己開自己關交易，不對外回傳 cursor。
 """
@@ -60,7 +73,9 @@ CREATE TABLE IF NOT EXISTS topic (
     superseded_by INTEGER,               -- 取代它的那件事的 root
     retired       INTEGER NOT NULL DEFAULT 0,
     status        TEXT    NOT NULL DEFAULT 'normal',  -- normal／locked／pending／rejected
-    replaces      INTEGER                -- pending 才有：它要取代的鎖定 root
+    replaces      INTEGER,               -- pending 才有：它要取代的鎖定 root
+    judge_model   TEXT,                  -- 判出這件事的模型 alias；NULL＝非背景判斷寫入
+    judge_prompt  TEXT                   -- 當時規則檔的內容雜湊（judge.prompt_digest）
 );
 CREATE INDEX IF NOT EXISTS topic_root ON topic(root);
 CREATE INDEX IF NOT EXISTS topic_attr ON topic(attr_key) WHERE attr_key IS NOT NULL;
@@ -76,10 +91,12 @@ _LIVE = "('normal','locked')"   # 會被檢索的狀態
 
 def ensure_schema(cx: sqlite3.Connection) -> None:
     cx.executescript(SCHEMA)
-    # 2026-10-09 前建的表沒有 status／replaces ⇒ 補欄位（既有列一律 normal，行為不變）。
+    # 舊表補欄位：2026-10-09 前沒有 status／replaces（既有列一律 normal，行為不變）；
+    # 2026-10-17 前沒有 judge_model／judge_prompt（既有列為 NULL＝來源不明）。
     # ⚠️ 這是對正式記憶檔的結構改動：第一次跑新版前先備份 data/memory.db。
     cols = {r[1] for r in cx.execute("PRAGMA table_info(topic)")}
-    for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'normal'"), ("replaces", "INTEGER")):
+    for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'normal'"), ("replaces", "INTEGER"),
+                     ("judge_model", "TEXT"), ("judge_prompt", "TEXT")):
         if col not in cols:
             with write_txn(cx):
                 cx.execute(f"ALTER TABLE topic ADD COLUMN {col} {ddl}")
@@ -143,13 +160,15 @@ class TopicStore:
     # ── 寫入 ──────────────────────────────────────────────────
 
     def add_topics(self, items: list[dict], *, first_serial: int, last_serial: int,
-                   event_ts: str, speakers: list[str], judged_upto: int) -> list[int]:
+                   event_ts: str, speakers: list[str], judged_upto: int,
+                   judge_model: str | None = None, judge_prompt: str | None = None) -> list[int]:
         """寫入一段對話判出的主題，並在**同一個交易**裡：
           ① 同 attr_key 的舊事實標 valid_to／superseded_by（機械取代）
           ② 推進 judged_upto
         ⇒ 「主題寫了但進度沒推（下次重複建）」與「進度推了但主題沒寫（漏建）」都不存在。
 
         items：[{text, type, attr_key}]；空清單＝這段判了不建，只推進度。
+        judge_model／judge_prompt：背景判斷一律要帶（見檔頭〈判斷來源〉）；不帶＝NULL。
         回傳新列的 id。
         ⚠️ 要取代的舊事實裡有**鎖定**的 ⇒ 鎖定的那件不動，新的這件寫成 pending 等人工審核
            （非鎖定的照常取代）。
@@ -161,9 +180,11 @@ class TopicStore:
             for it in items:
                 cur = self.cx.execute(
                     "INSERT INTO topic(text, type, attr_key, first_serial, last_serial, "
-                    "event_ts, created_at, speakers) VALUES(?,?,?,?,?,?,?,?)",
+                    "event_ts, created_at, speakers, judge_model, judge_prompt) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (it["text"], it.get("type"), it.get("attr_key") or None,
-                     first_serial, last_serial, event_ts, now, spk or None))
+                     first_serial, last_serial, event_ts, now, spk or None,
+                     judge_model, judge_prompt))
                 tid = cur.lastrowid
                 self.cx.execute("UPDATE topic SET root=? WHERE id=?", (tid, tid))
                 ids.append(tid)
@@ -190,18 +211,21 @@ class TopicStore:
         return ids
 
     def add_version(self, parent_id: int, text: str) -> int:
-        """寫一個重寫版本（第 4 步用）：parent＝上一版、root＝同源頭，其餘欄位沿用。"""
+        """寫一個重寫版本（第 4 步用）：parent＝上一版、root＝同源頭，其餘欄位沿用。
+        ⚠️ status／replaces 一定要沿用：latest() 取每個 root 最新一版，新版若退回預設 normal，
+           鎖定的事一被重寫就不再是鎖定（之後同屬性鍵的新說法會直接取代它，不進待審）。
+        judge_model／judge_prompt 不沿用（見檔頭〈判斷來源〉）。"""
         with write_txn(self.cx):
             p = self.cx.execute("SELECT * FROM topic WHERE id=?", (parent_id,)).fetchone()
             if p is None:
                 raise KeyError(f"topic id={parent_id} 不存在")
             cur = self.cx.execute(
                 "INSERT INTO topic(root, parent, text, type, attr_key, first_serial, last_serial, "
-                "event_ts, created_at, speakers, valid_to, superseded_by) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "event_ts, created_at, speakers, valid_to, superseded_by, status, replaces) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (p["root"], parent_id, text, p["type"], p["attr_key"], p["first_serial"],
                  p["last_serial"], p["event_ts"], _now_iso(), p["speakers"],
-                 p["valid_to"], p["superseded_by"]))
+                 p["valid_to"], p["superseded_by"], p["status"], p["replaces"]))
             return cur.lastrowid
 
     # ── 讀取 ──────────────────────────────────────────────────
@@ -246,7 +270,8 @@ class TopicStore:
             self.cx.execute("UPDATE topic SET status='locked' WHERE id=?", (topic_id,))
 
     def reject(self, topic_id: int) -> None:
-        """駁回：不刪列（原句與判斷紀錄都留著），只是永遠不進檢索。"""
+        """駁回：不刪列（原句與判斷紀錄都留著），不改核心設定。
+        現行不進檢索；日後改為當日常記憶撈（見檔頭〈鎖定與人工審核〉）。"""
         with write_txn(self.cx):
             n = self.cx.execute("UPDATE topic SET status='rejected' WHERE id=? AND status='pending'",
                                 (topic_id,)).rowcount

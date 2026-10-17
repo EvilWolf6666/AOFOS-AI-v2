@@ -8,6 +8,7 @@
 暫停逾時保險、壞輸出。
 🆕 2026-10-09：判斷一次呼叫＋logprobs 算 P(建)（含「答不建但機率過門檻 ⇒ 補一次」與「拿不到機率」）、
 規則檔解析（用真的 prompts/memory_judge.txt）、關鍵字那一路與配額聯集、鎖定／待審／人工審核、舊表遷移。
+🆕 2026-10-17：判斷來源（judge_model／judge_prompt）落地與舊表補欄、重寫版本沿用鎖定狀態。
 ⚠️ 不測「真的推理後端斷線後會不會停止運算」——那要在 Windows 實測（看取消後下一輪對話 TTFT）。
 """
 
@@ -28,7 +29,7 @@ from config import MEMORY_CONFIG
 from core.llm_client import BackgroundLLM
 from core.memory.db import connect
 from core.memory.judge import (_FORCE_BUILD, drop_copies, fallback_topic, load_prompt, norm_topic, p_build,
-                               parse_topics, split_answer, split_segment)
+                               parse_topics, prompt_digest, split_answer, split_segment)
 from core.memory.manager import MemoryManager
 from core.memory.topic_index import TopicSearch, fill_fts
 from core.memory.topics import SCHEMA as TOPIC_SCHEMA
@@ -383,18 +384,46 @@ def main() -> int:
               got == {"奧狐的生日是 3 月 11 號"}, str(got))
         cx.close()
 
-    print("\n[舊表遷移：沒有 status／replaces 欄]")
+    print("\n[重寫版本沿用鎖定狀態]")
+    with tempfile.TemporaryDirectory() as d:
+        cx = connect(os.path.join(d, "v.db"))
+        st = TopicStore(cx)
+        k = st.add_topics([{"text": "奧狐的生日是 3 月 23 日", "type": "身分", "attr_key": "奧狐.生日"}],
+                          first_serial=1, last_serial=2, event_ts=ts(1), speakers=["evilwolf"], judged_upto=2)
+        st.lock(k[0])
+        kv = st.add_version(k[0], "奧狐的生日是 3 月 23 日（重寫版）")
+        lat = st.latest()
+        check("鎖定的事被重寫 ⇒ 新版仍是 locked", [(t["id"], t["status"]) for t in lat] == [(kv, "locked")],
+              str([(t["id"], t["status"]) for t in lat]))
+        nk = st.add_topics([{"text": "奧狐的生日是 1 月 1 號", "type": "身分", "attr_key": "奧狐.生日"}],
+                           first_serial=3, last_serial=4, event_ts=ts(2), speakers=["evilwolf"], judged_upto=4)
+        check("重寫後同屬性鍵的新說法 ⇒ 照樣進待審、不直接取代",
+              [p_["id"] for p_ in st.pending_review()] == nk
+              and [t["text"] for t in st.latest()] == ["奧狐的生日是 3 月 23 日（重寫版）"])
+        check("重寫版本不填判斷來源", st.get([kv])[0]["judge_model"] is None)
+        cx.close()
+
+    print("\n[舊表遷移：沒有 status／replaces／judge_model／judge_prompt 欄]")
     with tempfile.TemporaryDirectory() as d:
         cx = connect(os.path.join(d, "old.db"))
-        old_schema = TOPIC_SCHEMA.replace(",\n    status        TEXT    NOT NULL DEFAULT 'normal',  -- normal／locked／pending／rejected\n    replaces      INTEGER                -- pending 才有：它要取代的鎖定 root\n", "\n")
-        assert "status" not in old_schema.split("CREATE INDEX")[0]
+        added = ("status", "replaces", "judge_model", "judge_prompt")
+        table, rest = TOPIC_SCHEMA.split("CREATE INDEX", 1)
+        keep = [ln for ln in table.splitlines() if ln.strip().split(" ", 1)[0] not in added]
+        # 最後一個欄位行拿掉逗號（拿掉的欄位都在表尾）
+        last = max(i for i, ln in enumerate(keep) if ln.startswith("    ") and not ln.strip().startswith(")"))
+        head, _, cmt = keep[last].partition("--")
+        keep[last] = head.rstrip().rstrip(",") + ("  --" + cmt if cmt else "")
+        old_schema = "\n".join(keep) + "\nCREATE INDEX" + rest
+        assert not any(c in old_schema.split("CREATE INDEX")[0] for c in added), old_schema
         cx.executescript(old_schema)
         cx.execute("INSERT INTO topic(root, text, first_serial, last_serial, created_at) VALUES(1,'舊主題',1,2,'x')")
         cx.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER)")
         st = TopicStore(cx)
         cols = {r[1] for r in cx.execute("PRAGMA table_info(topic)")}
-        check("補上兩欄、既有列為 normal、照常被檢索", {"status", "replaces"} <= cols
-              and [t["text"] for t in st.latest()] == ["舊主題"] and st.latest()[0]["status"] == "normal")
+        lat = st.latest()
+        check("補上四欄、既有列為 normal／來源 NULL、照常被檢索", set(added) <= cols
+              and [t["text"] for t in lat] == ["舊主題"] and lat[0]["status"] == "normal"
+              and lat[0]["judge_model"] is None and lat[0]["judge_prompt"] is None, str(cols))
         cx.close()
 
     print("\n[人工審核工具（tools/memory_review.py，腳本化輸入）]")
@@ -450,7 +479,12 @@ def main() -> int:
             check("建 2 件主題並補完向量", ok, m.status_text())
             cx = connect(m.memory_path)
             spk = [r[0] for r in cx.execute("SELECT speaker_id FROM transcript ORDER BY serial")]
+            src = {(r[0], r[1]) for r in cx.execute("SELECT judge_model, judge_prompt FROM topic")}
             cx.close()
+            # 標準答案獨立重算：直接讀規則檔再雜湊，不讀 BackgroundJudge 身上的值
+            want = prompt_digest(load_prompt(MEMORY_CONFIG["judge_prompt_path"],
+                                             max_topics=MEMORY_CONFIG["judge_max_topics"])[0])
+            check("判斷來源落地（模型 alias＋規則檔雜湊）", src == {("fake", want)}, f"{src} want={want}")
             check("speaker_id 落地（使用者／奧狐）", spk == ["evilwolf", "aofos"] * 2, str(spk))
             inj = injected(m.get_context("港都熱不熱"))
             check("同義查詢撈回主題句（帶口語時間）", "邪狼住在高雄" in inj and "（剛剛）" in inj, inj)
