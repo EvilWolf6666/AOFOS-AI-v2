@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import threading
@@ -79,6 +80,13 @@ def load_prompt(path: str, *, max_topics: int) -> tuple[str, list[str], list[tup
         elif examples and ln != "輸出：":
             examples[-1][1].append(ln)
     return raw.replace("{最多幾件}", str(max_topics)).strip(), types, examples
+
+
+def prompt_digest(system: str) -> str:
+    """規則的內容雜湊（寫進主題表 judge_prompt，換規則後能挑出舊規則判的）。
+    雜湊的是**實際送出的 system 文字**（已代入最多幾件、文字模式讀檔＝換行已統一），
+    不是檔案位元組：只動到不送出的東西不算換規則。"""
+    return hashlib.sha256(system.encode("utf-8")).hexdigest()[:12]
 
 
 def build_messages(system: str, segment: str, *, force: bool = False) -> list[dict]:
@@ -265,6 +273,11 @@ class BackgroundJudge:
         self.names = cfg["speaker_names"]
         self.system, self.types, self.examples = load_prompt(
             cfg["judge_prompt_path"], max_topics=cfg["judge_max_topics"])
+        # 判斷來源（寫進主題表，《現況》〈🔒 隔離區〉準 v4；core/memory/topics.py 檔頭〈判斷來源〉）。
+        # 規則檔只在這裡讀一次 ⇒ 整個執行期間雜湊不變；改規則檔要重開才生效，與送出的內容一致。
+        self.judge_model = llm.model
+        self.judge_prompt = prompt_digest(self.system)
+        logger.info(f"背景判斷來源：模型 {self.judge_model}／規則 {self.judge_prompt}")
         # 例子的主題句（期望輸出第 2 行起、「類型｜屬性鍵｜主題句」的第三欄）——照抄過濾用
         self._example_texts = {norm_topic(ln.replace("|", "｜").split("｜")[-1])
                                for _, out in self.examples for ln in out[1:] if "｜" in ln.replace("|", "｜")}
@@ -466,7 +479,8 @@ class BackgroundJudge:
                                f"退回存原句（類型「{FALLBACK_TYPE}」）")
         speakers = [r.get("speaker_id") for r in seg]
         ids = st.add_topics(items, first_serial=first, last_serial=last,
-                            event_ts=seg[-1]["ts"], speakers=speakers, judged_upto=last)
+                            event_ts=seg[-1]["ts"], speakers=speakers, judged_upto=last,
+                            judge_model=self.judge_model, judge_prompt=self.judge_prompt)
         self.stats["segments"] += 1
         self.stats["built" if items else "skipped"] += 1
         self.stats["topics"] += len(ids)
