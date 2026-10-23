@@ -9,6 +9,8 @@
   ④ 本場開頭幾輪另帶開場：「上次聊天是多久以前／今天聊過幾次／那次聊了幾輪」＋上一場的關鍵詞
      （事件層，程式算、不經 LLM）
   ⑤ 全部包在一個 `⟦記憶⟧…⟦/記憶⟧` system 區塊裡，**追加在本輪輸入之前**；區塊第一行自帶說明
+     區塊內兩段標題：④ 開場＝「妳記得的事」、③ 主題＝「妳想起的事」（config 的 label_remember／label_recall；
+     🔴 必須與人格 prompt〈記憶誠實原則〉的用詞逐字相同，人格規定只有這兩段裡的才算知道）
 Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪、一次丟 WM_DROP_ROUNDS 輪），超出的直接滑出——
 ⭐ 原句已經落地，滑出不會丟任何東西，**所以不需要壓縮**。
 
@@ -141,10 +143,12 @@ class MemoryManager:
         self._test_path = test_db_path or cfg["test_db_path"]
         self._max_terms = cfg["max_query_terms"]
         self._open, self._close, self._note = cfg["block_open"], cfg["block_close"], cfg["block_note"]
+        self._lab_rem, self._lab_rec = cfg["label_remember"], cfg["label_recall"]
         # 說明放在哪（config 的 note_position）："fixed" 時說明是開頭一則不變的 system 訊息
         if cfg["note_position"] not in ("fixed", "inline"):
             raise ValueError(f"MEMORY_CONFIG['note_position'] 只能是 fixed／inline：{cfg['note_position']!r}")
-        self._fixed_note = (cfg["fixed_note"].format(open=self._open, close=self._close)
+        self._fixed_note = (cfg["fixed_note"].format(open=self._open, close=self._close,
+                                                     remember=self._lab_rem, recall=self._lab_rec)
                             if cfg["note_position"] == "fixed" else None)
         self._opening_turns = cfg["opening_turns"]
         self._ep_cfg = {"gap": cfg["episode_gap_minutes"], "kw": cfg["episode_keywords"],
@@ -459,7 +463,7 @@ class MemoryManager:
                     if n_today and bucket in ("剛剛", "今天稍早"):
                         state += f"，今天已經聊過 {n_today} 次"
                     state += f"；那次聊了大約 {max(1, ep['n_rows'] // 2)} 輪。"
-                    lines = [f"[狀態] {state}"]
+                    lines = [f"[{self._lab_rem}]", f"[狀態] {state}"]
                     if ep["keywords"]:
                         lines.append("[上一場] 聊到：" + "、".join(ep["keywords"]))
                     text = "\n".join(lines)
@@ -505,7 +509,8 @@ class MemoryManager:
                 return ""
             hits = sorted(picked.values(), key=lambda t: t["event_ts"] or "")
             # fixed：「括號是什麼」已在固定說明裡，區塊只留標籤（少重算的字）
-            lines = ["[相關記憶]" if self._fixed_note else "[相關記憶] 你記得的事（括號是事情發生的時候）："]
+            lines = [f"[{self._lab_rec}]" if self._fixed_note
+                     else f"[{self._lab_rec}]（括號是事情發生的時候）："]
             for t in hits:
                 b = time_bucket(t["event_ts"] or "")
                 lines.append(f"· {'（' + b + '）' if b else ''}{t['text']}")
