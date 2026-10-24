@@ -28,7 +28,7 @@ import math
 from config import MEMORY_CONFIG
 from core.llm_client import BackgroundLLM
 from core.memory.db import connect
-from core.memory.judge import (_FORCE_BUILD, drop_copies, fallback_topic, load_prompt, norm_topic, p_build,
+from core.memory.judge import (_FORCE_BUILD, decide, drop_copies, fallback_topic, load_prompt, norm_topic, p_build,
                                parse_topics, prompt_digest, split_answer, split_segment)
 from core.memory.manager import MemoryManager
 from core.memory.topic_index import TopicSearch, fill_fts
@@ -279,6 +279,13 @@ def main() -> int:
     check("選了「建」時，「不」底下的不確定路徑不算（看不到）",
           abs(p_build([L("建", [("建", 0.7), ("不", 0.3)]), L("\n", [("\n", 1.0)])]) - 0.7) < 1e-6)
     check("沒有 logprobs ⇒ None", p_build([]) is None and p_build([{"token": "建", "logprob": 0.0}]) is None)
+    # 🆕 2026-10-24：門檻 None＝看字（預設）；數值＝看機率（補呼叫只有這條會走到）
+    check("decide 看字：只有「不建」不建，P(建) 再高也不補呼叫",
+          decide("不建", 0.9, None) == (False, False) and decide("建", 0.01, None) == (True, False)
+          and decide("不確定", None, None) == (True, False) and decide("?", 0.2, None) == (True, False))
+    check("decide 門檻：過門檻就建、答不建時要補；拿不到機率退回看字",
+          decide("不建", 0.4, 0.3) == (True, True) and decide("建", 0.2, 0.3) == (False, False)
+          and decide("建", 0.9, 0.3) == (True, False) and decide("不建", None, 0.3) == (False, False))
     check("第一行判斷與主題句分開", split_answer("建\n狀態｜無｜x") == ("建", "狀態｜無｜x")
           and split_answer("不建") == ("不建", "") and split_answer("嗯\n狀態｜無｜x")[0] == "?")
 
@@ -467,7 +474,8 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory() as d:
             print("\n[端到端：閒置 → 判斷 → 主題 → 注入]")
-            m = mm(d, fake)
+            # 明帶數值門檻：「邊界」那段要走「答不建但過門檻 ⇒ 補一次」（config 預設 None＝看字，走不到）
+            m = mm(d, fake, judge_build_threshold=0.3)
             check("啟動時不碰 DB 建主題表（連線延後到真的要判）",
                   not has_table(os.path.join(d, "memory.db"), "topic"))
             turn(m, "我住在高雄", "高雄很熱吧")

@@ -7,8 +7,13 @@
 
 ⭐ 以測試模式開啟：日常區唯讀、寫入只進測試區，結束時測試區整包丟棄。
    向量關閉（省 18 s 載入）⇒ 下面的 messages 只含開場與「關鍵字那一路」命中的主題。
-   主題表另外直接列出（唯讀）。🔺 2026-10-09 準 v3 撈原句淘汰後，messages 不再有原句。準 v3 撈原句若在 config 關了，messages 會是空的——正常。
+   主題表另外直接列出（唯讀）。🔺 2026-10-09 準 v3 撈原句淘汰後，messages 不再有原句；
+   `v4_enabled` 關閉時也不撈主題，只會看到開場（第一場沒有上一場時連開場都沒有）——正常。
+⭐ 日常區以唯讀開啟（mode=ro）：檔案不存在時只印提示，不會替它建出空檔（2026-10-24 修：
+   原本 sqlite3.connect 會先建空檔、再因沒有 transcript 表而拋錯）。
+⭐ 印的是正式路徑實際送出的形狀（build_turn()：記憶區塊依 block_position 可能在最後一則 user 裡）。
 """
+import os
 import sqlite3
 import sys
 
@@ -18,7 +23,16 @@ from core.memory.manager import MemoryManager
 
 def main() -> None:
     query = sys.argv[1] if len(sys.argv) > 1 else ""
-    cx = sqlite3.connect(MEMORY_CONFIG["db_path"])
+    path = MEMORY_CONFIG["db_path"]
+    if os.path.exists(path):
+        _print_daily(path)
+    else:
+        print(f"══ 日常區不存在：{path}（正式記憶為空；不建檔）══")
+    _print_messages(query)
+
+
+def _print_daily(path: str) -> None:
+    cx = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     cx.row_factory = sqlite3.Row
     print("══ 日常區最近 30 句 ══")
     for r in cx.execute("SELECT serial, ts, role, content, situation FROM transcript "
@@ -47,12 +61,14 @@ def main() -> None:
         print(f"  （沒有事件層：{e}）")
     cx.close()
 
+
+def _print_messages(query: str) -> None:
     m = MemoryManager(embed_enabled=False)
     m.set_test_mode(True)
     try:
-        ctx = m.get_context(query)
-        print(f"\n══ 送給模型的 messages（查詢：{query!r}）══")
-        for x in ctx:
+        ctx, user_content = m.build_turn(query)
+        print(f"\n══ 送給模型的 messages（人格之後；查詢：{query!r}）══")
+        for x in ctx + [{"role": "user", "content": user_content}]:
             print(f'--- role={x["role"]} ---\n{x["content"]}')
     finally:
         # 🔺 只呼叫 compress_on_exit()：測試模式下它會自己丟棄測試區、不碰日常區。

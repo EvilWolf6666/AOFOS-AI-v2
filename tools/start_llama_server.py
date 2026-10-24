@@ -78,14 +78,44 @@ def build_cmd(cfg: dict, log_file: Path) -> list[str]:
         "--jinja",
         "--metrics",
         "--log-file", str(log_file),
+        *optional_args(cfg),
         *cfg["extra_args"],
     ]
+
+
+def optional_args(cfg: dict) -> list[str]:
+    """config 的 optional_args：None／False 不送、True 只送旗標、其他送「旗標 值」。"""
+    out: list[str] = []
+    for flag, v in cfg["optional_args"].items():
+        if v is None or v is False:
+            continue
+        out += [flag] if v is True else [flag, str(v)]
+    return out
+
+
+def check_flags(cfg: dict) -> None:
+    """啟用中的 optional_args 旗標，本機版本的 --help 裡必須找得到，否則不開機。
+
+    ⚠️ 旗標名是照官方 README 抄的，版本間會改名；帶著不認得的旗標開機，
+       推理後端會直接報錯退出，或（更糟）被當成別的參數的值。
+    """
+    on = [f for f, v in cfg["optional_args"].items() if v is not None and v is not False]
+    if not on:
+        return
+    out = subprocess.run([cfg["exe"], "--help"], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
+    text = out.stdout + out.stderr
+    missing = [f for f in on if not re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", text)]
+    if missing:
+        fail(f"這些旗標在本機 llama-server（{cfg['build']}）的 --help 裡找不到：{missing}\n"
+             "請用 llama-server.exe --help 查正確名稱後改 config.LLAMA_SERVER['optional_args']。")
 
 
 def main() -> None:
     cfg = config.LLAMA_SERVER
     check_files(cfg)
     check_build(cfg)
+    check_flags(cfg)
     check_port_free(cfg)
     warn_if_lmstudio_running()
 

@@ -28,16 +28,11 @@
      現行刪除條件：綁在 opencc 恢復排程上——恢復並穩定後才重新評估。
         ⚠️ **施測期間不要開它**，它是新變數。
 
-  2. dump_observation_messages()
-     呼叫點：core/agent/pipeline.py handle_observation()
-     目的：確認 observation 輪次實際送出的 messages——情境 system 訊息的位置與
-           內容、以及 working memory 內累積的空 U 對是否造成逐字複製
-     刪除條件：空 U 複製問題釐清後
+  （🔺 2026-10-24 移除 dump_observation_messages()：刪除條件「空 U 複製問題釐清後」已達成——
+     照抄的成因是「system 訊息接在上一句回覆後面」，情境改併進 user 後 0 次（《現況》22之84、第八章 C14）。）
 """
 
 from __future__ import annotations
-
-import json
 
 from config import DIAGNOSTICS
 from core.logger import setup_logger
@@ -74,28 +69,3 @@ def log_opencc_diff(before: str, after: str) -> None:
     else:
         # 長度不同代表不是單純的一對一字元替換，直接記兩邊供人工判讀
         logger.debug(f"opencc 改動（長度變化）：{before[:60]} → {after[:60]}")
-
-
-# ══════════════════════════════════════════════════════════════
-# 2. observation 輪次 messages 傾印
-# ══════════════════════════════════════════════════════════════
-
-def dump_observation_messages(messages: list) -> None:
-    """
-    印出 observation 輪次送進 LLM 的完整 messages。
-
-    要看的三件事：
-      · [目前情境] system 訊息落在陣列的哪個位置、與人格 prompt 的相對順序
-      · working memory 裡是否已累積 content 為空的 user 訊息，以及其後的
-        assistant 內容是否就是被複製的那一句
-      · 情境描述是否真的存在於送出內容中（排除組裝過程被吃掉的可能）
-
-    直接 print 而非 logger：需要完整多行 JSON，logger 的單行格式不利閱讀。
-    """
-    if not DIAGNOSTICS.get("dump_observation_messages"):
-        return
-
-    print("\n" + "─" * 64)
-    print("[DUMP] observation messages（共 %d 則）" % len(messages))
-    print(json.dumps(messages, ensure_ascii=False, indent=2))
-    print("─" * 64 + "\n")
