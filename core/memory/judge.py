@@ -4,10 +4,12 @@
 
 一段對話 → **一次呼叫**（🔺 2026-10-09 改，舊做法 json_schema 兩段式見《歸檔》D0033）：
   第一行「建／不建／不確定」，要建就接著一行一件「類型｜屬性鍵｜主題句」，**JSON 由 Python 組**。
-  · 建不建看**機率不看字**：由第一行的 logprobs 算 P(建)（「不確定」那條路算進建，寧可多建——
-    主題是可重建的索引，漏建才救不回來），**只有一個門檻**（config `judge_build_threshold`）。
-  · 模型答「不建」但 P(建) 過門檻 ⇒ 它沒寫主題句 ⇒ 補一次呼叫要它寫。
-  · 拿不到 logprobs ⇒ WARNING（只記一次）＋計數，退回看文字（不確定／看不懂都當建）。
+  · 建不建由 `decide()` 定，看 config `judge_build_threshold`：
+      None（🔺 2026-10-24 起的預設）＝看第一行的字：只有「不建」不建，「不確定」與看不懂都當建。
+      數值＝看機率：由第一行的 logprobs 算 P(建)（「不確定」那條路算進建，寧可多建——
+      主題是可重建的索引，漏建才救不回來）≥ 門檻就建；模型答「不建」但過門檻 ⇒ 它沒寫主題句 ⇒ 補一次呼叫要它寫。
+  · P(建) 兩種模式都照算、照寫 log（之後要不要恢復門檻，靠這些樣本校準）。
+  · 拿不到 logprobs ⇒ WARNING（只記一次）＋計數，看文字（同 None）。
   · 不用 json_schema：後端在格式限制下回的是限制「之前」的分布，讀不出選項機率，
     而且同一段結論會變（2026-10-09 LM Studio 時期實測，《現況》11之2 己）。
   ⭐ prompt 順序＝「規則在前（system，固定不變）、對話片段在後」：規則是每段共用的前綴，
@@ -110,6 +112,18 @@ def classify(word: str) -> str:
     if w.startswith("不建"):
         return "不建"
     return "?"
+
+
+def decide(said: str, p: float | None, thr: float | None) -> tuple[bool, bool]:
+    """（模型第一行的字, P(建), 門檻）→（建不建, 要不要補一次呼叫）。純函式 ⇒ 自測直接餵。
+
+    thr 是 None、或拿不到機率 ⇒ 看字：只有「不建」不建（「不確定」與看不懂「?」都當建）。
+    thr 是數值 ⇒ P(建) ≥ thr 就建；此時模型自己答「不建」⇒ 它沒寫主題句 ⇒ 要補一次。
+    """
+    if thr is None or p is None:
+        return said != "不建", False
+    build = p >= thr
+    return build, build and said == "不建"
 
 
 def p_build(tokens: list[dict]) -> float | None:
@@ -457,6 +471,7 @@ class BackgroundJudge:
         logger.info(f"背景判斷開始 serial {first}–{last}（{len(seg)} 句）")
         said, p, build, items = self._judge(text, first, last)
         thr = cfg["judge_build_threshold"]
+        rule = "看字" if thr is None else f"門檻 {thr}"
 
         parsed = len(items)
         copied = 0
@@ -486,7 +501,7 @@ class BackgroundJudge:
         self.stats["topics"] += len(ids)
         # 🔴 第 6 點（定門檻）的資料來源就是這一行：P(建)、模型自己的答案、結果
         pb = "—" if p is None else f"{p:.3f}"
-        logger.info(f"背景判斷 serial {first}–{last}：模型答「{said}」P(建)={pb}（門檻 {thr}）"
+        logger.info(f"背景判斷 serial {first}–{last}：模型答「{said}」P(建)={pb}（{rule}）"
                     f"→ {'建' if build else '不建'}，建 {len(ids)} 件")
         if ids:
             fill_fts(self._cx)
@@ -509,15 +524,13 @@ class BackgroundJudge:
                 logger.warning("背景判斷拿不到 logprobs（後端串流沒附？），改看文字判斷："
                                "「不確定」與看不懂都當建。只記這一次，次數見 /status「缺機率」")
                 self._no_lp_warned = True
-            build = said != "不建"
-        else:
-            build = p >= thr
+        build, extra = decide(said, p, thr)
         if said == "?":
             logger.warning(f"判斷第一行看不懂（serial {first}–{last}）：{out[:80]!r}")
 
         items: list[dict] = []
         if build:
-            if said == "不建":   # 機率過門檻、但模型自己答了不建 ⇒ 它沒寫主題句，補一次
+            if extra:   # 機率過門檻、但模型自己答了不建 ⇒ 它沒寫主題句，補一次（只有數值門檻會走到）
                 self.stats["extra"] += 1
                 out = self.llm.call(self._messages(text, force=True), purpose="記憶主題",
                                     max_tokens=cfg["judge_max_tokens"])

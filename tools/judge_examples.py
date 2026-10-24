@@ -22,7 +22,7 @@ import time
 
 from config import MEMORY_CONFIG
 from core.llm_client import BackgroundLLM
-from core.memory.judge import build_messages, load_prompt, norm_topic, p_build, split_answer
+from core.memory.judge import build_messages, decide, load_prompt, norm_topic, p_build, split_answer
 
 # （對話，「／」分句；期望輸出：第一行建／不建，之後是期望主題句）——不得與提示詞【例子】重複
 HELD_OUT: list[tuple[str, list[str]]] = [
@@ -60,7 +60,7 @@ def main(argv: list[str]) -> int:
         dt = time.monotonic() - t0
         said, body = split_answer(out)
         p = p_build(lps)
-        got = ("建" if said != "不建" else "不建") if p is None else ("建" if p >= thr else "不建")
+        got = "建" if decide(said, p, thr)[0] else "不建"   # 與正式判斷同一條規則
         hit = got == want
         wrong += not hit
         pb = "—" if p is None else f"{p:.2f}"
@@ -77,8 +77,9 @@ def main(argv: list[str]) -> int:
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"threshold": thr, "rows": rows}, f, ensure_ascii=False, indent=2, sort_keys=True)
     if any(r["p_build"] is None for r in rows):
-        print("⚠️ 有回應拿不到 logprobs（串流沒附？）⇒ 上面那些是看文字判的")
-    print(f"\n建不建：{len(rows) - wrong}/{len(rows)} 對（門檻 {thr}）｜主題句請對照「期望／模型」看｜原始回應：{path}")
+        print("⚠️ 有回應拿不到 logprobs（串流沒附？）⇒ 那些 P(建) 是「—」、一律看文字判")
+    rule = "看字" if thr is None else f"門檻 {thr}"
+    print(f"\n建不建：{len(rows) - wrong}/{len(rows)} 對（{rule}）｜主題句請對照「期望／模型」看｜原始回應：{path}")
     return 1 if wrong else 0
 
 

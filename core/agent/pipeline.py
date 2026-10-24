@@ -21,7 +21,6 @@ from typing import Callable, Optional, Tuple
 
 from config import EVENT_CONFIG, PERSONA_CONFIG
 from core.agent.events import Event, OBSERVATION
-from core.short_time_test import dump_observation_messages
 from core import console
 
 
@@ -270,8 +269,9 @@ class Pipeline:
         # 準 v4：背景判斷先讓出推論槽（推理後端單槽，背景請求在跑會讓本輪排隊）。
         # 恢復在 finalize_turn（輸出之後）。
         self.memory.bg_pause()
-        context = self.memory.get_context(user_input)
-        messages = self.persona.build_messages(context, user_input)
+        # 記憶區塊可能併進本輪 user 訊息（config 的 block_position）；寫回記憶仍用原始輸入
+        context, user_content = self.memory.build_turn(user_input)
+        messages = self.persona.build_messages(context, user_content)
         reply, printed = self._chat_streamed(messages)
 
         if reply:
@@ -301,55 +301,53 @@ class Pipeline:
 
     def handle_observation(self, event: Event) -> TurnResult:
         """
-        環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話，故 user 欄位
-        填 EVENT_CONFIG["user_placeholder"]（不偽裝成使用者發言），情境改由
-        EVENT_CONFIG["observation_role"] 指定的角色帶入。與 handle_turn() 相同，
-        此處只追加記憶。
+        環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話。情境怎麼送看
+        EVENT_CONFIG["observation_delivery"]（2026-10-23 起 "in_user"：情境就是這一輪
+        user 訊息的內容；舊做法 "separate_role"：一則 observation_role 訊息＋空 user）。
+        與 handle_turn() 相同，此處只追加記憶。
 
-        🔴 role 的現行值、待定狀態與兩套 role 定義交錯的問題，唯一記載在
-        config.EVENT_CONFIG["observation_role"]，此處不複述——改動前讀該處。
+        🔴 兩種送法的實測差異、為什麼不能改成尾端 system，唯一記載在
+        config.EVENT_CONFIG["observation_delivery"]，此處不複述——改動前讀該處。
 
-        情境訊息只存在於這次呼叫，不寫入 Working Memory。
-        ⚠️ 已知症狀：連續觸發時模型照抄前一組回應（v1 時另有「壓縮讀不到情境」，
-        壓縮已移除）。待 observation 類訓練資料就緒後重新評估——
-        模型學到「U 空時看情境說話」可能即可壓過複製傾向，故不預先修。
+        寫回 WM 的 user 內容是 placeholder，情境掛在 situation 欄位；之後幾輪看不看得到情境，
+        由 EVENT_CONFIG["situation_in_history"] 決定（方案 α，2026-10-24 起 "latest"），渲染在 manager._history()。
+        ⚠️ 照抄前一組回應：舊做法（"tool" 放尾端）在貪婪解碼、真實情境格式下，
+        連續觸發會回同一句（2026-10-23，《現況》22之84）；in_user 0 次。
 
-        🔴 情境訊息一律 append 在歷史「之後」、緊鄰生成點，順序不可前移。
-        prompt cache 比對的是最長共同前綴，變動內容排最尾端時分岔點之後只需重算
-        情境與空 user；前移則整段歷史被牽連重算，代價隨對話變長而增大。
-        同一原理見 core/memory/manager.py 的 get_context()。
+        ⚠️ separate_role 時情境訊息 append 在歷史「之後」、緊鄰生成點，不可前移
+        （prompt cache 比對最長共同前綴，前移會讓整段歷史重算）。in_user 時情境本來就在最後一則。
 
-        ⚠️ placeholder、suffix、role 皆由 config 帶入，不寫死在此。
+        ⚠️ placeholder、suffix、送法、role 皆由 config 帶入，不寫死在此。
 
-        🔴 **情境描述現在會進記憶（方案 β：掛欄位、不進訊息串）。**
+        🔴 **情境描述會進記憶（方案 β：掛欄位；之後幾輪顯不顯示看 situation_in_history）。**
         `add_turn(..., situation=description)` 把它掛在**該輪的 user 那一則**上
         ——那一則的 content 是空 placeholder，情境正是那個位置該有的東西。
         ⭐ **「user 空 ＋ 有 situation」是自洽的形狀；「user 空 ＋ 沒有 situation」
         一眼看得出是異常。** 先前情境只存在於這一次呼叫，事件層會留下一批
         「她突然說了一段話而沒有人知道為什麼」的紀錄。
-        ⚠️ **但模型看到的東西完全不變**：`get_context()` 會把非標準欄位投影掉
-        （見 core/memory/manager.py 的 get_context）——**那個投影是本做法成立的前提，
-        不是防禦性程式碼**。而「要不要把情境餵給模型」是另一個
-        決定（方案 α），待 observation 類訓練資料就緒後再議，本次不做。
+        ⚠️ 非標準欄位一律由 manager._to_message() 投影掉——**那個投影是本做法成立的前提，
+        不是防禦性程式碼**。situation 是唯一例外：依 situation_in_history 渲染成那則 user 的內容
+        （方案 α，2026-10-24 邪狼裁；實測見《現況》22之84 五），欄位本身仍不送。
 
         ⚠️ **observation 輪次不做記憶檢索，這是實際行為但尚未確認是否應該如此。**
-        傳給 get_context() 的是空 placeholder，該方法的 `if user_input:` 因此
+        傳給 build_turn() 的是空 placeholder，該方法的 `if user_input:` 因此
         跳過查詢，即使 description 本身是可用的檢索字串（開場帶入仍照常）。
         改動前先確認收益，不要當成 bug 直接「修好」。
         """
         description = event.payload
         placeholder = EVENT_CONFIG["user_placeholder"]
         self.memory.bg_pause()   # 同 handle_turn
-        suffix = EVENT_CONFIG["observation_prompt_suffix"]
-
-        context = self.memory.get_context(placeholder)
-        context.append({
-            "role": EVENT_CONFIG["observation_role"],
-            "content": f"[目前情境]\n{description}" + (f"\n{suffix}" if suffix else ""),
-        })
-        messages = self.persona.build_messages(context, placeholder)
-
-        dump_observation_messages(messages)  # 腳手架，見 core/short_time_test.py
+        if EVENT_CONFIG["observation_delivery"] == "in_user":
+            # 選項 D（2026-10-23）：情境就是這一輪 user 訊息的內容；檢索仍看空 placeholder（不檢索）
+            context, user_content = self.memory.build_turn(placeholder, situation=description)
+        elif EVENT_CONFIG["observation_delivery"] == "separate_role":
+            context, user_content = self.memory.build_turn(placeholder)
+            context.append({"role": EVENT_CONFIG["observation_role"],
+                            "content": self.memory.render_situation(description)})
+        else:
+            raise ValueError(f"EVENT_CONFIG['observation_delivery'] 只能是 in_user／separate_role："
+                             f"{EVENT_CONFIG['observation_delivery']!r}")
+        messages = self.persona.build_messages(context, user_content)
 
         reply, printed = self._chat_streamed(messages)
 

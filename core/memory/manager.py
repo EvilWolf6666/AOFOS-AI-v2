@@ -8,7 +8,7 @@
   ③ 讀取：本輪輸入 → 主題兩路檢索（向量＋關鍵字，各取配額、聯集、不重排）→ 注入主題句
   ④ 本場開頭幾輪另帶開場：「上次聊天是多久以前／今天聊過幾次／那次聊了幾輪」＋上一場的關鍵詞
      （事件層，程式算、不經 LLM）
-  ⑤ 全部包在一個 `⟦記憶⟧…⟦/記憶⟧` system 區塊裡，**追加在本輪輸入之前**；區塊第一行自帶說明
+  ⑤ 全部包在一個 `⟦記憶⟧…⟦/記憶⟧` 區塊裡，**放在本輪輸入之前**（2026-10-23 起併進 user 訊息開頭，見 build_turn）；區塊第一行自帶說明
      區塊內兩段標題：④ 開場＝「妳記得的事」、③ 主題＝「妳想起的事」（config 的 label_remember／label_recall；
      🔴 必須與人格 prompt〈記憶誠實原則〉的用詞逐字相同，人格規定只有這兩段裡的才算知道）
 Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪、一次丟 WM_DROP_ROUNDS 輪），超出的直接滑出——
@@ -35,7 +35,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-from config import MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE, WM_DROP_ROUNDS
+from config import EVENT_CONFIG, MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE, WM_DROP_ROUNDS
 from core.llm_client import BackgroundLLM
 from core.logger import setup_logger, timed
 from core.memory.db import connect
@@ -150,6 +150,17 @@ class MemoryManager:
         self._fixed_note = (cfg["fixed_note"].format(open=self._open, close=self._close,
                                                      remember=self._lab_rem, recall=self._lab_rec)
                             if cfg["note_position"] == "fixed" else None)
+        # 區塊放哪（config 的 block_position）：只影響 build_turn()；get_context() 永遠是尾端 system 的形狀
+        if cfg["block_position"] not in ("tail_system", "in_user"):
+            raise ValueError(f"MEMORY_CONFIG['block_position'] 只能是 tail_system／in_user：{cfg['block_position']!r}")
+        self._block_in_user = cfg["block_position"] == "in_user"
+        # 情境留不留在歷史（EVENT_CONFIG 的 situation_in_history，方案 α）
+        self._sit_hist = EVENT_CONFIG["situation_in_history"]
+        if self._sit_hist not in ("none", "latest", "all"):
+            raise ValueError(f"EVENT_CONFIG['situation_in_history'] 只能是 none／latest／all：{self._sit_hist!r}")
+        if self._sit_hist != "none" and EVENT_CONFIG["observation_delivery"] != "in_user":
+            raise ValueError("situation_in_history 不是 none 時，observation_delivery 必須是 in_user"
+                             "（歷史裡的樣子要和當時送出的一致）")
         self._opening_turns = cfg["opening_turns"]
         self._ep_cfg = {"gap": cfg["episode_gap_minutes"], "kw": cfg["episode_keywords"],
                         "reps": cfg["episode_reps"]}
@@ -289,7 +300,9 @@ class MemoryManager:
           🔴 **永遠不得拿來做分支**——新增一個 producer 時它會靜默走進 else。
         ⚠️ `situation` 只掛在 **user 那一則**：observation 輪次的 user content 是空
         placeholder，情境正是那個位置該有的東西。
-        🔴 **這些欄位不得進入送給模型的 messages**，剝除點在 get_context()。
+        🔴 **這些欄位不得原樣進入送給模型的 messages**，剝除點在 _to_message()。
+           唯一例外：`situation` 依 EVENT_CONFIG["situation_in_history"] 由 _assemble() 渲染成那則 user 的內容
+           （方案 α，2026-10-24）——渲染的是內容字串，欄位本身仍不送。
 
         `user_speaker`（準 v4）：user 那一則的 speaker_id。預設＝config 的使用者 ID；
         observation 輪次由 Pipeline 明傳 None（沒有人說話）——由呼叫端決定，本層不看 kind 分支。
@@ -409,8 +422,38 @@ class MemoryManager:
         """
         return {"role": turn["role"], "content": turn["content"]}
 
+    def render_situation(self, description: str) -> str:
+        """情境送給模型的樣子（observation 輪與歷史共用，唯一來源 EVENT_CONFIG）。"""
+        suffix = EVENT_CONFIG["observation_prompt_suffix"]
+        return EVENT_CONFIG["situation_template"].format(description=description) + (f"\n{suffix}" if suffix else "")
+
+    def build_turn(self, user_input: str = "", *, situation: str | None = None) -> tuple[list[dict], str]:
+        """正式路徑用：回傳 (context, 本輪 user 訊息的內容)，區塊位置依 config 的 block_position。
+
+        `situation`：observation 輪的情境描述。給了就把渲染後的情境當成本輪 user 內容，
+        而 user_input 仍是空 placeholder——檢索看的是 user_input，所以 observation 輪照舊不檢索。
+        situation_in_history="latest" 時，有新情境的這一輪，歷史裡舊的情境全部收回成空 user。
+
+        "tail_system"：等同 get_context()，user 內容就是輸入本身。
+        "in_user"：context 不含區塊；區塊併進 user 內容開頭（區塊＋換行＋輸入）。
+        ⚠️ Working Memory 存的仍是原始輸入（add_turn 收的是 user_input），區塊不進歷史——
+           下一輪快取斷在上一輪那則 user 訊息，重算量與 tail_system 相近（2026-10-23 實測）。
+        ⚠️ 為什麼不放尾端 system：見 config 的 block_position 註解（區塊夾在上一句回覆後面時，她會照講上一句）。
+        """
+        text = user_input if situation is None else self.render_situation(situation)
+        context, block = self._assemble(user_input, fresh_situation=situation is not None)
+        if block is None:
+            return context, text
+        if self._block_in_user:
+            return context, f"{block}\n{text}"
+        context.append({"role": "system", "content": block})
+        return context, text
+
     def get_context(self, user_input: str = "") -> list[dict]:
         """〔固定說明〕＋ Working Memory ＋ 一個 `⟦記憶⟧` 區塊（追加在尾端、本輪輸入之前）。
+
+        ⚠️ 2026-10-23 起正式路徑改走 build_turn()（區塊位置看 config 的 block_position）；
+           本方法固定回傳「區塊在尾端 system」的形狀，給自測與 memory_peek 檢查區塊內容用。
 
         ⚠️ 順序依「變動頻率由低到高」：記憶區塊每輪不同，放尾端才不會讓
            WM 落在 prompt cache 斷點之後（prompt cache 比對的是最長共同前綴）。
@@ -420,8 +463,31 @@ class MemoryManager:
         ⚠️ user_input 為空（observation 輪次的 placeholder）時不做檢索；
            但本場開頭的開場（狀態＋上一場關鍵詞）照帶（它不依賴輸入）。
         """
+        context, block = self._assemble(user_input)
+        if block is not None:
+            context.append({"role": "system", "content": block})
+        return context
+
+    def _history(self, fresh_situation: bool) -> list[dict]:
+        """WM 投影成 messages；observation 那則 user 依 situation_in_history 顯示情境。"""
+        shown = set()
+        sits = [i for i, t in enumerate(self.working_memory) if t["role"] == "user" and t.get("situation")]
+        if self._sit_hist == "all":
+            shown = set(sits)
+        elif self._sit_hist == "latest" and sits and not fresh_situation:
+            shown = {sits[-1]}
+        out = []
+        for i, t in enumerate(self.working_memory):
+            m = self._to_message(t)
+            if i in shown:
+                m["content"] = self.render_situation(t["situation"])
+            out.append(m)
+        return out
+
+    def _assemble(self, user_input: str, *, fresh_situation: bool = False) -> tuple[list[dict], str | None]:
+        """〔固定說明〕＋ WM，與區塊文字（沒有就是 None）。放哪由呼叫端決定。"""
         with timed("記憶組裝"):
-            context = [self._to_message(m) for m in self.working_memory]
+            context = self._history(fresh_situation)
             if self._fixed_note:
                 context.insert(0, {"role": "system", "content": self._fixed_note})
             sections = []
@@ -433,11 +499,11 @@ class MemoryManager:
                 top = self._topics(user_input)
                 if top:
                     sections.append(top)
+            block = None
             if sections:
                 head = [self._open] if self._fixed_note else [self._open, self._note]
-                context.append({"role": "system", "content": "\n".join(
-                    [*head, *sections, self._close])})
-        return context
+                block = "\n".join([*head, *sections, self._close])
+        return context, block
 
     def _opening(self) -> str:
         """開場：上次聊天是多久以前／今天聊過幾次／那次聊了幾輪＋上一場的關鍵詞（事件層）。

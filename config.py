@@ -76,7 +76,78 @@ LLAMA_SERVER = {
     #   靠它把彼此的前綴存在 RAM、切回來不必整段重算（2026-10-11 log 確認有在作用）。
     #   壓到 1024：系統 RAM 只有 8GB 級時，預設上限可能吃光記憶體而開始換頁。
     # ⚠️ 單一變數實驗也加在這裡；--cache-reuse 屬片段式重用，可能有偏差 ⇒ 施測時不得加（《現況》11之2 己）。
-    "extra_args": ["-cram", "1024"],
+    "extra_args": [],
+
+    # ── 其餘推理後端參數（2026-10-24 邪狼：先全部列上，哪怕還用不到）──
+    # 規則：值為 None／False ＝不送（用推理後端預設）；True ＝只送旗標本身；其他值 ＝「旗標 值」。
+    # ⚠️ 旗標名取自 llama.cpp 官方 server README（master，2026-10-24 查）；版本間會改名。
+    #    啟動腳本會先跑 --help，**啟用中的旗標在本機版本找不到就停下**，不會帶著錯參數開機。
+    # ⚠️ 取樣參數（溫度、top_k、懲罰…）不在這裡：一律由 LLM_CONFIG 隨每個請求送出（見下方說明）。
+    # 不列：模型下載（-hf 等）、多模態、router、Web UI／工具／MCP、embedding／rerank、SSL、內建預設模型。
+    "optional_args": {
+        # ── 記憶體與快取 ──
+        # RAM 提示詞快取上限（MiB，預設 8192）。對話與背景判斷輪流用同一推理槽，靠它存彼此前綴、
+        #   切回來不必整段重算（2026-10-11 log 確認有作用）；壓到 1024：系統 RAM 只有 8GB 級，預設可能吃光而換頁。
+        "-cram": 1024,   # 用短旗標：與 10-11 起實際跑的指令逐字相同（長名 --cache-ram）
+        "--cache-reuse": None,          # 片段式 KV 重用的最小區塊（預設 0＝關）。⚠️ 可能有偏差，施測時不得開（《現況》11之2 己）
+        "--no-cache-prompt": False,     # True＝關掉提示詞快取（只在量「不吃快取」的成本時用）
+        "--no-cache-idle-slots": False, # True＝新任務時不把閒置槽存進 RAM 快取（預設會存）
+        "--kv-unified": None,           # True＝多槽共用一塊 KV（槽數為 auto 時預設開）；parallel 實驗時再看
+        "--kv-unified-per-slot": None,  # 每槽 context 上限（N）；不設 -c 時總量＝parallel×N
+        "--ctx-checkpoints": None,      # 每槽最多幾個 context 檢查點（預設 32）
+        "--cache-type-k": None,         # KV 精度：f16（預設）／q8_0／q4_0…；省 VRAM 但可能影響輸出，要量
+        "--cache-type-v": None,
+        "--no-kv-offload": False,       # True＝KV 不放 GPU（省 VRAM、變慢）
+        "--slot-prompt-similarity": None,  # 請求要多像某槽的 prompt 才沿用該槽（預設 0.10）
+        "--slot-save-path": None,       # 存槽 KV 到磁碟的目錄（預設關）
+        "--context-shift": False,       # True＝超出 context 時丟掉舊 token 繼續生成（預設關）
+        "--keep": None,                 # context shift 時保留開頭幾個 token（-1＝全保留）
+
+        # ── 載入與裝置 ──
+        "--fit": None,                  # on／off：自動調整「沒設的參數」以塞進顯存（預設 on；我們有設的不受影響）
+        "--fit-target": None,           # 每張卡保留的顯存餘裕（MiB，預設 1024）
+        "--load-mode": None,            # auto（預設）／none／mmap…：載入方式
+        "--override-tensor": None,      # 指定張量放哪個裝置（例："ffn_.*=CPU"），VRAM 不夠時的細部調整
+        "--device": None,               # 指定用哪些裝置（--list-devices 查）
+        "--main-gpu": None,
+        "--tensor-split": None,         # 多卡時各卡比例
+        "--split-mode": None,           # none／layer／row／tensor
+        "--no-repack": False,
+        "--check-tensors": False,       # True＝載入時檢查權重有沒有壞值（慢）
+        "--lora": None,                 # 額外掛 LoRA adapter 檔（現行用合併好的 GGUF，不需要）
+        "--lora-init-without-apply": False,
+
+        # ── CPU 與執行緒 ──
+        "--threads-batch": None,        # 處理 prompt 的執行緒（預設跟 threads 相同）
+        "--threads-http": None,         # HTTP 處理執行緒
+        "--prio": None,                 # 行程優先序：-1 低／0 一般（預設）／1／2／3 即時
+        "--poll": None,                 # 等待工作時的輪詢程度 0～100（預設 50）
+        "--numa": None,
+
+        # ── 伺服器行為 ──
+        "--cont-batching": None,        # 連續批次（預設開）；False 不送、要關請用 extra_args 加 --no-cont-batching
+        "--timeout": None,              # 讀寫逾時秒數（預設 3600）
+        "--sse-ping-interval": None,    # 串流保活 ping 秒數（預設 30，-1 關）
+        "--sleep-idle-seconds": None,   # 閒置多久後休眠（預設 -1＝不休眠）
+        "--no-warmup": False,           # True＝開機不做空跑預熱（開機快一點、第一句慢一點）
+        "--props": False,               # True＝允許 POST /props 改全域設定
+        "--no-slots": False,            # True＝關掉 /slots 監看端點
+        "--api-key": None,              # 只聽本機，不需要
+        "--log-prompts-dir": None,      # 除錯用：把 prompt 寫成檔
+        "--log-verbosity": None,        # 0～4
+        "--log-timestamps": None,
+
+        # ── 模板與思考 ──
+        "--chat-template-file": None,   # 覆寫聊天模板。⚠️ 必須與訓練端一致，否則推理與訓練格式不同
+        "--chat-template-kwargs": None,
+        "--reasoning": None,            # on／off／auto：思考模式（Llama 3.1 沒有，維持預設）
+        "--no-prefill-assistant": False,
+
+        # ── 加速（推測解碼；需要另一顆小模型或 n-gram，未試）──
+        "--spec-type": None,            # 例：ngram-simple／draft-simple…
+        "--model-draft": None,          # 草稿模型路徑
+        "--gpu-layers-draft": None,
+    },
 }
 
 
@@ -177,6 +248,14 @@ MEMORY_CONFIG = {
     #            區塊只留標記與會變的那幾行。⚠️ 說明離區塊變遠，「記憶≠對方現在說的話」的效果要重測。
     # ⚠️ 兩組對照施測必須同值（它改變 prompt 結構）。
     "note_position": "fixed",
+    # 區塊放哪（2026-10-23 邪狼裁定改 "in_user"；改回 "tail_system" 即完全回到舊行為）：
+    #   "tail_system"＝一則 system 訊息，夾在上一句回覆與本輪輸入之間（舊做法）。
+    #   "in_user"    ＝併進本輪 user 訊息的開頭（區塊＋換行＋輸入）。
+    # 依據（2026-10-23 實測，記憶開場、llama-server，V3 人格）：tail_system 時區塊一出現在上一句回覆後面，
+    #    她就傾向把上一句原樣再講一次（日常取樣 4/5 場、固定 seed 3/3、貪婪解碼每場都有）；
+    #    in_user 與「放在對話開頭」各 0 次。in_user 的快取成本與舊做法相近，放開頭則開場消失時整段歷史重算。
+    # ⚠️ 兩組對照施測必須同值（它改變 prompt 結構）。
+    "block_position": "in_user",
     # {open}／{close}／{remember}／{recall} 由上面四個鍵代入（標記與標題只存一份）。⚠️ 用詞是 Claude 擬的草稿，可直接改；
     #    稱呼用「妳」跟人格 prompt 一致（舊 block_note 用「你」，inline 模式照舊不動）。
     "fixed_note": "對話裡用 {open} 和 {close} 包起來的段落，是妳的記憶，不是對方現在說的話："
@@ -227,10 +306,15 @@ MEMORY_CONFIG = {
     "judge_segment_close_s": 60,  # 最後一句距今超過這麼久，這段才算「講完了」可以判
     "judge_max_topics": 5,        # 一段最多建幾件事
     "judge_max_tokens": 220,      # 一次呼叫：第一行判斷＋最多 judge_max_topics 行主題句
-    # 建不建看機率：P(建)＝第一行是「建」或「不確定」的機率（logprobs 算，judge.py p_build）。
-    # 🟨 起始值，不是結論：待第 6 點（實跑累積 P(建) 樣本）校準。低於 0.5＝寧可多建。
-    #    2026-10-09 探測：「我是你哥也是你的創造者」在沒給判準的提示下 P(建)≈0.37。
-    "judge_build_threshold": 0.3,
+    # 建不建怎麼定（judge.py decide）：
+    #   None ＝看模型第一行的字（「建」「不確定」、看不懂都當建；只有「不建」不建）。P(建) 照算、照寫 log。
+    #   數值 ＝看機率：P(建)＝第一行是「建」或「不確定」的機率（logprobs 算，judge.py p_build）≥ 這個值就建；
+    #          模型答「不建」但過門檻 ⇒ 補一次呼叫要它寫主題句。低於 0.5＝寧可多建。
+    # 🔺 2026-10-24 邪狼裁：0.3 → None。依據：llama-server 16 段實測（貪婪，3 次），門檻只改變了
+    #    「外星人派來的」一段（P≈0.24～0.35，應不建）的結果，而且是改錯；沒有一段靠門檻救回漏建。
+    #    等實跑出現「答不建、其實該建」的樣本再考慮恢復數值（log 裡的 P(建) 就是校準資料）。
+    #    舊值 0.3 的由來：2026-09-30「寧可多建」；2026-10-09 探測「我是你哥也是你的創造者」P(建)≈0.37。
+    "judge_build_threshold": None,
     "judge_top_logprobs": 5,      # 每個 token 要幾個候選（算 P(建) 只看前兩個 token）
     # 背景一律貪婪（可重現）。🔴 取樣參數全部明帶、不靠後端預設值（沒帶的會套 server 預設或
     #    GGUF 內嵌值，換模型就靜默改變背景行為）。重複懲罰在貪婪下仍會改變選字（主題句要照抄人名）⇒ 1.0。
@@ -292,7 +376,31 @@ EVENT_CONFIG = {
     #    引導句，推理端結構須與訓練端一致。非空值會把情境框成「有人在跟妳講話」。
     "observation_prompt_suffix": "",
 
-    # 情境訊息的 role 名稱。🔴 待定，值暫時不動（《現況》第八章 P8）。
+    # 情境怎麼送（2026-10-23 邪狼裁 P8 改選項 D）：
+    #   "in_user"       ＝併進本輪 user 訊息（「[目前情境]\n描述」；有記憶區塊時接在區塊後面）。
+    #   "separate_role" ＝舊做法：一則 observation_role 訊息放在空 user 之前。改回即完全回到舊行為。
+    # 依據（2026-10-23 實測，《現況》22之84）：separate_role（"tool"）在模板裡被渲染成 ipython header、內容包成
+    #    JSON 字串（引號與 \n 都是字面字元），扣住情境最差，貪婪解碼連續觸發會回同一句；
+    #    in_user 扣住情境最好、照抄 0 次，邪狼說話的輪次不受影響。⛔ 不可改成尾端 system（24/24 照講上一句）。
+    # ⚠️ in_user 時 user_placeholder 不送給模型，只用在寫回 Working Memory 與「observation 輪不做檢索」。
+    # ⚠️ 已知限制：一對一才成立；聊天室恢復後 user 位置多人共用，到時重看（邪狼 2026-10-23）。
+    "observation_delivery": "in_user",
+
+    # 情境要不要留在之後幾輪的對話歷史裡（方案 α，2026-10-24 邪狼裁走 α、選 all；《現況》第八章 P20）：
+    #   "none"   ＝方案 β（舊做法）：情境只存在記憶 db 的欄位，之後幾輪模型看不到（歷史裡是空 user）。
+    #   "latest" ＝只留最近一則：更早的收回成空 user（落選）。
+    #   "all"    ＝每則 observation 都顯示情境。
+    # 依據（2026-10-24 瀏覽器直打，各 6 場日常＋1 場貪婪，《現況》22之84 六）：all 與 latest 說話輪插話都是 0/12、
+    #    「現在在幹嘛」都 6/6；all「剛剛在玩什麼」完整答出 4 vs 2；all 的 observation 輪只重算 38～53 token，
+    #    latest 因為要把舊那則收回、快取斷掉，要 101～161。時間感標記不加（她會開始講時間）。
+    # ⚠️ all 的代價：情境文字留在 WM（每則約 30～40 token，受 WM 輪數上限約束）；偶爾把舊情境當成現在（6 場 1 次）。
+    # ⚠️ 只在 observation_delivery="in_user" 時有效（歷史要和當時送出的一致），否則啟動時大聲失敗。
+    "situation_in_history": "all",
+
+    # 情境送給模型的樣子（observation 輪與歷史共用這一份）。
+    "situation_template": "[目前情境]\n{description}",
+
+    # 情境訊息的 role 名稱（只在 observation_delivery="separate_role" 時用）。
     #
     # ⚠️ 兩套 role 定義交錯，交集裡沒有兩邊都正確的選項：
     #      "ipython" 過不了 LM Studio 白名單（400，實測）
@@ -301,7 +409,8 @@ EVENT_CONFIG = {
     #    v3 曾有 tool → ipython 映射分支，v4 沒有——依 v3 時代的推理做決定會出錯。
     # ⚠️ 讀完《現況》第八章 P8 之前不要改這個值。
     # ⚠️ 上述兩條實測都是 LM Studio 時期的。換 llama-server 後（2026-10-11，tools/chat_probe）：
-    #    "tool" 不被拒（沒有 400、有正常回應）；v3 template 實際怎麼渲染 tool 這則仍未看（/apply-template 可查）。
+    #    "tool" 不被拒（沒有 400、有正常回應）。2026-10-23 /apply-template 實查：v3 模板把 "tool" 與 "ipython"
+    #    都渲染成 ipython header、內容包成 JSON 字串，兩者輸出逐字相同（選項 A 等於現值）。
     "observation_role": "tool",
 
     # 註："test_observations" 腳手架已移除（《現況》第八章 舊C4（已結案））。日後若再需要手動注入情境，
@@ -431,7 +540,6 @@ DIAGNOSTICS = {
     #    工具。舊目的「釐清異體字來源」已於 2026-08-06 達成且證偽。
     # ⚠️ 施測期間不要開——它是新變數，兩組對照必須同值。
     "log_opencc_changes": True,
-    "dump_observation_messages": True, # 印出 observation 輪次送出的完整 messages
 }
 
 
