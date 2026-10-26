@@ -12,8 +12,8 @@ from pathlib import Path
 
 import config
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = PROJECT_ROOT / "logs"
+# 專案根只取 config.PROJECT_ROOT（config.py 開頭：不得自己推算）。後端紀錄放 logs/backend/。
+LOG_DIR = Path(config.PROJECT_ROOT) / "logs" / "backend"
 
 
 def fail(msg: str) -> None:
@@ -119,7 +119,7 @@ def main() -> None:
     check_port_free(cfg)
     warn_if_lmstudio_running()
 
-    LOG_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = LOG_DIR / f"llama-server_{stamp}.log"
     cmd = build_cmd(cfg, log_file)

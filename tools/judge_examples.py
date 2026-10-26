@@ -4,7 +4,7 @@
 
 用法：python -m tools.judge_examples            （只跑下方 HELD_OUT：不在提示詞裡的句子）
       python -m tools.judge_examples --all      （另外把 prompts/memory_judge.txt【例子】也跑一遍）
-（llama-server 照平常開著（start\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/judge_examples_*.json。）
+（llama-server 照平常開著（start\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/runs/judge_examples/judge_examples_*.json。）
 
 ⭐ 分兩組是為了不「拿考古題考」（2026-10-09 第一次實測 19 句全在提示詞裡、分數偏樂觀）：
    HELD_OUT 刻意不放進提示詞；提示詞的例子只用 --all 順便看。
@@ -20,7 +20,7 @@ import os
 import sys
 import time
 
-from config import MEMORY_CONFIG
+from config import MEMORY_CONFIG, PROJECT_ROOT
 from core.llm_client import BackgroundLLM
 from core.memory.judge import build_messages, decide, load_prompt, norm_topic, p_build, split_answer
 
@@ -72,8 +72,10 @@ def main(argv: list[str]) -> int:
             print(f"      模型：{ln}{mark}")
         rows.append({"group": group, "dialog": dialog, "want": want_lines, "said": said, "p_build": p,
                      "decided": got, "ok": hit, "seconds": round(dt, 2), "raw": out, "logprobs": lps})
-    os.makedirs("logs", exist_ok=True)
-    path = os.path.join("logs", time.strftime("judge_examples_%Y%m%d_%H%M%S.json"))
+    # 原本是相對路徑 "logs"：從別的資料夾執行會悄悄寫到別處。改用 config.PROJECT_ROOT。
+    out_dir = os.path.join(PROJECT_ROOT, "logs", "runs", "judge_examples")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, time.strftime("judge_examples_%Y%m%d_%H%M%S.json"))
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"threshold": thr, "rows": rows}, f, ensure_ascii=False, indent=2, sort_keys=True)
     if any(r["p_build"] is None for r in rows):

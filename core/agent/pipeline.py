@@ -310,7 +310,7 @@ class Pipeline:
         config.EVENT_CONFIG["observation_delivery"]，此處不複述——改動前讀該處。
 
         寫回 WM 的 user 內容是 placeholder，情境掛在 situation 欄位；之後幾輪看不看得到情境，
-        由 EVENT_CONFIG["situation_in_history"] 決定（方案 α，2026-10-24 起 "latest"），渲染在 manager._history()。
+        由 EVENT_CONFIG["situation_in_history"] 決定（方案 α；現值與各選項的依據只記在該處註解，此處不抄值），渲染在 manager._history()。
         ⚠️ 照抄前一組回應：舊做法（"tool" 放尾端）在貪婪解碼、真實情境格式下，
         連續觸發會回同一句（2026-10-23，《現況》22之84）；in_user 0 次。
 

@@ -52,7 +52,7 @@ LLAMA_SERVER = {
     #   "aofos_v2" / "aofos_v1"                  ← LoRA v2 / v1
     #   "meta-llama-3.1-8b-instruct-abliterated" ← 對照組 A（無 LoRA 底模）
     #   "meta-llama-3.1-8b-instruct"             ← 對照組 B（官方版）
-    "alias": "aofos_v3",
+    "alias": "aofos_v3_plain",
     "host": "127.0.0.1",
     "port": 8080,
 
@@ -138,7 +138,10 @@ LLAMA_SERVER = {
         "--log-timestamps": None,
 
         # ── 模板與思考 ──
-        "--chat-template-file": None,   # 覆寫聊天模板。⚠️ 必須與訓練端一致，否則推理與訓練格式不同
+        # 覆寫聊天模板。⚠️ 必須與訓練端一致，否則推理與訓練格式不同。
+        #   🔺 2026-10-26 擂台：v3 的 GGUF 內建官方 3.1 模板（system 前自動加兩行日期，每題多 20 token），
+        #   與底模 mlabonne GGUF 內建的簡單 llama3 模板不同 ⇒ 統一用底模那份（prompts\llama3_plain.jinja）。
+        "--chat-template-file": r"C:\Users\EvilWolf\Desktop\AI-project\AOFOS-AI\AOFOS-LOKA\prompts\llama3_plain.jinja",
         "--chat-template-kwargs": None,
         "--reasoning": None,            # on／off／auto：思考模式（Llama 3.1 沒有，維持預設）
         "--no-prefill-assistant": False,

@@ -10,9 +10,12 @@ from datetime import datetime
 
 import colorlog
 
-from config import TIMING_CONFIG
+from config import PROJECT_ROOT, TIMING_CONFIG
 
-LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+# 日常紀錄（每日 log、timing-*.jsonl）的位置。專案根只取 config.PROJECT_ROOT（config.py 開頭：不得自己推算）。
+# 紀錄結構（2026-10-26 統一）：logs/daily（本檔）、logs/backend（start_llama_server）、logs/runs/<工具>（各工具每次執行）、logs/archive（舊紀錄）。
+# AOFOS_LOG_DIR：子行程用的覆寫——tools/eval_runner 每題開的行程設成該題資料夾，施測流量不混進日常 log。
+LOG_DIR = os.environ.get("AOFOS_LOG_DIR") or os.path.join(PROJECT_ROOT, "logs", "daily")
 LOG_LEVEL = logging.DEBUG
 
 # 所有計時輸出共用同一個 logger，方便單獨調整等級或關閉
@@ -50,7 +53,7 @@ def set_console_stream(stream) -> None:
 
 
 def setup_logger(name: str) -> logging.Logger:
-    """建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 logs/（純文字，每日一份）。"""
+    """建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 LOG_DIR（純文字，每日一份）。"""
     os.makedirs(LOG_DIR, exist_ok=True)
 
     logger = logging.getLogger(name)
@@ -104,7 +107,7 @@ def _get_timing_logger() -> logging.Logger:
 
 
 def _write_timing_jsonl(record: dict) -> None:
-    """把單筆計時寫進 logs/timing-YYYY-MM-DD.jsonl。失敗不得影響主流程。"""
+    """把單筆計時寫進 LOG_DIR/timing-YYYY-MM-DD.jsonl。失敗不得影響主流程。"""
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         path = os.path.join(
