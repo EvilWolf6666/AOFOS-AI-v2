@@ -482,11 +482,14 @@ TIMING_CONFIG = {
 }
 
 
-# 對話視窗只印這個等級以上的 log；完整 log 一律寫進 logs/daily/，由 start/log.bat 另開視窗即時顯示
-#   （啟動.bat 會一起開；過午夜換檔要重開 log 視窗）。改回 "DEBUG" ＝全部印在對話視窗。
+# 對話視窗與 log 視窗的分工。log 視窗＝start/log.bat，即時顯示 logs/daily/ 當天的檔，啟動.bat 會一起開。
+#   對話視窗：你打的字、她說的話、指令回覆、語音狀態（聆聽中／辨識結果），以及「你的操作沒成功」的一行提示。
+#   log 視窗：其餘全部——載入細節、計時、背景判斷、警告與錯誤的原因。
+# dialog_level：log 也要印在對話視窗時填等級（"WARNING"＝警告以上、"DEBUG"＝全部）；None＝不印。
 #   理由：串流中插進來的 log 會把回應切成好幾行、把正在打的字洗掉。
+#   只管 AOFOS 對話視窗；tools/ 的腳本沒有 log 視窗，它們的終端照舊全部印。
 LOG_CONFIG = {
-    "console_level": "WARNING",
+    "dialog_level": None,
 }
 
 

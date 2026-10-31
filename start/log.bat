@@ -1,6 +1,6 @@
 @echo off
 rem Live view of today's log (logs\daily\YYYY-MM-DD.log). The start script opens it; double-click to reopen.
-rem After midnight the log file changes: close and reopen this window.
+rem A running AOFOS keeps writing the file of the day it started, so this window keeps up past midnight.
 rem (ASCII only: cmd reads this file in the system code page before chcp runs)
 chcp 65001 >nul
 cd /d "%~dp0.."

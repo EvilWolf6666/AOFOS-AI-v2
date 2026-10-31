@@ -5,5 +5,7 @@ chcp 65001 >nul
 set PYTHONUTF8=1
 cd /d "%~dp0.."
 if exist "venv\Scripts\python.exe" (set "PY=venv\Scripts\python.exe") else (set "PY=python")
+rem Log goes to its own window; the dialog window shows only the conversation (config LOG_CONFIG).
+start "AOFOS log" "%~dp0log.bat"
 "%PY%" main.py
 if errorlevel 1 pause

@@ -42,6 +42,9 @@ _WAIT_SLICE_S = 0.5
 
 class Agent:
     def __init__(self) -> None:
+        # 第一件事：下面各模組初始化的 log 也照對話視窗／log 視窗的分工走（config LOG_CONFIG）
+        console.install_logging_bridge()
+
         # 必要模組：初始化失敗應直接報錯，不做 fallback
         self.llm = LLMClient()
         self.persona = Persona()
@@ -84,7 +87,7 @@ class Agent:
                 self._voice_input = VoiceInput(model_size="small", language="zh")
             except Exception as e:
                 logger.error(f"語音輸入啟動失敗：{type(e).__name__}: {e}")
-                console.emit(f"[語音模式啟動失敗，維持文字模式：{e}]\n")
+                console.emit("[語音模式啟動失敗，維持文字模式（原因見 log 視窗）]\n")
                 self.state.switch_to_text()
                 return self._text
             self._voice = voice_reader(self.state.event_queue, self._voice_input)
@@ -226,6 +229,9 @@ class Agent:
                 self._emit_reply(result.reply)
             logger.debug(f"奧狐回應：{result.reply[:50]}...")
             self.state.last_speech_at = time.monotonic()
+        else:
+            # 原因（呼叫失敗、空內容）已記在 log；對話視窗只說結果，不然你只看到提示又出現
+            console.emit("\n[她這輪沒有回應（原因見 log 視窗）]\n")
 
         # 收尾一律在輸出之後，即使本輪無回應也要呼叫（恢復背景判斷，同 _handle_observation）。
         self.pipeline.finalize_turn()
@@ -233,7 +239,6 @@ class Agent:
     # ── 主迴圈 ───────────────────────────────────────────────────────
 
     def run(self) -> None:
-        console.install_logging_bridge()
         console.on_window_close(self._shutdown_done)   # 按 X 關視窗＝Ctrl+C，一樣收尾
         try:
             self._banner()

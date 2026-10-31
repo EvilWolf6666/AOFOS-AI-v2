@@ -1,5 +1,5 @@
 @echo off
-rem Background memory judging while AOFOS is closed (llama-server must stay running).
+rem Background memory judging while AOFOS is closed (the inference backend must stay running).
 rem Exits by itself when done, or as soon as AOFOS starts. Window stays open on error.
 rem (ASCII only: cmd reads this file in the system code page before chcp runs)
 chcp 65001 >nul
