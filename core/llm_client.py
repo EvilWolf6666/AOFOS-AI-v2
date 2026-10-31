@@ -1,5 +1,5 @@
 # core/llm_client.py
-# 透過 OpenAI 相容 API 連接本機推理後端（2026-10-10 起為 llama-server；之前為 LM Studio）
+# 透過 OpenAI 相容 API 連接本機推理後端
 
 import time
 from typing import Callable, Optional
@@ -13,7 +13,7 @@ from core.text_utils import fix_traditional
 
 logger = setup_logger("LLMClient")
 
-# 非 OpenAI 標準的取樣參數（llama-server 原生支援），需透過 extra_body 送出；
+# 非 OpenAI 標準的取樣參數（後端原生支援），需透過 extra_body 送出；
 # 直接當具名參數傳會被 SDK 丟掉或報錯。
 _EXTRA_BODY_KEYS = ("top_k", "repeat_penalty", "min_p")
 
@@ -41,7 +41,7 @@ class LLMClient:
         self.seed = LLM_CONFIG.get("seed")
         self.max_tokens_by_purpose = LLM_CONFIG.get("max_tokens_by_purpose", {})
 
-        # 輸入側預算的分母。與 llama-server 啟動參數、verify_llamaserver 取自同一處，故不會有兩份真相。
+        # 輸入側預算的分母。與後端啟動參數、verify_llamaserver 取自同一處，故不會有兩份真相。
         # 為 None 時輸入側檢查自動停用，不報錯。
         self.context_length = LLAMA_SERVER.get("ctx")
 
@@ -67,7 +67,7 @@ class LLMClient:
             f"extra_body={self.extra_body}"
         )
         if self.seed is not None:
-            # llama-server 會照 seed 執行：固定 seed＝每次請求同一串亂數，日常對話會一再抽出同一句（2026-10-11 實測）
+            # 固定 seed＝每次請求同一串亂數，日常對話會一再抽出同一句
             logger.warning(f"seed 固定為 {self.seed}：日常對話容易反覆出現同一句；施測請用 /test on（貪婪解碼）")
 
         # 載入層參數記進 log，讓每份 log 都能還原當時環境（server 由 tools/start_llama_server.py 依同一份設定啟動）
@@ -84,9 +84,8 @@ class LLMClient:
         )
         self._warned_no_timings = False
 
-        # config.TEST_MODE 開啟時，啟動即套用評測推理參數（與 /test on 走同一條路徑）。
-        # 🔺 2026-09-28 修：先前只有記憶層讀 TEST_MODE，推理參數與串流仍是日常值，
-        #    而 /status 照樣顯示「測試模式：開啟」——不報錯的條件污染。
+        # config.TEST_MODE 開啟時，啟動即套用評測推理參數（與 /test on 走同一條路徑；
+        #    少了這步，記憶層是測試模式而推理參數仍是日常值，且不報錯）。
         if TEST_MODE:
             self.set_test_mode(True)
 
@@ -174,10 +173,8 @@ class LLMClient:
         # 不是 prompt 單獨對 context 的佔比——max_tokens 調大的用途，prompt 還沒到
         # 固定百分比就已無餘裕，用固定百分比會漏掉這種情形。
         #
-        # ⚠️ 溢出的後果不是報錯，是 llama.cpp 靜默截掉 context 的「中間」段，
-        #    也就是人格 prompt 之後的早期對話（Working Memory 前段）。整份記憶消失且無任何徵兆。
-        #    ⚠️ 上述是 LM Studio 時期的行為；llama-server 溢出時是報錯還是截斷未實測——
-        #       若是報錯，chat() 會回空字串並記 ERROR，反而是大聲的。
+        # ⚠️ 溢出時後端是報錯還是靜默截掉中間段，現行後端未實測：截斷會讓人格 prompt 之後的
+        #    早期對話消失且無徵兆；報錯則 chat() 回空字串並記 ERROR。
         #
         # ⚠️ usage.prompt_tokens 是否為「截斷前」的原始長度未經證實。若後端回報
         #    的是截斷後的值，下方 needed > context 那條永遠不會觸發，實際發揮
@@ -257,8 +254,8 @@ class LLMClient:
 
         存在理由：同一個方法若有多種用途，計時紀錄同名就分不出「這次呼叫是回應使用者，
         還是別的處理」——而那正是判斷某個呼叫是否落在延遲路徑上所需的資訊。
-        新增呼叫點時記得傳入對應 purpose。（🔺 2026-10-09：v1 的 `_compress` 已移除，
-        目前只有對話在用；背景判斷走下方 BackgroundLLM，計時標籤是「LLM背景[…]」。）
+        新增呼叫點時記得傳入對應 purpose。目前只有對話在用；背景判斷走下方 BackgroundLLM，
+        計時標籤是「LLM背景[…]」。
 
         on_delta：逐段輸出的回呼，收到的是**已完成繁簡處理**的片段。傳 None
         （預設）即走原本的一次性路徑，沒有觀眾的呼叫點不需要改。
@@ -434,10 +431,8 @@ class LLMClient:
 #    背景呼叫還在跑時使用者開口，對話那一次會排在它後面，**多等一次 5～15 秒**。
 #    ⇒ 取消若做不出來，準 v4 裁決是直接改上小模型（甲），見《現況》〈🔒 隔離區〉〈準 v4〉。
 #    ⚠️ 本類別能保證的是「我們這端立刻放手、連線關掉」；後端何時真的停是它的行為：
-#       · LM Studio：實測取消有讓出（2026-10-04，《現況》11之2 己）。
-#       · llama-server（2026-10-11，server log）：**正在做的那一批 prefill 不會被打斷**，做完那批才停。
-#         batch 2048 時取消後還要排隊 12～25 秒；batch 改 512 後 4.8 秒（config.LLAMA_SERVER["batch"]）。
-#         ⇒ 量法：tools/chat_probe 的「排隊」欄（TTFT 扣掉 server 自算的 prompt 時間）。
+#       現行後端正在做的那一批 prefill 不會被打斷，做完那批才停（批次大小見 config.LLAMA_SERVER["batch"]）。
+#       量法：tools/chat_probe 的「排隊」欄（TTFT 扣掉後端自算的 prompt 時間）。
 
 class BackgroundCancelled(Exception):
     """背景呼叫被取消（使用者開口）。不是錯誤，呼叫端照常跳過本次工作即可。"""
@@ -450,7 +445,7 @@ class BackgroundLLM:
       ① 請求已送出、後端還在 prefill（連回應標頭都還沒回）
       ② 已在串流
     SDK（httpx）在 ① 階段沒有從別的執行緒中斷的手段（關 client 不會打斷正在等的讀取，
-    2026-09-30 用假伺服器實測：取消後仍卡到標頭回來才放手，prefill 3 秒就等 2.5 秒）。
+    假伺服器實測：取消後仍卡到標頭回來才放手）。
     自己持有 socket ⇒ `shutdown()` 會讓另一條執行緒卡住的 recv 立刻返回 ⇒ 兩個階段都是毫秒級。
     ⚠️ 代價：SSE 解析自己做（只需 `data:` 行與 `[DONE]`，格式固定）。
     """
@@ -469,7 +464,7 @@ class BackgroundLLM:
         self._cancel = threading.Event()
         # ⚠️ 存 socket 本身、不存 conn：伺服器回 Connection: close 時，http.client 在
         #    getresponse() 之後就把 conn.sock 設成 None（socket 轉交給 response），
-        #    只存 conn 的話串流階段 cancel() 會找不到 socket（2026-09-30 自測抓到）。
+        #    只存 conn 的話串流階段 cancel() 會找不到 socket。
         self._sock = None
 
     # ── 取消 ──────────────────────────────────────────────────
@@ -513,10 +508,9 @@ class BackgroundLLM:
         """同 call()，另回傳每個輸出 token 的 logprobs（OpenAI 格式的 `logprobs.content` 逐項）。
 
         top_logprobs＝0 時不要求 logprobs，回傳空清單。
-        ⚠️ 2026-10-09 LM Studio 實測（非串流、純文字）有回 `top_logprobs`；2026-10-11 llama-server
-           串流下逐塊附上（tools/judge_examples 讀得到 P(建)）。
-           ⇒ 拿不到時仍回空清單，由呼叫端大聲處理（judge.py 會記 WARNING 並退回看文字）。
-        ⚠️ 用了 json_schema 時回的是格式限制「之前」的分布，讀不出選項機率（同日實測），兩者不要合用。
+        現行後端在串流下逐塊附上（tools/judge_examples 讀得到 P(建)）。
+        ⚠️ 拿不到時仍回空清單，由呼叫端大聲處理（judge.py 會記 WARNING 並退回看文字）。
+        ⚠️ 用了 json_schema 時回的是格式限制「之前」的分布，讀不出選項機率，兩者不要合用。
         """
         import http.client
         import json as _json

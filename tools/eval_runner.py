@@ -1,7 +1,5 @@
 """eval_runner：照《題本》自動施測一組模型，輸出成《施測記錄表》的組別區塊（blind_eval.py 可直接吃）。
 
-版本：2026-10-26（初版，Claude 撰；邪狼審過才放進 tools/）
-
 為什麼有這支
   擂台一輪要測好幾版 × 20 題、每題重開。手動貼輸入、複製回答，漏貼或貼錯不會有任何警告。
 
@@ -28,6 +26,8 @@ prompt_tokens 比對
   python -m tools.eval_runner run                        題本預設 evaluation/題本_v2.md、組別預設＝config 的 alias
   python -m tools.eval_runner run --batch 擂台第二輪       同一批測試放同一個資料夾（預設＝當天日期）
   python -m tools.eval_runner run --group 甲 --only D1,B1  只跑指定題（驗證用）；兩個參數都可另給
+  python -m tools.eval_runner run --no-persona            不送人格 system（《現況》第八章 C22 補測；組別與資料夾自動加 _nopersona）
+  start\\自動施測_無人格.bat                                同上一行（雙擊用）
   start\\自動施測.bat                                       同第一行（雙擊用）
   python -m tools.eval_runner compare <results.json> <results.json> ...                       比對第一輪 prompt_tokens
   python -m tools.eval_runner combine <輸出記錄表.md> <組別.md> <組別.md> ...                  把各組區塊併成一份記錄表
@@ -158,7 +158,9 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
     with open(turns_file, encoding="utf-8") as f:
         turns = json.load(f)
     work = os.path.dirname(out_file)
-    rec: dict = {"qid": qid, "turns": [], "error": None}
+    # --no-persona 由父行程以環境變數傳入；結果記下實際狀態，父行程逐題核對。
+    no_persona = os.environ.get("AOFOS_EVAL_NO_PERSONA") == "1"
+    rec: dict = {"qid": qid, "turns": [], "error": None, "persona": not no_persona}
     memory = None
     try:
         llm = LLMClient()
@@ -182,6 +184,11 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
 
         def build(history, user_input):
             msgs = orig_build(history, user_input)
+            if no_persona:
+                # 只拿掉開頭的人格 system；開頭不是它就報錯（Persona.build_messages 形狀變了）。
+                if not (msgs and msgs[0].get("role") == "system" and msgs[0].get("content") == persona.system_prompt):
+                    raise RuntimeError("--no-persona：送出的第一則不是人格 system，Persona.build_messages 形狀可能改了")
+                msgs = msgs[1:]
             sent.append(msgs)
             return msgs
 
@@ -256,7 +263,7 @@ def cmd_run(args) -> int:
     if args.questions is None:
         args.questions = os.path.join(config.PROJECT_ROOT, "evaluation", "題本_v2.md")
     if args.group is None:
-        args.group = cfg["alias"]
+        args.group = cfg["alias"] + ("_nopersona" if args.no_persona else "")
     qs = parse_questions(args.questions)
     order = ORDER
     if args.only:
@@ -276,9 +283,11 @@ def cmd_run(args) -> int:
     batch = args.batch or datetime.now().strftime("%Y-%m-%d")
     if any(c in batch for c in '\\/:*?"<>|'):
         fail(f"--batch 不能含路徑字元：{batch}")
-    root = os.path.join(config.PROJECT_ROOT, "logs", "runs", "eval", batch, f"eval_{cfg['alias']}_{stamp}")
+    tag = cfg["alias"] + ("_nopersona" if args.no_persona else "")
+    root = os.path.join(config.PROJECT_ROOT, "logs", "runs", "eval", batch, f"eval_{tag}_{stamp}")
     os.makedirs(root, exist_ok=True)
     print(f"模型 {cfg['alias']}｜後端 {backend['build_info']}｜LoRA {backend['lora_adapters']}")
+    print("人格 system：" + ("❗ 不送（--no-persona）" if args.no_persona else "照常送出"))
     print(f"結果資料夾：{root}\n")
 
     results: dict[str, dict] = {}
@@ -291,7 +300,8 @@ def cmd_run(args) -> int:
             with open(tf, "w", encoding="utf-8") as f:
                 json.dump(qs[q], f, ensure_ascii=False)
             print(f"[{i}/{len(order)}] {q}（{len(qs[q])} 輪）…", flush=True)
-            env = dict(os.environ, PYTHONUTF8="1", AOFOS_LOG_DIR=qdir)
+            env = dict(os.environ, PYTHONUTF8="1", AOFOS_LOG_DIR=qdir,
+                       AOFOS_EVAL_NO_PERSONA="1" if args.no_persona else "0")
             try:
                 p = subprocess.run([sys.executable, "-m", "tools.eval_runner", "_one", q, tf, of],
                                    cwd=config.PROJECT_ROOT, env=env, timeout=CHILD_TIMEOUT_S,
@@ -309,6 +319,9 @@ def cmd_run(args) -> int:
             if r.get("error"):
                 failed.append(f"{q}：{r['error']}（看 {qdir}\\child.log）")
                 break
+            if r.get("persona") is not (not args.no_persona):
+                failed.append(f"{q}：子行程的人格狀態與 --no-persona 不符（{r.get('persona')}）")
+                break
             empties = [n for n, t in enumerate(r["turns"], 1) if not t["reply"]]
             if empties:
                 print(f"   ⚠️ 第 {empties} 輪空回覆（照原樣記，不補字）")
@@ -320,7 +333,7 @@ def cmd_run(args) -> int:
 
     lora = cfg.get("optional_args", {}).get("--lora")
     meta = {
-        "模型": f"{cfg['alias']}（{os.path.basename(cfg['model'])}）",
+        "模型": f"{cfg['alias']}（{os.path.basename(cfg['model'])}）" + ("｜不送人格 system" if args.no_persona else ""),
         "量化": _quant(cfg["model"]),
         "LoRA": os.path.basename(lora) if lora else "無（模型檔本身；合併版或底模）",
         "推理後端": f"llama-server {backend['build_info']}",
@@ -330,7 +343,7 @@ def cmd_run(args) -> int:
         "施測日期": datetime.now().strftime("%Y-%m-%d"),
     }
     with open(os.path.join(root, "results.json"), "w", encoding="utf-8") as f:
-        json.dump({"group": args.group, "meta": meta, "backend": backend, "order": order,
+        json.dump({"group": args.group, "persona": not args.no_persona, "meta": meta, "backend": backend, "order": order,
                    "results": results, "failed": failed}, f, ensure_ascii=False, indent=2)
 
     if failed:
@@ -401,6 +414,7 @@ def main() -> int:
     r.add_argument("--group", default=None, help="記錄表的組別名稱（預設＝config 的 alias）")
     r.add_argument("--batch", default=None, help="批次資料夾名稱（logs/runs/eval/ 底下；預設＝當天日期）")
     r.add_argument("--only", default=None, help="只跑指定題號，逗號分隔（驗證用，不產生記錄表區塊）")
+    r.add_argument("--no-persona", action="store_true", help="不送人格 system（C22 補測）；組別與資料夾自動加 _nopersona")
     c = sub.add_parser("compare")
     c.add_argument("results", nargs="+", help="各組的 results.json")
     m = sub.add_parser("combine")

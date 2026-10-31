@@ -16,9 +16,8 @@ from dataclasses import dataclass
 
 # kind 決定注入方式，兩者不可互換：
 #   "utterance"   有人在說話。payload 進 user 欄位，走 handle_turn()
-#   "observation" 環境狀態變化，沒有人在說話。payload 進 [目前情境] system 區塊，
-#                 user 欄位留空（config.EVENT_CONFIG["user_placeholder"]），
-#                 走 handle_observation()
+#   "observation" 環境狀態變化，沒有人在說話。payload 是情境描述，怎麼送看
+#                 config.EVENT_CONFIG["observation_delivery"]；走 handle_observation()
 #
 # 把遊戲事件當 utterance 送出，模型會把「玩家血量剩 10%」誤認為邪狼說的話。
 UTTERANCE = "utterance"
@@ -29,7 +28,7 @@ OBSERVATION = "observation"
 class Event:
     """
     source: 產生者標籤，供 log 與分流輔助判斷
-            （"user_text" / "user_voice" / "test" / 未來的 "screen" / "chat"）
+            （"user_text" / "user_voice" / "window" / 未來的 "screen" / "chat"）
     kind:   UTTERANCE 或 OBSERVATION
     payload: utterance 為輸入原文；observation 為情境描述文字
     """

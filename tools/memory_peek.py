@@ -7,10 +7,9 @@
 
 ⭐ 以測試模式開啟：日常區唯讀、寫入只進測試區，結束時測試區整包丟棄。
    向量關閉（省 18 s 載入）⇒ 下面的 messages 只含開場與「關鍵字那一路」命中的主題。
-   主題表另外直接列出（唯讀）。🔺 2026-10-09 準 v3 撈原句淘汰後，messages 不再有原句；
-   `v4_enabled` 關閉時也不撈主題，只會看到開場（第一場沒有上一場時連開場都沒有）——正常。
-⭐ 日常區以唯讀開啟（mode=ro）：檔案不存在時只印提示，不會替它建出空檔（2026-10-24 修：
-   原本 sqlite3.connect 會先建空檔、再因沒有 transcript 表而拋錯）。
+   主題表另外直接列出（唯讀）。`v4_enabled` 關閉時不撈主題，只會看到開場
+   （第一場沒有上一場時連開場都沒有）——正常。
+⭐ 日常區以唯讀開啟（mode=ro）：檔案不存在時只印提示，不會替它建出空檔。
 ⭐ 印的是正式路徑實際送出的形狀（build_turn()：記憶區塊依 block_position 可能在最後一則 user 裡）。
 """
 import os
@@ -71,9 +70,8 @@ def _print_messages(query: str) -> None:
         for x in ctx + [{"role": "user", "content": user_content}]:
             print(f'--- role={x["role"]} ---\n{x["content"]}')
     finally:
-        # 🔺 只呼叫 compress_on_exit()：測試模式下它會自己丟棄測試區、不碰日常區。
-        #    原本先 set_test_mode(False) 再 compress_on_exit()，會把日常區以可寫開啟
-        #    ⇒ 檢索索引 catch-up ＋ 事件層整張重建，與檔頭「不寫入日常區」矛盾。
+        # 只呼叫 compress_on_exit()：測試模式下它會自己丟棄測試區、不碰日常區。
+        #    ⚠️ 先 set_test_mode(False) 會把日常區以可寫開啟並重建事件層，違反「不寫入日常區」。
         m.compress_on_exit()
 
 

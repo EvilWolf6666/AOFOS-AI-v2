@@ -5,30 +5,21 @@
 一個檔、多張表：`pre_write`（預寫區佇列）／`transcript`（原文存放區，永久）／
 `topic`／`topic_vec`／`topic_fts`（準 v4 主題與其索引，topics.py／topic_index.py 持有）／
 `episode`（事件層，衍生）／`meta`（`next_serial`、`landed_upto`＝N、`judged_upto`）。
-🔺 2026-10-09：v1 壓縮的進度 `compressed_upto`（M）已移除；舊 DB 的 meta 裡那一列留著、沒人讀。
+舊 DB 的 meta 可能殘留 `compressed_upto` 一列（v1），沒人讀。
 
 🔴 **為什麼是同一個 DB 檔**：讓「原文寫進 transcript ＋ 推進 N」落在**同一個交易**裡
    ——分成兩個檔就沒有交易保證，那個「原文寫成功但 N 沒更新」的窗口會回來。
    `serial` 發號同理：取號與寫入同一交易 ⇒ **不會有「號發了但紀錄沒寫」。**
 
-🔴 **為什麼不再是 JSONL**（2026-09-13 實測後重選，舊做法見《歸檔》）：
-   · 前台 append（同等耐久度）在 Windows 上 **SQLite 0.677 ms vs JSONL 1.210 ms**
-     ——⭐ 機制是「JSONL 每批都要開一次檔，而 Windows 開檔很貴」，SQLite 連線常駐。
-   · 依 serial 查一筆（5 萬筆）：**0.007 ms vs 221 ms**；啟動取 MAX(serial)
-     **0.085 ms vs 建索引 294.7 ms**。
-   · ⭐ **而最大的收穫不是速度，是消失的東西**：交易保證讓「寫到一半的紀錄」
-     這個狀態不存在 ⇒ JSONL 版要自己做的「檔尾換行檢查」「解析失敗檢查」
-     「啟動截尾」**全部不需要**。
-   ⚠️ **上列數字只描述那台 2019 筆電 ＋ 本架構**，換設備要重量（兩區都要，
-     不只 append 那區）——已掛進《現況》的換硬體重看清單。
+🔴 **為什麼是 SQLite 不是 JSONL**（量測與舊做法見《歸檔》）：交易保證讓「寫到一半的紀錄」
+   這個狀態不存在 ⇒ 不必自己做檔尾換行檢查、解析失敗檢查、啟動截尾。
 
 ⚠️ **每個執行緒各自 connect()。** Python 的 sqlite3 連線預設不可跨執行緒共用
    （check_same_thread）。producer（主線程）與 consumer（背景）各開各的，
    指向同一個檔——**這正是 WAL 模式設計來支援的形狀**（一個 writer ＋ 多 reader，
    寫入由鎖序列化，不會交錯寫壞）。
 
-🔴 **「單一寫入者」那條舊規則的理由在這裡不成立了。** 它存在是因為**檔案層級
-   沒有原子性保證**；SQLite 有。⇒ 不再需要「清除必須由 producer 執行」那條繞路。
+多個執行緒各自寫入是安全的：SQLite 交易有原子性，不需要「只由單一寫入者清除」這類繞路。
 """
 
 from __future__ import annotations
@@ -75,9 +66,9 @@ CREATE TABLE IF NOT EXISTS transcript (
     retired   INTEGER NOT NULL DEFAULT 0,  -- 可標失效；⚠️ 永不刪除列
     speaker_id TEXT                        -- 準 v4：這一句是誰說的；NULL＝未知（欄位加入前的舊列）
 );
--- 🔺 2026-09-30：`participants` 改為每句一個 `speaker_id`（《現況》11之2 丁；舊裁決《歸檔》D0030）。
+-- speaker_id 每句一個（《現況》11之2 丁；舊做法 participants 見《歸檔》D0030）。
 --    「誰在場」由同一段對話的 speaker_id 收集推出，不另存（兩份會對不上）。
---    舊列不回填：當時只有邪狼在用，但「猜的值」與「記錄到的值」長得一樣，寧可留 NULL。
+--    舊列不回填：「猜的值」與「記錄到的值」長得一樣，寧可留 NULL。
 
 -- 單一鍵值表：next_serial（下一個可用號）／landed_upto（N）／judged_upto（topics.py 建）
 CREATE TABLE IF NOT EXISTS meta (
@@ -94,8 +85,7 @@ def connect(path: str) -> sqlite3.Connection:
 
     ⚠️ `synchronous=FULL` 是刻意的：WAL 預設的 NORMAL 在斷電時可能丟掉最後幾個
     交易，而預寫區的整個價值就是「裁切 Working Memory 之前原文已經落地」。
-    實測差距（那台筆電）0.677 ms vs 0.098 ms——**0.58 ms 換掉一個資料遺失路徑，
-    而前台的 TTFT 是數千毫秒。**
+    代價是每次寫入不到 1 ms，相對 TTFT 可忽略。
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     # 🔴 **isolation_level=None（autocommit）是必要的**，不是風格選擇：
@@ -122,7 +112,7 @@ def _migrate(cx: sqlite3.Connection) -> None:
     """舊檔補欄位。`CREATE TABLE IF NOT EXISTS` 對已存在的表**什麼都不做**，
     所以新加的欄位只會出現在新檔——舊檔要靠這裡補，否則寫入時才炸。
 
-    🆕 2026-09-25 `transcript.clean`（準 v3 最小記憶切片，標籤走 C）：
+    `transcript.clean`：
     `ALTER TABLE ADD COLUMN` 在 SQLite 是零遷移成本（見上方 SCHEMA 的註解），
     補完後把既有列回填成 `clean = content`——剝除規則未定前兩欄本來就相同，
     ⚠️ 不回填的話舊列的 clean 是 NULL，而「NULL」與「剝完是空字串」是兩件事。
@@ -135,7 +125,7 @@ def _migrate(cx: sqlite3.Connection) -> None:
                 "UPDATE transcript SET clean = content WHERE clean IS NULL").rowcount
         logger.warning(f"原文存放區補上 clean 欄位（一次性），回填 {n} 列")
 
-    # 🆕 2026-09-30 準 v4：speaker_id（預寫區與原文存放區都要有，預寫區是原樣轉寫的上游）。
+    # speaker_id（預寫區與原文存放區都要有，預寫區是原樣轉寫的上游）。
     # ⚠️ 一次性結構改動（《現況》〈📐 規則〉二「架構上只做一次的事」）：動手前先備份 data/memory.db。
     for table in ("pre_write", "transcript"):
         cols = {r["name"] for r in cx.execute(f"PRAGMA table_info({table})")}
@@ -155,10 +145,8 @@ def write_txn(cx: sqlite3.Connection):
     read-modify-write **不是原子的**：兩個執行緒同時讀到同一個號，
     然後一個寫成功、另一個炸 `UNIQUE constraint failed`。
 
-    ⚠️ **這個缺陷只在併發下發作，單執行緒測試全綠** ——本專案的自測實際撞到過
-    （兩條執行緒各寫 40 筆，結果只進去 47 筆）。⭐ **它也直接反駁了
-    「SQLite 的鎖會序列化寫入所以不用管」這個說法**：它序列化的是**寫**，
-    而 DEFERRED 交易的**讀**不排他。
+    ⚠️ **這個缺陷只在併發下發作，單執行緒測試全綠**（自測撞到過：兩條執行緒各寫 40 筆，
+    只進去 47 筆）。SQLite 序列化的是**寫**，DEFERRED 交易的**讀**不排他。
 
     ⚠️ **交易只能包住 DB 操作**——LLM 呼叫、網路、睡眠一律在外面（見本檔末）。
     """
@@ -191,14 +179,13 @@ def set_meta(cx: sqlite3.Connection, key: str, value: int) -> None:
 #
 # **交易只能包住 DB 操作。LLM 呼叫、網路、睡眠一律在交易之外。**
 #
-# ⚠️ 違反的症狀很具體：背景判斷的 LLM 呼叫每段 5～25 秒（v1 的壓縮曾是 21～60 秒），
+# ⚠️ 違反的症狀很具體：背景判斷的 LLM 呼叫每段 5～25 秒，
 #    若它被包在交易裡，producer 每一次 append 都要等那把鎖——**而前台會直接感覺到**。
 #
 # ⭐ **本套件不靠註解維持這條，靠結構**：
 #    `pre_write`、`transcript`、`topics` 的公開方法**一律自己開自己關交易**（用 write_txn），
 #    不對外回傳任何可持有的 transaction 物件或 cursor。
 #    ⇒ **呼叫端在結構上拿不到「把 LLM 包進交易」的機會。**
-#    📌 拿不到的東西不會被誤用；靠註解的東西要人記得。
 #
 # ⚠️ 因此 consumer 的迴圈固定切三段（現行實例：core/memory/judge.py 的背景判斷）：
 #      ① 開交易讀待處理 → 關交易
@@ -212,7 +199,7 @@ def set_meta(cx: sqlite3.Connection, key: str, value: int) -> None:
 #
 # 🔴 **每一項都用一個已知該被抓到的樣本撞一次**（《現況》20之3）——
 #    只印「通過」只證明射程內沒問題，沒證明射程夠寬。
-# ⚠️ **一律在暫存目錄造假 DB，不碰任何真檔**（《現況》20之0「副本數才是變因」）。
+# ⚠️ **一律在暫存目錄造假 DB，不碰任何真檔**。
 # 📌 本自測涵蓋整個儲存層（pre_write ＋ transcript ＋ meta），因為它們是同一個 DB。
 
 def _selftest() -> int:  # noqa: C901

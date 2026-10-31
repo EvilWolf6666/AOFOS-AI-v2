@@ -13,7 +13,7 @@ import colorlog
 from config import PROJECT_ROOT, TIMING_CONFIG
 
 # 日常紀錄（每日 log、timing-*.jsonl）的位置。專案根只取 config.PROJECT_ROOT（config.py 開頭：不得自己推算）。
-# 紀錄結構（2026-10-26 統一）：logs/daily（本檔）、logs/backend（start_llama_server）、logs/runs/<工具>（各工具每次執行）、logs/archive（舊紀錄）。
+# 紀錄結構：logs/daily（本檔）、logs/backend（start_llama_server）、logs/runs/<工具>（各工具每次執行）、logs/archive_lmstudio（舊紀錄）。
 # AOFOS_LOG_DIR：子行程用的覆寫——tools/eval_runner 每題開的行程設成該題資料夾，施測流量不混進日常 log。
 LOG_DIR = os.environ.get("AOFOS_LOG_DIR") or os.path.join(PROJECT_ROOT, "logs", "daily")
 LOG_LEVEL = logging.DEBUG
@@ -125,8 +125,8 @@ def timed(stage: str, **extra):
     """
     量測一段區塊的耗時。
 
-        with timed("RAG查詢"):
-            results = rag.search(query)
+        with timed("記憶組裝"):
+            context = build(...)
 
         with timed("LLM呼叫", model=self.model):
             response = client.chat.completions.create(...)
