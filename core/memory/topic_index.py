@@ -3,15 +3,15 @@
 準 v4 讀取端：主題句的向量（`topic_vec` 表）與檢索。
 
 ⭐ 衍生物：`topic_vec` 完全由 `topic.text` 算出，換 embedding 模型時舊向量自動不採用、背景重算。
-⭐ FAISS 保留（邪狼 2026-09-30 裁定）：IndexFlatIP＝逐筆內積，結果與 numpy 逐筆算完全相同
+⭐ FAISS：IndexFlatIP＝逐筆內積，結果與 numpy 逐筆算完全相同
    （確定性不變），只是量大時快。🔴 沒裝 faiss 時退回 numpy，**記一次 WARNING**——
    結果一樣、只差速度，所以不擋啟動。
 
 ⚠️ 執行緒分工同 embed.py：寫 `topic_vec` 在背景（判斷執行緒建完主題順手算）；
    主執行緒只讀、只編碼查詢句。
 
-🆕 2026-10-09 關鍵字那一路（邪狼裁兩路並用，《現況》〈🔒 隔離區〉準 v4 檢索列）：
-   `topic_fts`（FTS5，rowid＝topic.id）＝主題句的 bigram，**與準 v3 撈原句同一個切法**
+關鍵字那一路（《現況》〈🔒 隔離區〉準 v4 檢索列）：
+   `topic_fts`（FTS5，rowid＝topic.id）＝主題句的 bigram
    （core/memory/bigram.py 的 `bigrams()`／`_match_expr()`，寫入與查詢必須同一個函式）。
    同樣是衍生物、可重建；由判斷執行緒建完主題順手補（`fill_fts`）。
    合併方式不在本檔：兩路各自回名單，由 manager 依各路配額取聯集（不重排）。

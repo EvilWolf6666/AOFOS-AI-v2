@@ -2,25 +2,25 @@
 """
 準 v4 寫入端的背景判斷（乙：同一顆對話模型，閒置時跑、一開口就取消）。
 
-一段對話 → **一次呼叫**（🔺 2026-10-09 改，舊做法 json_schema 兩段式見《歸檔》D0033）：
+一段對話 → **一次呼叫**（舊做法 json_schema 兩段式見《歸檔》D0033）：
   第一行「建／不建／不確定」，要建就接著一行一件「類型｜屬性鍵｜主題句」，**JSON 由 Python 組**。
   · 建不建由 `decide()` 定，看 config `judge_build_threshold`：
-      None（🔺 2026-10-24 起的預設）＝看第一行的字：只有「不建」不建，「不確定」與看不懂都當建。
+      None＝看第一行的字：只有「不建」不建，「不確定」與看不懂都當建。
       數值＝看機率：由第一行的 logprobs 算 P(建)（「不確定」那條路算進建，寧可多建——
       主題是可重建的索引，漏建才救不回來）≥ 門檻就建；模型答「不建」但過門檻 ⇒ 它沒寫主題句 ⇒ 補一次呼叫要它寫。
   · P(建) 兩種模式都照算、照寫 log（之後要不要恢復門檻，靠這些樣本校準）。
   · 拿不到 logprobs ⇒ WARNING（只記一次）＋計數，看文字（同 None）。
   · 不用 json_schema：後端在格式限制下回的是限制「之前」的分布，讀不出選項機率，
-    而且同一段結論會變（2026-10-09 LM Studio 時期實測，《現況》11之2 己）。
+    而且同一段結論會變（實測，《現況》11之2 己）。
   ⭐ prompt 順序＝「規則在前（system，固定不變）、對話片段在後」：規則是每段共用的前綴，
-    連續判好幾段時吃得到 prompt cache。規則、類型、例子都在 prompts/memory_judge.txt（邪狼直接排版）。
+    連續判好幾段時吃得到 prompt cache。規則、類型、例子都在 prompts/memory_judge.txt。
 
 取消（乙能不能成立的關鍵）：
   · Pipeline 在輪次**開始**呼叫 pause() ⇒ BackgroundLLM.cancel() 切斷連線；
     在輪次**收尾**呼叫 resume()。被取消的那段**不推進度**，下次整段重判（冪等）。
   · 🔴 `cancels_live`＝真的切斷了進行中請求的次數。乙成不成立要看的是
-    「取消之後下一輪對話有沒有排隊」——llama-server 實測見 core/llm_client.py BackgroundLLM 檔頭
-    （做完當前那批 prefill 才停；量法：tools/chat_probe 的「排隊」欄），
+    「取消之後下一輪對話有沒有排隊」——後端行為見 core/llm_client.py BackgroundLLM 段首註解
+    （量法：tools/chat_probe 的「排隊」欄），
     本檔只負責把次數與時間點記下來（log 搜「背景取消」對照下一行「LLM呼叫」耗時）。
     量不到改善或做不到 ⇒ 換甲（極小判斷模型），見《現況》準 v4。
 
@@ -55,8 +55,7 @@ def load_prompt(path: str, *, max_topics: int) -> tuple[str, list[str], list[tup
 
     ⭐ 類型名稱的單一來源就是這個檔的【類型】段（「名稱：說明」每行一個）——config 不另列一份。
     ⭐ 例子格式：「對話：…」一行，接「輸出：」，之後到下一個「對話：」為止是期望輸出（第一行建／不建）。
-       🔺 2026-10-09 實測：例子只寫「→ 建：身分」時，模型照抄類型說明、欄位錯位、編造事實
-       ⇒ 例子改成完整輸出格式。
+       ⚠️ 例子要寫完整輸出格式：只寫「→ 建：身分」時，模型會照抄類型說明、欄位錯位、編造事實。
     🔴 檔案不在、或【類型】段解析不出任何類型 ⇒ 直接拋（啟動就失敗，不帶著空規則默默跑）。
     """
     if not os.path.exists(path):
@@ -158,7 +157,7 @@ def norm_topic(text: str) -> str:
 
 
 def drop_copies(items: list[dict], *, examples: set[str], existing: set[str]) -> tuple[list[dict], int, int]:
-    """機械過濾（2026-10-09 實跑：模型會把提示詞例子原句寫進無關的段，也會重複建同一件）：
+    """機械過濾（模型會把提示詞例子原句寫進無關的段，也會重複建同一件）：
       ① 與規則檔【例子】的主題句一字不差 ⇒ 丟（照抄例子）
       ② 與現存（最新有效版）主題一字不差、或同一次輸出裡重複 ⇒ 丟（重複）
     回傳（留下的, 抄例子數, 重複數）。純函式；確定性，不靠模型自己判斷。
@@ -181,12 +180,11 @@ FALLBACK_TYPE = "原句"
 
 
 def fallback_topic(segment_text: str) -> dict:
-    """判了建、但模型寫不出能用的主題句時，退回存原句（2026-10-10 邪狼裁：先做這個再看換模型）。
+    """判了建、但模型寫不出能用的主題句時，退回存原句。
 
     片段 → 一件主題：拿掉第一行時間標頭，各句以「／」接起（說話者名字保留，主詞不會丟）。
     類型固定 FALLBACK_TYPE、不帶屬性鍵 ⇒ 不參與機械取代；換模型後可用類型撈出來重判。
-    ⚠️ 防的事故：照抄例子被濾光、或主題句解析不出時，進度照推 ⇒ 該段的事實永久沒進主題表
-       （2026-10-10 judge_examples：生日、熬夜看法兩件就是這樣丟的）。
+    ⚠️ 不退回的話：照抄例子被濾光、或主題句解析不出時，進度照推 ⇒ 該段的事實永久沒進主題表。
     """
     lines = [ln.strip() for ln in segment_text.splitlines()[1:] if ln.strip()]
     return {"type": FALLBACK_TYPE, "attr_key": None, "text": "／".join(lines)}
@@ -499,7 +497,7 @@ class BackgroundJudge:
         self.stats["segments"] += 1
         self.stats["built" if items else "skipped"] += 1
         self.stats["topics"] += len(ids)
-        # 🔴 第 6 點（定門檻）的資料來源就是這一行：P(建)、模型自己的答案、結果
+        # 🔴 定門檻的資料來源就是這一行：P(建)、模型自己的答案、結果
         pb = "—" if p is None else f"{p:.3f}"
         logger.info(f"背景判斷 serial {first}–{last}：模型答「{said}」P(建)={pb}（{rule}）"
                     f"→ {'建' if build else '不建'}，建 {len(ids)} 件")

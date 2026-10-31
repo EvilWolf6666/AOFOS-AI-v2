@@ -8,21 +8,14 @@
   ③ 讀取：本輪輸入 → 主題兩路檢索（向量＋關鍵字，各取配額、聯集、不重排）→ 注入主題句
   ④ 本場開頭幾輪另帶開場：「上次聊天是多久以前／今天聊過幾次／那次聊了幾輪」＋上一場的關鍵詞
      （事件層，程式算、不經 LLM）
-  ⑤ 全部包在一個 `⟦記憶⟧…⟦/記憶⟧` 區塊裡，**放在本輪輸入之前**（2026-10-23 起併進 user 訊息開頭，見 build_turn）；區塊第一行自帶說明
+  ⑤ 全部包在一個 `⟦記憶⟧…⟦/記憶⟧` 區塊裡，**放在本輪輸入之前**（位置依 config 的 block_position，見 build_turn）
      區塊內兩段標題：④ 開場＝「妳記得的事」、③ 主題＝「妳想起的事」（config 的 label_remember／label_recall；
      🔴 必須與人格 prompt〈記憶誠實原則〉的用詞逐字相同，人格規定只有這兩段裡的才算知道）
 Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪、一次丟 WM_DROP_ROUNDS 輪），超出的直接滑出——
 ⭐ 原句已經落地，滑出不會丟任何東西，**所以不需要壓縮**。
 
-🔺 2026-10-09 準 v3 讀取路徑淘汰（邪狼裁「淘汰沒用的，有用的併進準 v4」）：
-   刪：撈原句（原句的關鍵字索引與每輪補索引、原句向量、RRF）、開場的代表句與最後幾句原句、
-       `v3_recall`／`v3_opening` 開關。
-   留：原句存放、事件層開場的「狀態」與「上一場關鍵詞」（她才答得出「上次聊天是多久以前」）。
-   舊的設計與理由見《歸檔》（準 v3 主題 D、E）。
-
-⚠️ 🔺 2026-10-09 v1 的相容殼（`compressed_memory`、`rag`、`needs_compress`、`maybe_compress`、
-   `save_memory`）已移除，pipeline 同步拿掉呼叫。`compress_on_exit()` 名稱沿用（呼叫點多），
-   實際做的是**離場收尾**：關背景判斷、補寫原句、重建事件層或丟棄測試區、關連線。
+⚠️ `compress_on_exit()` 名稱沿用 v1（呼叫點多），實際做的是**離場收尾**：
+   關背景判斷、補寫原句、重建事件層或丟棄測試區、關連線。
 
 🔴 **執行緒**：DB 連線在**第一次使用時**於當下執行緒開啟，之後只能在同一執行緒用
    （sqlite3 預設 check_same_thread，跨執行緒會直接拋 ProgrammingError——大聲，是對的）。
@@ -134,7 +127,7 @@ class MemoryManager:
 
         cfg = {**MEMORY_CONFIG, **(cfg_override or {})}
         self._cfg = cfg
-        self._v4 = cfg["v4_enabled"]   # 關掉＝只存原句、不判不撈（config 註解：P1 第 ② 點）
+        self._v4 = cfg["v4_enabled"]   # 關掉＝只存原句、不判不撈
         self._spk = cfg["speaker_ids"]
         # 滑動視窗兩個參數的正本在 config 頂層；cfg_override 只給自測固定舊行為用
         self._wm_max = cfg.get("wm_max_rounds", MAX_WORKING_MEMORY)
@@ -215,7 +208,7 @@ class MemoryManager:
     def _new_store(self, path: str, *, writable: bool) -> _Store:
         return _Store(path, writable=writable, emb=self._emb, ep_cfg=self._ep_cfg, v4=self._v4)
 
-    # ── 測試模式：讀取共用、寫入分流（第八章 舊C8（已結案））───────────────
+    # ── 測試模式：讀取共用、寫入分流 ───────────────
 
     @property
     def memory_path(self) -> str:
@@ -302,7 +295,7 @@ class MemoryManager:
         placeholder，情境正是那個位置該有的東西。
         🔴 **這些欄位不得原樣進入送給模型的 messages**，剝除點在 _to_message()。
            唯一例外：`situation` 依 EVENT_CONFIG["situation_in_history"] 由 _assemble() 渲染成那則 user 的內容
-           （方案 α，2026-10-24）——渲染的是內容字串，欄位本身仍不送。
+           ——渲染的是內容字串，欄位本身仍不送。
 
         `user_speaker`（準 v4）：user 那一則的 speaker_id。預設＝config 的使用者 ID；
         observation 輪次由 Pipeline 明傳 None（沒有人說話）——由呼叫端決定，本層不看 kind 分支。
@@ -332,8 +325,8 @@ class MemoryManager:
     def _flush(self) -> None:
         """把 Working Memory 裡還沒有 serial 的紀錄寫進去。
 
-        流程沿用準 v2：預寫區 append（取號＋落盤）→ 讀出 → 原文存放區 land
-        （推進 N）→ 清預寫區 → 補索引。
+        流程：預寫區 append（取號＋落盤）→ 讀出 → 原文存放區 land
+        （推進 N）→ 清預寫區 → 通知背景判斷。
         ⭐ **失敗不中斷對話，而且會自己重試**：沒拿到 serial 的紀錄留在 WM，
            下一輪再寫；已進預寫區但沒 land 的，下一輪 read_pending 會一起帶出來。
         🔴 但失敗要大聲——連續失敗代表原句根本沒在存，關係連續性是假的。
@@ -364,7 +357,7 @@ class MemoryManager:
         """滑動視窗：超過上限輪數時，**一次**丟掉最舊的 WM_DROP_ROUNDS 輪（只丟已落地的）。
 
         ⭐ 一次丟一批而不是每輪丟一輪：送給模型的開頭只在丟的那一輪改變 ⇒ 其餘輪次吃得到
-           後端的提示詞快取（每輪丟一輪時，滿了之後每輪 TTFT 多 2.5～3 秒，2026-10-04 LM Studio 時期實測）。
+           後端的提示詞快取。
         🔴 **沒有 serial 的一律不丟**（寫入失敗的那些）——丟了就真的沒了。
         """
         limit = self._wm_max * 2
@@ -437,7 +430,7 @@ class MemoryManager:
         "tail_system"：等同 get_context()，user 內容就是輸入本身。
         "in_user"：context 不含區塊；區塊併進 user 內容開頭（區塊＋換行＋輸入）。
         ⚠️ Working Memory 存的仍是原始輸入（add_turn 收的是 user_input），區塊不進歷史——
-           下一輪快取斷在上一輪那則 user 訊息，重算量與 tail_system 相近（2026-10-23 實測）。
+           下一輪快取斷在上一輪那則 user 訊息，重算量與 tail_system 相近。
         ⚠️ 為什麼不放尾端 system：見 config 的 block_position 註解（區塊夾在上一句回覆後面時，她會照講上一句）。
         """
         text = user_input if situation is None else self.render_situation(situation)
@@ -452,7 +445,7 @@ class MemoryManager:
     def get_context(self, user_input: str = "") -> list[dict]:
         """〔固定說明〕＋ Working Memory ＋ 一個 `⟦記憶⟧` 區塊（追加在尾端、本輪輸入之前）。
 
-        ⚠️ 2026-10-23 起正式路徑改走 build_turn()（區塊位置看 config 的 block_position）；
+        ⚠️ 正式路徑走 build_turn()（區塊位置看 config 的 block_position）；
            本方法固定回傳「區塊在尾端 system」的形狀，給自測與 memory_peek 檢查區塊內容用。
 
         ⚠️ 順序依「變動頻率由低到高」：記憶區塊每輪不同，放尾端才不會讓
@@ -508,8 +501,7 @@ class MemoryManager:
     def _opening(self) -> str:
         """開場：上次聊天是多久以前／今天聊過幾次／那次聊了幾輪＋上一場的關鍵詞（事件層）。
 
-        🔺 2026-10-09 準 v3 淘汰時留下（邪狼裁「開場只留關鍵詞」）：代表句與最後幾句原句不再帶——
-           原句直接注入是逐字照抄的來源（《現況》12之0），上次聊了什麼的細節改由主題依輸入撈。
+        不帶代表句與原句：原句直接注入是逐字照抄的來源（《現況》12之0）；細節改由主題依輸入撈。
         ⭐ 本場只算一次、之後原樣重用 ⇒ 開頭幾輪這段字不變（對 prompt cache 友善），
            且不依輸入——問「上次聊甚麼」「上次聊天是多久以前」這種沒有內容詞的話也有東西可用。
         ⭐ 時間只給口語的時間感（`time_bucket`），不給日期與天數，避免她照唸。
@@ -542,8 +534,8 @@ class MemoryManager:
     def _topics(self, query: str) -> str:
         """準 v4 讀取：向量＋關鍵字兩路，**各取自己的配額、聯集去重、不重新排名**，依事件時間排列。
 
-        🔺 2026-10-09 邪狼裁（《現況》〈🔒 隔離區〉準 v4 檢索列）：兩路一律並行；不用 RRF——
-           RRF 讓兩路搶同一組名額，只有一路命中的（例：關鍵字逐字命中的專有名詞）可能被擠掉。
+        不用 RRF（《現況》〈🔒 隔離區〉準 v4 檢索列）：RRF 讓兩路搶同一組名額，
+           只有一路命中的（例：關鍵字逐字命中的專有名詞）可能被擠掉。
            去重空出的名額不遞補（遞補就得決定「下一名給誰」，又回到排名次）。
         ⭐ 兩路各自的命中名單寫 debug log ⇒ 日後可離線重算 RRF 比對，不必重跑對話。
         ⚠️ 第 4 步「依當下狀況重寫」尚未實作：現在注入的是建立時的主題句本身。

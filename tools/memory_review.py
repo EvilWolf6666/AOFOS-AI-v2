@@ -1,6 +1,6 @@
 # tools/memory_review.py
 """
-人工審核（2026-10-09 邪狼裁，《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）。
+人工審核（《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）。
 
 用法：雙擊 start/審核.bat（或 python -m tools.memory_review）。
   逐筆列出待審的東西：輸入 yes（或 y）通過、no（或 n）駁回、直接 Enter 跳過（維持待審，下次再審）。

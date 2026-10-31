@@ -94,8 +94,8 @@ def input_with_prompt(prompt: str) -> str:
 # 逐字呼叫等於每個 token 閃一次畫面。串流需要的是「開頭印一次前綴、中間只追加、
 # 結尾收一次」，這是不同的輸出形狀，不是 emit 的參數能表達的。
 #
-# ⚠️ 刻意不在串流全程持鎖。持鎖會讓背景執行緒的 log 卡住整段生成時間
-# （實測 4.7～15.5 秒），而那些 log 有些是要當場看的警告。改為逐次取鎖 +
+# ⚠️ 刻意不在串流全程持鎖。持鎖會讓背景執行緒的 log 卡住整段生成時間，
+# 而那些 log 有些是要當場看的警告。改為逐次取鎖 +
 # _streaming 旗標，代價是 log 會把回應切成多行——可接受，因為字沒有消失。
 
 
@@ -176,7 +176,7 @@ def install_logging_bridge() -> int:
       1. **FileHandler 是 StreamHandler 的子類別**。只用
          isinstance(h, StreamHandler) 過濾會一併改接檔案 handler——
          結果是檔案 log 被印到畫面（每筆訊息出現兩次，第二次帶時間戳），
-         而 logs/*.log 從此空白。長期記錄斷掉且無任何徵兆。
+         而 logs/daily/*.log 從此空白。長期記錄斷掉且無任何徵兆。
 
       2. **第三方 logger**。掃 logging.root.manager.loggerDict 會取到
          chromadb / sentence-transformers / urllib3 等所有 import 過的套件。

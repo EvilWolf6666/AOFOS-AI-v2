@@ -1,12 +1,12 @@
 # tools/judge_examples.py
 """
-例句實測：把句子逐句送真的推理後端（llama-server），看 P(建)、建不建判對沒有、主題句寫得像不像。
+例句實測：把句子逐句送真的推理後端，看 P(建)、建不建判對沒有、主題句寫得像不像。
 
 用法：python -m tools.judge_examples            （只跑下方 HELD_OUT：不在提示詞裡的句子）
       python -m tools.judge_examples --all      （另外把 prompts/memory_judge.txt【例子】也跑一遍）
-（llama-server 照平常開著（start\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/runs/judge_examples/judge_examples_*.json。）
+（推理後端照平常開著（start\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/runs/judge_examples/judge_examples_*.json。）
 
-⭐ 分兩組是為了不「拿考古題考」（2026-10-09 第一次實測 19 句全在提示詞裡、分數偏樂觀）：
+⭐ 分兩組是為了不「拿考古題考」（句子全在提示詞裡時分數偏樂觀）：
    HELD_OUT 刻意不放進提示詞；提示詞的例子只用 --all 順便看。
 ⭐ 建不建自動判對錯；主題句只並排印出（期望 vs 模型），由人看——寫法沒有唯一答案。
 ⭐ 送法與正式判斷同一份（core/memory/judge.py 的 build_messages／p_build／split_answer），不另寫。
@@ -72,7 +72,7 @@ def main(argv: list[str]) -> int:
             print(f"      模型：{ln}{mark}")
         rows.append({"group": group, "dialog": dialog, "want": want_lines, "said": said, "p_build": p,
                      "decided": got, "ok": hit, "seconds": round(dt, 2), "raw": out, "logprobs": lps})
-    # 原本是相對路徑 "logs"：從別的資料夾執行會悄悄寫到別處。改用 config.PROJECT_ROOT。
+    # 用 config.PROJECT_ROOT：相對路徑從別的資料夾執行會悄悄寫到別處。
     out_dir = os.path.join(PROJECT_ROOT, "logs", "runs", "judge_examples")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, time.strftime("judge_examples_%Y%m%d_%H%M%S.json"))

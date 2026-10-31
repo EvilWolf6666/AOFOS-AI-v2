@@ -7,21 +7,16 @@
 
 🔴 **它是權威副本這件事的後果超出字面**：原文不在向量庫裡 ⇒ 換 embedding、
    換距離空間時，**刪掉向量庫、從這裡重跑一次就好，資料一筆不丟**。
-   ⭐ 先前記的「不可逆四項」裡有三項因此不成立（embedding／距離空間／存逐字或抽取）。
 
-**存逐字，不存抽取**（2026-09-13 邪狼確認）：抽取保住「發生了什麼」、
+**存逐字，不存抽取**：抽取保住「發生了什麼」、
 丟掉「**怎麼說的**」——語氣、用詞、當下喊的稱呼。而陪伴型要的正是後者：
 「你上次去高雄也是三天」這種**她自己講過的話**，抽成「邪狼曾去高雄三天」之後
 就回指不了。⚠️ 粒度＝**一則**（一個 user／assistant 對是兩則）。
 
 🔴 **本模組同時持有 checkpoint N（landed_upto）**，而這是刻意的：
    「原文落地 ＋ 推進 N」必須在**同一個交易**裡——拆成兩個模組就拆成兩段，
-   那個「原文寫成功但 N 沒更新」的窗口會回來。
-   ⇒ 📌 檔名表原本列的 `checkpoint.py` 因此**不獨立成檔**（結構改動，在此聲明）。
-🔺 2026-10-09：v1 壓縮的 checkpoint M（`compressed_upto`）與 `pending_compress()`／`mark_compressed()`
-   隨 v1 殘留清理移除；既有 DB 的 meta 裡那一列留著不動（沒人讀）。它當時寫下的教訓——
-   「一條狀態如果只靠某個東西還留著來表示，它就是沒被寫下來」——由準 v4 的 `judged_upto`
-   （core/memory/topics.py）沿用：背景判斷的進度明寫在 meta，不靠「還沒建主題」推斷。
+   那個「原文寫成功但 N 沒更新」的窗口會回來。⇒ checkpoint 不獨立成檔。
+背景判斷的進度另有 `judged_upto`（core/memory/topics.py），明寫在 meta，不靠「還沒建主題」推斷。
 """
 
 from __future__ import annotations
@@ -36,7 +31,7 @@ from core.memory.clean import clean_text
 logger = setup_logger("Transcript")
 
 _COLS = ("serial", "ts", "role", "content", "hash", "source", "kind", "situation", "speaker_id")
-# 🆕 2026-09-25：寫入時多一欄 clean（由 clean_text() 從 content 算出）。
+# 寫入時多一欄 clean（由 clean_text() 從 content 算出）。
 # ⚠️ 只加在寫入端：預寫區不認識 clean（它由本檔落地時才算）。
 _WRITE_COLS = _COLS + ("clean",)
 

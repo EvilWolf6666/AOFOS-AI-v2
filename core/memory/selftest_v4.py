@@ -5,10 +5,9 @@
 全部在暫存資料夾、對假 LLM 伺服器（本檔 FakeLLM）與假 embedding 跑，不碰 data/、不碰真的推理後端。
 涵蓋：切段／解析（純函式）、主題表（屬性鍵機械取代、版本、進度原子性）、speaker_id 落地、
 端到端（閒置 → 判斷 → 建主題 → 向量 → 注入）、取消（prefill 中／串流中）、施測隔離、
-暫停逾時保險、壞輸出。
-🆕 2026-10-09：判斷一次呼叫＋logprobs 算 P(建)（含「答不建但機率過門檻 ⇒ 補一次」與「拿不到機率」）、
-規則檔解析（用真的 prompts/memory_judge.txt）、關鍵字那一路與配額聯集、鎖定／待審／人工審核、舊表遷移。
-🆕 2026-10-17：判斷來源（judge_model／judge_prompt）落地與舊表補欄、重寫版本沿用鎖定狀態。
+暫停逾時保險、壞輸出、判斷一次呼叫＋logprobs 算 P(建)（含「答不建但機率過門檻 ⇒ 補一次」與「拿不到機率」）、
+規則檔解析（用真的 prompts/memory_judge.txt）、關鍵字那一路與配額聯集、鎖定／待審／人工審核、舊表遷移、
+判斷來源（judge_model／judge_prompt）落地與舊表補欄、重寫版本沿用鎖定狀態。
 ⚠️ 不測「真的推理後端斷線後會不會停止運算」——那要在 Windows 實測（看取消後下一輪對話 TTFT）。
 """
 
@@ -36,7 +35,7 @@ from core.memory.topics import SCHEMA as TOPIC_SCHEMA
 from core.memory.topics import TopicStore
 
 
-# ── 假 LLM 伺服器（只給本自測用，不接任何真服務；2026-10-04 由 fake_llm_server.py 併入）──
+# ── 假 LLM 伺服器（只給本自測用，不接任何真服務）──
 # 模擬後端的兩段延遲：送出回應標頭前的 prefill，以及逐 token 串流；
 # 記錄每個請求是「送完」還是「被客戶端中途斷線」，用來驗證 BackgroundLLM 的取消。
 
@@ -182,7 +181,7 @@ def open_handles(d: str) -> list[str]:
     """本行程還開著、指向 d 底下的檔案（Linux 用 /proc 看；其他平台回空＝不檢查）。
 
     🔴 存在理由：Windows 不能刪開著的檔，Linux 可以 ⇒ 連線漏關在 Linux 自測永遠看不出來
-       （2026-09-30 Windows 實跑兩支自測都在清暫存資料夾時炸）。這裡在 Linux 上把同一件事變成可見。
+       （Windows 實跑時自測在清暫存資料夾時炸過）。這裡在 Linux 上把同一件事變成可見。
     """
     import gc
     gc.collect()   # sqlite3 連線可能卡在循環參考裡，先收掉，只留真的還被持有的
@@ -203,7 +202,7 @@ def open_handles(d: str) -> list[str]:
 
 def has_table(path: str, name: str) -> bool:
     # 🔴 一定要關：Windows 上沒關的連線會讓測試區刪不掉、暫存資料夾清不掉
-    #    （2026-09-30 Windows 實跑抓到；Linux 刪得掉開著的檔，所以本機自測看不出來）。
+    #    （Linux 刪得掉開著的檔，所以 Linux 上自測看不出來）。
     cx = sqlite3.connect(path)
     try:
         return cx.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone() is not None
@@ -268,7 +267,7 @@ def main() -> int:
     print("\n[判斷：讀機率（純函式）]")
     L = lambda tok, cands: {"token": tok, "logprob": math.log(dict(cands)[tok]),
                             "top_logprobs": [{"token": c, "logprob": math.log(p)} for c, p in cands]}
-    # 2026-10-09 LM Studio 實測的形狀：不 0.873／建 0.117，接著 建 0.705／確 0.287
+    # 實測過的形狀：不 0.873／建 0.117，接著 建 0.705／確 0.287
     real = [L("不", [("不", 0.873), ("建", 0.117)]), L("建", [("建", 0.705), ("確", 0.287)])]
     check("P(建)＝建＋不×確（實測形狀 ≈0.37）", abs(p_build(real) - (0.117 + 0.873 * 0.287)) < 1e-6,
           str(p_build(real)))
@@ -279,7 +278,7 @@ def main() -> int:
     check("選了「建」時，「不」底下的不確定路徑不算（看不到）",
           abs(p_build([L("建", [("建", 0.7), ("不", 0.3)]), L("\n", [("\n", 1.0)])]) - 0.7) < 1e-6)
     check("沒有 logprobs ⇒ None", p_build([]) is None and p_build([{"token": "建", "logprob": 0.0}]) is None)
-    # 🆕 2026-10-24：門檻 None＝看字（預設）；數值＝看機率（補呼叫只有這條會走到）
+    # 門檻 None＝看字（預設）；數值＝看機率（補呼叫只有這條會走到）
     check("decide 看字：只有「不建」不建，P(建) 再高也不補呼叫",
           decide("不建", 0.9, None) == (False, False) and decide("建", 0.01, None) == (True, False)
           and decide("不確定", None, None) == (True, False) and decide("?", 0.2, None) == (True, False))
@@ -674,7 +673,7 @@ def main() -> int:
             hold.release()
             fake.prefill_s = 0.0
             # ⚠️ 門檻是「假伺服器 prefill 3 秒＋1」而不是 1 秒：Windows 上 shutdown() 不會打斷別條執行緒
-            #    卡著的 recv（Linux 會），要等伺服器下一次寫入才返回（2026-10-09 Windows 實測 2.77 秒）。
+            #    卡著的 recv（Linux 會），要等伺服器下一次寫入才返回（Windows 實測約 2.8 秒）。
             #    斷線本身（FIN）在取消當下就送出 ⇒ 伺服器端照樣看得到；只是 worker 本身晚一點結束。
             check("跑到一半 AOFOS 啟動 ⇒ 取消手上的呼叫並結束（伺服器看到斷線；Windows 最多等到伺服器下一次回應）",
                   res == [0] and dt < 4.0 and aborted and "偵測到 AOFOS 啟動" in lines[-1],

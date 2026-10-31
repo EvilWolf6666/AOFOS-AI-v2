@@ -1,6 +1,6 @@
 # core/memory/run_lock.py
 """
-「AOFOS 正在執行」的訊號：一個由作業系統持有的檔案鎖（2026-10-09，給 tools/judge_worker.py 用）。
+「AOFOS 正在執行」的訊號：一個由作業系統持有的檔案鎖（給 tools/judge_worker.py 用）。
 
 為什麼要它：獨立終端的背景判斷（judge_worker）收不到「使用者開口」的取消訊號——
 它若在 AOFOS 開著時跑，對話就得排在它後面（推理後端只有一個推理槽），兩邊也會同時判同一個 DB。

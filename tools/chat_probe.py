@@ -1,21 +1,17 @@
 """對話探測：照劇本自動跑一場或連續幾場對話，量延遲、看注入、測背景取消與 observation。
 
-版本：2026-10-25 14:49（前一版：2026-10-25 14:45）
-🔺 2026-10-25 改版（《現況》第八章 P1 第 ③ 點基線＋P22）：
-   ① 劇本改成 23 輪：中段兩則 observation，後面接「剛剛在玩什麼」「現在在幹嘛」（P22：驗方案 α
-      `situation_in_history="all"` 在正式路徑上的歷史）；長度超過 Working Memory 上限，量丟批那一輪。
-   ② 可連跑多場（--sessions），第 k 場用第 k−1 場的副本當來源 ⇒ 第二場起才有開場可帶。
-      也可用 --from-prev／--from 指定上一次探測的副本當來源。
-   ③ 記憶區塊 2026-10-23 起併進 user 訊息（block_position="in_user"），舊版摘要只在 system
-      訊息裡找區塊 ⇒ 注入件數永遠是 0。改成兩處都找。
-   ④ 每輪自動標記四項觀察（字面 `[狀態]`、照講上一句、「你們」、丟批那輪 TTFT）與 P22 核對；
-      判讀門檻在 THRESHOLDS，是 Claude 擬的草案，邪狼可直接改。
-   ⑤ 14:45：--v4 on／off 只在副本上開關主題建立（不改 config）；--baseline 預設 on。
-      邪狼 2026-10-25：基線開主題只看效能（向量載入、主題檢索與注入、背景判斷與取消對延遲的影響），
-      不看主題內容——判斷模型還沒換（P1 第 ⑤ 點），建出來的主題品質不當結論。
-   ⑥ 14:49：劇本第 16 輪後加一段閒置，等背景判斷開跑後插話（第 17 輪）⇒ 量「歷史已長、判斷進行中」
-      的取消代價（舊劇本只在結尾量，那時判斷很少有東西可判）。跑完把本次副本上的主題全部停用
-      （retired=1，不刪）：邪狼 2026-10-25，測試時的主題句不作為實際使用。
+劇本（《現況》第八章 P1 第 ③ 點基線＋P22）：
+   · 23 輪：中段兩則 observation，後面接「剛剛在玩什麼」「現在在幹嘛」（P22：驗
+     situation_in_history 在正式路徑上的歷史）；長度超過 Working Memory 上限，量丟批那一輪。
+   · 第 16 輪後閒置，等背景判斷開跑後插話 ⇒ 量「歷史已長、判斷進行中」的取消代價。
+   · 可連跑多場（--sessions），第 k 場用第 k−1 場的副本當來源 ⇒ 第二場起才有開場可帶。
+     也可用 --from-prev／--from 指定上一次探測的副本當來源。
+   · 記憶區塊在 user 訊息開頭或 system 訊息裡都找（依 block_position）。
+   · 每輪自動標記四項觀察（字面 `[狀態]`、照講上一句、「你們」、丟批那輪 TTFT）與 P22 核對；
+     判讀門檻在 THRESHOLDS（草案，可直接改）。
+   · --v4 on／off 只在副本上開關主題建立（不改 config）；--baseline 預設 on，只看效能
+     （向量載入、主題檢索與注入、背景判斷與取消對延遲的影響），不看主題內容。
+   · 跑完把本次副本上的主題全部停用（retired=1，不刪）：測試時的主題句不作為實際使用。
 
 用途：換後端、改參數、改記憶注入之後的回歸實測，不用人在終端機一句一句打。
 走的是正式路徑：LLMClient＋Persona＋MemoryManager＋Pipeline。
@@ -62,7 +58,7 @@ from core.memory.manager import MemoryManager
 from core.memory.run_lock import RunLock, lock_path
 from core.persona import Persona
 
-# 探測紀錄放 logs/runs/chat_probe/（2026-10-26 紀錄結構統一，見 core/logger.py 開頭）。
+# 探測紀錄放 logs/runs/chat_probe/（紀錄結構見 core/logger.py 開頭）。
 PROBE_RUNS_DIR = os.path.join(config.PROJECT_ROOT, "logs", "runs", "chat_probe")
 PROBE_IDLE_S = 10.0
 PROBE_EPISODE_GAP_MIN = 3        # 連跑時的切段門檻（分鐘）；劇本內最長的停頓（背景取消等待 ≤120 秒）要小於它
@@ -103,16 +99,16 @@ SCRIPT = [
 ROUNDS = [x for x in SCRIPT if x[0] != "idle"]   # 真正送出的輪次（idle 只是停頓，不算一輪）
 CANCEL_INPUT = "我回來了，剛剛在發呆"
 
-# 判讀門檻（2026-10-25 Claude 擬的草案，未經邪狼確認；依據寫在每項後面）
+# 判讀門檻（草案；依據寫在每項後面）
 THRESHOLDS = {
     # 照講上一句：和上一句回覆的相似度 ≥ 這個值就算（difflib ratio；0.8 約等於只改幾個字）
     "repeat_ratio": 0.8,
-    # 全部場次合計：0 ✅、≤ warn ⚠️、更多 ❌（2026-10-23 區塊併進 user 後 12 輪 0 次）
+    # 全部場次合計：0 ✅、≤ warn ⚠️、更多 ❌（區塊併進 user 後實測 12 輪 0 次）
     "repeat_warn": 1,
-    # 「你們」：每場平均出現幾句以下算 ⚠️（0 ✅；任一場 ≥ fail_per_session ❌；2026-10-24 前 12 句 7 次）
+    # 「你們」：每場平均出現幾句以下算 ⚠️（0 ✅；任一場 ≥ fail_per_session ❌；改前實測 12 句 7 次）
     "youmen_warn_avg": 1.0,
     "youmen_fail_per_session": 2,
-    # 丟批那輪 TTFT：平常 1.2～3.3 秒；超過 warn 已是明顯卡頓，超過 fail 需要處理（2026-10-24 量到 82 秒）
+    # 丟批那輪 TTFT：平常 1.2～3.3 秒；超過 warn 已是明顯卡頓，超過 fail 需要處理（曾量到 82 秒）
     "drop_ttft_warn_ms": 10_000,
     "drop_ttft_fail_ms": 30_000,
     # P22 答案核對：答對的場次比例（瀏覽器直打 all：「現在在幹嘛」6/6、「剛剛在玩什麼」完整 4/6）
@@ -238,7 +234,7 @@ def summarize(rec: dict) -> str:
 
 
 def check_baseline_conditions() -> list[str]:
-    """P1 第 ③ 點的基線條件（2026-10-24）。人格是不是 V3 程式驗不了，只記雜湊。"""
+    """《現況》第八章 P1 第 ③ 點的基線條件。人格是不是 V3 程式驗不了，只記雜湊。"""
     bad = []
     if config.MEMORY_CONFIG.get("block_position") != "in_user":
         bad.append(f"block_position={config.MEMORY_CONFIG.get('block_position')!r}（應為 'in_user'）")
@@ -486,7 +482,7 @@ def verdict(sums: list[dict]) -> list[str]:
 def retire_probe_topics(root: str) -> dict:
     """本次探測各場副本上建出的主題全部停用（retired=1）。
 
-    邪狼 2026-10-25：測試時的主題句不作為實際使用。⇒ 跑完才停用、不在跑的時候關：
+    測試時的主題句不作為實際使用 ⇒ 跑完才停用、不在跑的時候關：
     跑的時候要量主題檢索與注入的效能；跑完停用，日後 --from-prev／--from 拿這份副本當來源時
     就撈不到（兩路檢索都經 TopicStore.latest()，只取 retired=0）。
     ⭐ 停用不刪：主題列與原句都留著，result.json 對得回去；要看內容時改回 0 即可。

@@ -4,8 +4,7 @@ Pipeline（流程控制層）
 
 決定一個事件該怎麼被處理：系統指令、正常對話輪次，還是環境事件。
 正常輪次的處理順序固定為：取記憶 context → 組裝 Prompt → 呼叫 LLM → 寫回記憶，
-輪次收尾另由 finalize_turn() 負責，由 Agent 在輸出之後呼叫
-（🔺 2026-09-27：準 v3 不壓縮，該掛點目前空轉；留著給日後的離線整理用）。
+輪次收尾另由 finalize_turn() 負責（恢復背景判斷），由 Agent 在輸出之後呼叫。
 
 Prompt 組裝的優先順序由 persona.build_messages() 決定，此處只負責呼叫順序。
 
@@ -108,7 +107,7 @@ class Pipeline:
         由長至短逐段比對，因為指令 key 本身含空白（"/mode t"）。取第一段會讓
         "/proactive on" 誤命中不存在的 "/proactive"。
 
-        ⚠️ takes_arg 目前無任何使用者（《現況》第八章 舊C4（已結案）清理後），留著的成本是一個 bool；
+        ⚠️ takes_arg 目前沒有指令用到，留著的成本是一個 bool；
         新增帶參數的指令時登記 takes_arg=True 即可。
         ⚠️ 參數取自 _key() 正規化後的字串，已轉小寫；需大小寫敏感時改由原始輸入取。
         """
@@ -156,7 +155,6 @@ class Pipeline:
 
     def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
         # 離場收尾（補寫原句、關背景判斷、重建事件層；毫秒級，不需要「請稍候」提示）。
-        # 🔺 2026-10-09 v1 壓縮的相容殼（needs_compress／COMPRESS_WAIT_MESSAGE）已移除。
         self.memory.compress_on_exit()
         state.stop()
         return TurnResult(should_exit=True, system_message="掰掰。")
@@ -287,9 +285,7 @@ class Pipeline:
         """
         輸出後的收尾掛點：恢復背景判斷（輪次開始時 bg_pause）。
         🔴 必須由 Agent 在回應「已經輸出之後」呼叫——早了背景請求會跟還沒送完的對話搶推論槽。
-        失敗不得中斷主流程。
-        🔺 2026-10-09 v1 壓縮（maybe_compress）的相容殼已移除；日後要在這裡掛任何離線處理，
-           同樣只能放在輸出之後、且不得放在使用者等待的路徑上。
+        失敗不得中斷主流程。日後要在這裡掛任何離線處理，只能放在輸出之後、且不得放在使用者等待的路徑上。
         """
         try:
             self.memory.bg_resume()
@@ -302,32 +298,29 @@ class Pipeline:
     def handle_observation(self, event: Event) -> TurnResult:
         """
         環境狀態變化（螢幕/遊戲事件等）觸發的輪次：沒有人在說話。情境怎麼送看
-        EVENT_CONFIG["observation_delivery"]（2026-10-23 起 "in_user"：情境就是這一輪
-        user 訊息的內容；舊做法 "separate_role"：一則 observation_role 訊息＋空 user）。
+        EVENT_CONFIG["observation_delivery"]（"in_user"：情境就是這一輪 user 訊息的內容；
+        "separate_role"：一則 observation_role 訊息＋空 user）。
         與 handle_turn() 相同，此處只追加記憶。
 
         🔴 兩種送法的實測差異、為什麼不能改成尾端 system，唯一記載在
         config.EVENT_CONFIG["observation_delivery"]，此處不複述——改動前讀該處。
 
         寫回 WM 的 user 內容是 placeholder，情境掛在 situation 欄位；之後幾輪看不看得到情境，
-        由 EVENT_CONFIG["situation_in_history"] 決定（方案 α；現值與各選項的依據只記在該處註解，此處不抄值），渲染在 manager._history()。
-        ⚠️ 照抄前一組回應：舊做法（"tool" 放尾端）在貪婪解碼、真實情境格式下，
-        連續觸發會回同一句（2026-10-23，《現況》22之84）；in_user 0 次。
+        由 EVENT_CONFIG["situation_in_history"] 決定（各選項只記在該處），渲染在 manager._history()。
 
         ⚠️ separate_role 時情境訊息 append 在歷史「之後」、緊鄰生成點，不可前移
         （prompt cache 比對最長共同前綴，前移會讓整段歷史重算）。in_user 時情境本來就在最後一則。
 
         ⚠️ placeholder、suffix、送法、role 皆由 config 帶入，不寫死在此。
 
-        🔴 **情境描述會進記憶（方案 β：掛欄位；之後幾輪顯不顯示看 situation_in_history）。**
+        🔴 **情境描述會進記憶（掛欄位；之後幾輪顯不顯示看 situation_in_history）。**
         `add_turn(..., situation=description)` 把它掛在**該輪的 user 那一則**上
         ——那一則的 content 是空 placeholder，情境正是那個位置該有的東西。
         ⭐ **「user 空 ＋ 有 situation」是自洽的形狀；「user 空 ＋ 沒有 situation」
-        一眼看得出是異常。** 先前情境只存在於這一次呼叫，事件層會留下一批
-        「她突然說了一段話而沒有人知道為什麼」的紀錄。
+        一眼看得出是異常。**
         ⚠️ 非標準欄位一律由 manager._to_message() 投影掉——**那個投影是本做法成立的前提，
-        不是防禦性程式碼**。situation 是唯一例外：依 situation_in_history 渲染成那則 user 的內容
-        （方案 α，2026-10-24 邪狼裁；實測見《現況》22之84 五），欄位本身仍不送。
+        不是防禦性程式碼**。situation 是唯一例外：依 situation_in_history 渲染成那則 user 的內容，
+        欄位本身仍不送。
 
         ⚠️ **observation 輪次不做記憶檢索，這是實際行為但尚未確認是否應該如此。**
         傳給 build_turn() 的是空 placeholder，該方法的 `if user_input:` 因此
@@ -338,7 +331,7 @@ class Pipeline:
         placeholder = EVENT_CONFIG["user_placeholder"]
         self.memory.bg_pause()   # 同 handle_turn
         if EVENT_CONFIG["observation_delivery"] == "in_user":
-            # 選項 D（2026-10-23）：情境就是這一輪 user 訊息的內容；檢索仍看空 placeholder（不檢索）
+            # 情境就是這一輪 user 訊息的內容；檢索仍看空 placeholder（不檢索）
             context, user_content = self.memory.build_turn(placeholder, situation=description)
         elif EVENT_CONFIG["observation_delivery"] == "separate_role":
             context, user_content = self.memory.build_turn(placeholder)

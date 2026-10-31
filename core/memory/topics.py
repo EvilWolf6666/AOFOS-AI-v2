@@ -7,7 +7,7 @@
   · 原句永遠在 transcript，一筆不刪；日常主題壞掉可以從原句重建（重跑背景判斷）。
     例外是核心設定與審核結果（status／replaces），見下方〈鎖定與人工審核〉。
     ⇒ 寫入端做的歸納是**可重建的衍生物**，不是不可逆的結論
-      （〈📐 規則〉三「歸納放在讀取端」要防的是不可逆，這裡沒有違反）。
+      （《現況》〈📐 規則〉三「歸納放在讀取端」要防的是不可逆，這裡沒有違反）。
 
 版本（重寫）：
   · 一件事第一次被記下來＝一列，`root = 自己的 id`、`parent = NULL`。
@@ -22,13 +22,13 @@
   · 判斷「是不是同一件事的新狀態」需要語意，那一步已經搭在標主題那次呼叫裡（產出 attr_key）。
   · 檢索預設跳過 `valid_to IS NOT NULL` 的列；原句照留。
 
-鎖定與人工審核（2026-10-09 邪狼裁，《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）：
+鎖定與人工審核（《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）：
   · `status`：normal（日常）／locked（核心設定）／pending（待審）／rejected（駁回）。
   · 人工審核只管「要不要進核心設定」：背景判斷寫進來的新事實若要**機械取代一件核心設定**
     （同屬性鍵），不直接取代；新的那件寫成 pending、`replaces` 指向被它挑戰的鎖定 root，
     等人工審核（tools/memory_review.py）。通過＝取代舊的、成為核心設定；駁回＝不改核心設定。
-  · 駁回的事日後要當日常記憶撈（加註「有人提過、未採用」，同時帶入現行核心設定，矛盾時核心優先；
-    2026-10-09 邪狼裁）。⏸ 這段讀取行為等有鎖定條目時才實作；**現行**檢索只看 normal／locked，
+  · 駁回的事日後要當日常記憶撈（加註「有人提過、未採用」，同時帶入現行核心設定，矛盾時核心優先）。
+    ⏸ 這段讀取行為等有鎖定條目時才實作；**現行**檢索只看 normal／locked，
     pending、rejected 不注入（原句照留，駁回的列也不刪）。
   ⚠️ 目前沒有任何路徑會產生 locked（世界觀灌入未做，《現況》17之1）⇒ 欄位先在、機制先不會被觸發。
   ⚠️ 核心設定（locked）與審核結果（status／replaces）**不能從原句重建**：前者日後由世界觀灌入、
@@ -91,8 +91,8 @@ _LIVE = "('normal','locked')"   # 會被檢索的狀態
 
 def ensure_schema(cx: sqlite3.Connection) -> None:
     cx.executescript(SCHEMA)
-    # 舊表補欄位：2026-10-09 前沒有 status／replaces（既有列一律 normal，行為不變）；
-    # 2026-10-17 前沒有 judge_model／judge_prompt（既有列為 NULL＝來源不明）。
+    # 舊表補欄位：沒有 status／replaces 的補上（既有列一律 normal，行為不變）；
+    # 沒有 judge_model／judge_prompt 的補上（既有列為 NULL＝來源不明）。
     # ⚠️ 這是對正式記憶檔的結構改動：第一次跑新版前先備份 data/memory.db。
     cols = {r[1] for r in cx.execute("PRAGMA table_info(topic)")}
     for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'normal'"), ("replaces", "INTEGER"),
@@ -133,7 +133,7 @@ class TopicStore:
             return get_meta(self.cx, _JUDGED_KEY)
         except KeyError:
             # 建表與寫入 judged_upto 是先後兩步（ensure_schema）：別條連線剛好夾在中間讀到
-            # ＝還沒判過任何一句。2026-10-09 Windows 自測撞到（judge_worker 主執行緒讀、判斷執行緒建表）。
+            # ＝還沒判過任何一句（Windows 自測撞到：judge_worker 主執行緒讀、判斷執行緒建表）。
             return 0
 
     def pending_rows(self, limit: int) -> list[dict]:

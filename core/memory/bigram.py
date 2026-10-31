@@ -1,6 +1,6 @@
 # core/memory/bigram.py
 """
-中文 bigram 切詞＋FTS5 查詢式（2026-10-09 由 recall.py 留下的部分；準 v3 撈原句已淘汰）。
+中文 bigram 切詞＋FTS5 查詢式。
 
 用的人：主題的關鍵字那一路（core/memory/topic_index.py 的 `topic_fts`）、事件層挑關鍵詞
 （core/memory/episode.py 的 `_is_cjk`）、MemoryManager 啟動時的 FTS5 檢查。

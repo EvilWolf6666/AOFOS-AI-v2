@@ -1,6 +1,6 @@
 # tools/judge_worker.py
 """
-獨立終端的背景判斷：AOFOS 關了、llama-server 還開著時，把還沒判的原句判完（2026-10-09 邪狼）。
+獨立終端的背景判斷：AOFOS 關了、推理後端還開著時，把還沒判的原句判完。
 
 用法：雙擊 start/背景判斷.bat（或 python -m tools.judge_worker）。判完自動結束。
 
@@ -14,7 +14,7 @@
       主題的關鍵字索引照補，向量由 AOFOS 下次開啟後的背景判斷順手補（補完之前向量那一路撈不到這些新主題）。
   · 一段只有在「最後一句已過 judge_segment_close_s」才算講完，所以 AOFOS 剛關時最多等那麼久才開判。
   · 人工審核不在這裡做：判完若有待審的，只提醒去開 start/審核.bat。
-  · 連續出錯 3 次（例如 llama-server 沒開）⇒ 結束並回 1（.bat 會停住讓你看訊息）。
+  · 連續出錯 3 次（例如後端沒開）⇒ 結束並回 1（.bat 會停住讓你看訊息）。
   · config 的 MEMORY_CONFIG["v4_enabled"] 關閉時不啟動（與 AOFOS 一致：關閉期間不建主題）。
 """
 from __future__ import annotations
