@@ -3,9 +3,9 @@
 主迴圈周邊的自測：`python -m core.agent.selftest`
 
 涵蓋：事件佇列（逾時、同來源覆蓋）、使用者輸入讀取器（一次只讀一次、空的不算、讀取壞掉
-仍推得出事件、ESC＝/mode t）、語音模型載不起來時留在文字模式、收尾只做一次且不怕某步壞掉、
-收完會通知、
-log 終端輸出（之後才建立的 logger 與第三方套件也走登記的出口、檔案 log 不受影響）、
+仍推得出事件、ESC＝/mode t）、語音模型載不起來時留在文字模式、對話視窗只看到一行結果
+（原因在 log）、她沒回應時有一行提示、收尾只做一次且不怕某步壞掉、收完會通知、
+log 終端輸出（之後才建立的 logger 與第三方套件也走登記的出口、等級照登記的、檔案 log 不受影響）、
 惰性載入（import 主迴圈不會拉進語音棧）。
 
 不連推理後端、不開麥克風、不碰 data/。
@@ -139,6 +139,23 @@ def test_reader() -> None:
     v.close()
 
 
+class _dialog:
+    """擷取對話視窗（console.emit）的輸出；log 照 dialog_level=None 接上，看會不會混進來。"""
+
+    def __enter__(self) -> list:
+        from core import console
+        from core import logger as L
+        self._console, self._L, self._saved = console, L, console.emit
+        shown: list = []
+        console.emit = lambda text="", end="\n": shown.append(text)
+        L.set_console_writer(console._log_line, None)
+        return shown
+
+    def __exit__(self, *exc) -> None:
+        self._console.emit = self._saved
+        self._L.set_console_writer(None)
+
+
 def test_agent_parts() -> None:
     """Agent 的模式切換與收尾。不建真的 Agent（要推理後端），只裝上這兩件事用到的欄位。"""
     print("\n[語音模型載不起來]")
@@ -160,15 +177,28 @@ def test_agent_parts() -> None:
     bad.VoiceInput = _Broken
     saved = sys.modules.get("core.voice_input")
     sys.modules["core.voice_input"] = bad
-    try:
-        a.state.switch_to_voice()
-        got = a._reader_for_mode()
-    finally:
-        if saved is None:
-            sys.modules.pop("core.voice_input", None)
-        else:
-            sys.modules["core.voice_input"] = saved
+    with _dialog() as shown:
+        try:
+            a.state.switch_to_voice()
+            got = a._reader_for_mode()
+        finally:
+            if saved is None:
+                sys.modules.pop("core.voice_input", None)
+            else:
+                sys.modules["core.voice_input"] = saved
     check("退回文字讀取器、模式改回文字", got is a._text and a.state.mode == "t")
+    check("對話視窗只有一行結果，原因（例外內容）不在對話視窗",
+          len(shown) == 1 and "語音模式啟動失敗" in shown[0] and "找不到麥克風" not in shown[0], str(shown))
+
+    print("\n[她沒回應]")
+    from core.agent.pipeline import TurnResult
+    done: list[str] = []
+    a.pipeline = types.SimpleNamespace(is_command=lambda t: False, handle_turn=lambda e: TurnResult(reply=""),
+                                       finalize_turn=lambda: done.append("收尾"))
+    with _dialog() as shown:
+        a._handle_utterance(Event("user_text", UTTERANCE, "哈囉"))
+    check("對話視窗有一行提示（不然只看到提示字元又出現）、收尾照做",
+          len(shown) == 1 and "沒有回應" in shown[0] and done == ["收尾"], f"{shown} {done}")
 
     print("\n[收尾]")
     calls: list[str] = []
@@ -203,7 +233,7 @@ def test_log_sink() -> None:
 
     early = L.setup_logger("SelftestEarly")
     got: list[str] = []
-    L.set_console_writer(got.append)
+    L.set_console_writer(got.append, "WARNING")
     try:
         late = L.setup_logger("SelftestLate")   # 登記之後才建立（同 TIMING）
         early.warning("早")
@@ -213,13 +243,19 @@ def test_log_sink() -> None:
         L.set_console_writer(None)
     check("登記前後建立的 logger 都走登記的出口", any("早" in x for x in got) and any("晚" in x for x in got),
           str(got))
-    from config import LOG_CONFIG
-    if logging.getLevelName(LOG_CONFIG["console_level"]) > logging.DEBUG:
-        check("低於 LOG_CONFIG 等級的不印在對話視窗", not any("細" in x for x in got), str(got))
+    check("低於登記等級的不印", not any("細" in x for x in got), str(got))
+    none: list[str] = []
+    L.set_console_writer(none.append, None)
+    try:
+        early.error("不該印")
+    finally:
+        L.set_console_writer(None)
+    check("等級 None＝一筆都不印（對話視窗的預設）", none == [], str(none))
+    check("還原後全部印（tools/ 腳本的終端）", L._CONSOLE_SINK.level == logging.DEBUG)
 
     import warnings
     third: list[str] = []
-    L.set_console_writer(third.append)
+    L.set_console_writer(third.append, "WARNING")
     try:
         logging.getLogger("some.thirdparty").warning("第三方警告")
         logging.getLogger("some.thirdparty").info("第三方資訊")

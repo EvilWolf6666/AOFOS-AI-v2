@@ -52,7 +52,8 @@ def _drain_keys() -> bool:
 
 class VoiceInput:
     def __init__(self, model_size: str = "small", language: str = "zh"):
-        console.emit("[VoiceInput] 載入 Whisper 模型中...")
+        console.emit("[語音模型載入中…]")
+        logger.info(f"載入 Whisper 模型（{model_size}）")
         self.whisper = WhisperModel(
             model_size,
             device="cpu",
@@ -60,7 +61,7 @@ class VoiceInput:
         )
         self.language = language
 
-        console.emit("[VoiceInput] 載入 Silero VAD 模型中...")
+        logger.info("載入 Silero VAD 模型")
         self.vad_model, self.vad_utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
@@ -76,7 +77,7 @@ class VoiceInput:
 
         if msvcrt is None:
             logger.warning("非 Windows 終端：ESC 退出語音模式不可用（說 quit 或 Ctrl+C 結束）")
-        console.emit("[VoiceInput] 準備完成，可以開始說話。（在本視窗按 ESC 可退出語音模式）\n")
+        console.emit("[語音準備完成，可以開始說話（在本視窗按 ESC 回到文字模式）]\n")
 
     def listen(self) -> str | None:
         """
@@ -108,7 +109,7 @@ class VoiceInput:
 
                 rms = float(torch.sqrt(torch.mean(tensor ** 2)))
                 if DEBUG_PRINT_RMS:
-                    console.emit(f"[debug] rms={rms:.4f}")
+                    logger.debug(f"rms={rms:.4f}")   # 校準用，看 log 視窗
 
                 # 先用音量門檻過濾底噪，未過門檻不送進 VAD（省一次模型推論）
                 if rms < RMS_GATE:

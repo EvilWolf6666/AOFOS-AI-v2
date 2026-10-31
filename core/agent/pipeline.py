@@ -21,6 +21,9 @@ from typing import Callable, Optional, Tuple
 from config import EVENT_CONFIG, PERSONA_CONFIG
 from core.agent.events import Event
 from core import console
+from core.logger import setup_logger
+
+logger = setup_logger("Pipeline")
 
 
 class TurnResult:
@@ -286,8 +289,8 @@ class Pipeline:
         try:
             self.memory.bg_resume()
         except Exception as e:
-            # 此處不用 logger：Pipeline 不持有 logger，錯誤細節已由 MemoryManager 記錄
-            console.emit(f"[背景記憶恢復失敗，不影響本輪對話：{e}]")
+            # 不影響你這輪的對話，只是背景判斷要等暫停逾時才恢復 ⇒ 屬 log 視窗（config LOG_CONFIG 的分工）
+            logger.error(f"背景判斷恢復失敗（不影響本輪對話，等暫停逾時自動恢復）：{type(e).__name__}: {e}")
 
     # ── 環境事件輪次 ──────────────────────────────────────────────
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 import threading
 
+from config import LOG_CONFIG
 from core.logger import set_console_writer
 
 # ANSI：\r 回到行首，\033[K 清除該行從游標到行尾
@@ -197,7 +198,7 @@ def _log_line(text: str) -> None:
 
 def install_logging_bridge() -> None:
     """
-    把專案 logger 的終端輸出導進 emit()（檔案 log 不受影響）。之後才建立的 logger 也涵蓋，
-    機制見 core.logger._ConsoleSink。
+    把專案 logger 的終端輸出導進 emit()，等級照 LOG_CONFIG["dialog_level"]（預設不印，看 log 視窗）。
+    檔案 log 不受影響。之後才建立的 logger 也涵蓋，機制見 core.logger._ConsoleSink。
     """
-    set_console_writer(_log_line)
+    set_console_writer(_log_line, LOG_CONFIG["dialog_level"])

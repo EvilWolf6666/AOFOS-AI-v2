@@ -11,7 +11,7 @@ from datetime import datetime
 
 import colorlog
 
-from config import LOG_CONFIG, PROJECT_ROOT, TIMING_CONFIG
+from config import PROJECT_ROOT, TIMING_CONFIG
 
 # 日常紀錄（每日 log、timing-*.jsonl）的位置。專案根只取 config.PROJECT_ROOT（config.py 開頭：不得自己推算）。
 # 紀錄結構：logs/daily（本檔）、logs/backend（start_llama_server）、logs/runs/<工具>（各工具每次執行）、logs/archive_lmstudio（舊紀錄）。
@@ -25,8 +25,10 @@ _timing_logger = None
 
 class _ConsoleSink:
     """
-    所有 logger 的終端 handler 共用這一個 stream；寫入當下才決定去哪：
-    有登記 writer（core/console.py 啟動時登記）就交給它，沒有就寫 stderr。
+    所有 logger 的終端 handler 共用這一個 stream；寫入當下才決定去哪、印多少：
+    有登記 writer（core/console.py 啟動時登記）就交給它，沒有就寫 stderr；
+    level 以下的不印（每個終端 handler 的 filter 看這裡）。預設 DEBUG＝全部印，tools/ 腳本的終端用這個；
+    AOFOS 對話視窗登記 writer 時一併給自己的等級（config LOG_CONFIG["dialog_level"]）。
 
     ⭐ 因為每個 handler 從建立起就指向這裡，之後才建立的 logger（例如第一次 timed()
        才誕生的 TIMING）也自動涵蓋，不必在啟動時回頭改接任何 handler。
@@ -36,6 +38,10 @@ class _ConsoleSink:
     """
 
     writer = None
+    level = logging.DEBUG
+
+    def passes(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= self.level
 
     def write(self, text: str) -> int:
         w = self.writer
@@ -53,17 +59,21 @@ class _ConsoleSink:
 _CONSOLE_SINK = _ConsoleSink()
 
 
-def set_console_writer(writer) -> None:
-    """登記終端輸出函式（收到的是一筆已格式化、結尾帶換行的 log）。傳 None 還原成 stderr。"""
+def set_console_writer(writer, level: str | None = "DEBUG") -> None:
+    """
+    登記終端輸出函式（收到的是一筆已格式化、結尾帶換行的 log）與要印的最低等級（None＝都不印）。
+    writer 傳 None 還原成 stderr。
+    """
     _CONSOLE_SINK.writer = writer
+    _CONSOLE_SINK.level = logging.CRITICAL + 1 if level is None else logging.getLevelName(level)
 
 
 def _add_handlers(logger: logging.Logger) -> None:
-    """終端（彩色，經 _ConsoleSink，等級看 LOG_CONFIG）＋ LOG_DIR 每日一份純文字檔。"""
+    """終端（彩色，經 _ConsoleSink，印多少由它決定）＋ LOG_DIR 每日一份純文字檔（全部）。"""
     os.makedirs(LOG_DIR, exist_ok=True)
 
     console_handler = colorlog.StreamHandler(_CONSOLE_SINK)
-    console_handler.setLevel(LOG_CONFIG["console_level"])
+    console_handler.addFilter(_CONSOLE_SINK.passes)
     console_handler.setFormatter(colorlog.ColoredFormatter(
         "%(log_color)s[%(levelname)s]%(reset)s %(name)s — %(message)s",
         log_colors={
@@ -102,7 +112,7 @@ def setup_logger(name: str) -> logging.Logger:
     return logger
 
 
-# 第三方套件的 log 與 warnings 也走同一套出口：寫進每日 log 檔，警告以上經 console 印在對話視窗
+# 第三方套件的 log 與 warnings 也走同一套出口：寫進每日 log 檔，終端印不印同上
 # （不再繞過 console 直接寫 stderr、把輸入列推走）。只收 WARNING 以上（root 預設等級）：
 # 第三方的 INFO／DEBUG 量大且與本專案無關。⚠️ 進度條（tqdm 等）直接寫 stderr、不經 logging，管不到。
 logging.captureWarnings(True)
