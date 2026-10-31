@@ -1,8 +1,13 @@
 # core/llm_client.py
 # 透過 OpenAI 相容 API 連接本機推理後端
 
+import http.client
+import json
+import socket
+import threading
 import time
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -59,6 +64,12 @@ class LLMClient:
         # 以及是否處於評測模式——三個條件的合成見 _should_stream()。
         self.stream = LLM_CONFIG.get("stream", False)
         self._warned_no_usage = False
+
+        # 最近一次 chat() 的紀錄，給量測工具（tools/eval_runner、tools/chat_probe）讀，
+        # 工具不必包本類別的方法。每次 chat() 開頭換成新的 dict（`is` 比對即可知道這輪有沒有呼叫）：
+        #   purpose、messages（實際送出的）、usage（{prompt_tokens, completion_tokens}；拿不到為 None）、
+        #   timings（後端回報的原始 dict；拿不到為 None）、ttft_ms（只有串流才有）、total_ms
+        self.last_call: dict | None = None
 
         logger.info("初始化完成")
         logger.info(
@@ -153,13 +164,15 @@ class LLMClient:
 
     def _check_usage(self, usage, purpose: str, max_tokens: int) -> None:
         """
-        截斷與 context 預算檢查。
+        截斷與 context 預算檢查（順帶記進 last_call）。
 
         ⚠️ 抽成獨立方法是必要的，不是整理癖：串流路徑也需要這三項檢查，
         內嵌在 chat() 裡會立刻變成兩份真相，而它們防的全是「不會報錯」的失敗。
         """
         if usage is None:
             return
+        self.last_call["usage"] = {"prompt_tokens": usage.prompt_tokens,
+                                   "completion_tokens": usage.completion_tokens}
 
         # completion_tokens 貼齊上限時，輸出極可能是被截斷而非自然結束
         if usage.completion_tokens >= max_tokens:
@@ -212,6 +225,7 @@ class LLMClient:
         timings 不是 OpenAI 標準欄位，SDK 放在 model_extra。拿不到只警告一次。
         """
         timings = (getattr(obj, "model_extra", None) or {}).get("timings") if obj is not None else None
+        self.last_call["timings"] = timings or None
         if not timings:
             if not self._warned_no_timings:
                 self._warned_no_timings = True
@@ -266,6 +280,9 @@ class LLMClient:
         回傳值在兩條路徑下一致：完整、已處理、已 strip 的回應字串。
         """
         max_tokens = self.max_tokens_by_purpose.get(purpose, self.max_tokens)
+        t0 = time.monotonic()
+        self.last_call = {"purpose": purpose, "messages": messages, "usage": None,
+                          "timings": None, "ttft_ms": None, "total_ms": None}
 
         try:
             if self._should_stream(on_delta):
@@ -277,6 +294,8 @@ class LLMClient:
             # 「模型答得很差」一模一樣
             logger.error(f"LLM 呼叫失敗（purpose={purpose}，本輪回傳空字串，勿當作模型表現）：{e}")
             return ""
+        finally:
+            self.last_call["total_ms"] = round((time.monotonic() - t0) * 1000)
 
     # ── 非串流路徑 ────────────────────────────────────────────
 
@@ -373,6 +392,7 @@ class LLMClient:
 
                 if ttft is None:
                     ttft = time.monotonic() - t_start
+                    self.last_call["ttft_ms"] = round(ttft * 1000)
 
                 raw_parts.append(piece)
                 shown = fix_traditional(piece)
@@ -452,8 +472,6 @@ class BackgroundLLM:
 
     def __init__(self, *, base_url: str | None = None, model: str | None = None,
                  params: dict | None = None, timeout_s: float = 120.0) -> None:
-        import threading
-        from urllib.parse import urlparse
         u = urlparse(base_url or LLM_CONFIG["base_url"])
         self._host, self._port = u.hostname, u.port or 80
         self._path = u.path.rstrip("/") + "/chat/completions"
@@ -471,7 +489,6 @@ class BackgroundLLM:
 
     def cancel(self) -> bool:
         """要求停止。回傳 True＝當下有請求在跑、已切斷連線。可從任何執行緒呼叫。"""
-        import socket
         self._cancel.set()
         with self._lock:
             sock = self._sock
@@ -512,8 +529,6 @@ class BackgroundLLM:
         ⚠️ 拿不到時仍回空清單，由呼叫端大聲處理（judge.py 會記 WARNING 並退回看文字）。
         ⚠️ 用了 json_schema 時回的是格式限制「之前」的分布，讀不出選項機率，兩者不要合用。
         """
-        import http.client
-        import json as _json
         if self._cancel.is_set():
             raise BackgroundCancelled()
         body = dict(model=self.model, messages=messages, max_tokens=max_tokens,
@@ -539,7 +554,7 @@ class BackgroundLLM:
                     self._sock = conn.sock
                 if self._cancel.is_set():
                     raise BackgroundCancelled()
-                conn.request("POST", self._path, body=_json.dumps(body).encode("utf-8"),
+                conn.request("POST", self._path, body=json.dumps(body).encode("utf-8"),
                              headers={"Content-Type": "application/json",
                                       "Authorization": f"Bearer {LLM_CONFIG['api_key']}"})
                 resp = conn.getresponse()
@@ -554,7 +569,7 @@ class BackgroundLLM:
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    ch = (_json.loads(data).get("choices") or [{}])[0]
+                    ch = (json.loads(data).get("choices") or [{}])[0]
                     piece = (ch.get("delta") or {}).get("content")
                     if piece:
                         parts.append(piece)

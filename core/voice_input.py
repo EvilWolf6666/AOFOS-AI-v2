@@ -3,18 +3,21 @@
 
 import threading
 
-import sounddevice as sd
-import numpy as np
-import torch
-from faster_whisper import WhisperModel
-from pynput import keyboard
-
+# ⚠️ config 必須排在重量套件之前：faster_whisper 會連帶 import huggingface_hub，
+#    而後者在 import 當下就讀 HF_HUB_OFFLINE（config 開頭設定，見 main.py 開頭）。
 from config import VOICE_CONFIG
+from core import console
 from core.logger import setup_logger
 
-# 其他模組要 catch VoiceModeExit 一律從 core.ctrl_signals import；從本檔 import
-# 會在模組層級拉進整個語音棧，且無徵兆。此處僅供本檔 raise。
-from core.ctrl_signals import VoiceModeExit
+import numpy as np
+import sounddevice as sd
+import torch
+from faster_whisper import WhisperModel
+
+try:
+    import msvcrt   # Windows 終端的按鍵緩衝
+except ImportError:  # 非 Windows
+    msvcrt = None
 
 logger = setup_logger("VoiceInput")
 
@@ -26,10 +29,30 @@ RMS_GATE = VOICE_CONFIG["rms_gate"]
 CHUNK_SIZE = VOICE_CONFIG["chunk_size"]
 DEBUG_PRINT_RMS = VOICE_CONFIG["debug_print_rms"]
 
+_ESC = "\x1b"
+
+
+def _drain_keys() -> bool:
+    """讀光終端按鍵緩衝，回傳其中有沒有 ESC。
+
+    ⚠️ 讀的是本終端的輸入緩衝，只有終端視窗在前景時按鍵才會進來。不要改成全域鍵盤 hook
+       （pynput 之類）：那會讓在遊戲或其他程式裡按 ESC 也退出語音模式。
+    """
+    if msvcrt is None:
+        return False
+    hit = False
+    while msvcrt.kbhit():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):   # 方向鍵等特殊鍵是兩碼，第二碼一起讀掉
+            msvcrt.getwch()
+        elif ch == _ESC:
+            hit = True
+    return hit
+
 
 class VoiceInput:
-    def __init__(self, model_size: str = "small", language: str = "zh", exit_key=keyboard.Key.esc):
-        print("[VoiceInput] 載入 Whisper 模型中...")
+    def __init__(self, model_size: str = "small", language: str = "zh"):
+        console.emit("[VoiceInput] 載入 Whisper 模型中...")
         self.whisper = WhisperModel(
             model_size,
             device="cpu",
@@ -37,7 +60,7 @@ class VoiceInput:
         )
         self.language = language
 
-        print("[VoiceInput] 載入 Silero VAD 模型中...")
+        console.emit("[VoiceInput] 載入 Silero VAD 模型中...")
         self.vad_model, self.vad_utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
@@ -49,28 +72,21 @@ class VoiceInput:
          self.VADIterator,
          self.collect_chunks) = self.vad_utils
 
-        # 背景鍵盤監聽：整個 VoiceInput 生命週期只啟動一次，不放在 listen() 裡重複建立
-        self.exit_key = exit_key
-        self._exit_event = threading.Event()
-        self._key_listener = keyboard.Listener(on_press=self._on_key_press)
-        self._key_listener.daemon = True
-        self._key_listener.start()
+        self._stop = threading.Event()   # close() 用：讓進行中的 listen() 在下一個音框結束
 
-        print(f"[VoiceInput] 準備完成，可以開始說話。（按 {self.exit_key} 可隨時退出語音模式）\n")
+        if msvcrt is None:
+            logger.warning("非 Windows 終端：ESC 退出語音模式不可用（說 quit 或 Ctrl+C 結束）")
+        console.emit("[VoiceInput] 準備完成，可以開始說話。（在本視窗按 ESC 可退出語音模式）\n")
 
-    def _on_key_press(self, key):
-        if key == self.exit_key:
-            self._exit_event.set()
-
-    def listen(self) -> str:
+    def listen(self) -> str | None:
         """
-        收音、偵測語音、靜音超過 SILENCE_DURATION 秒後停止並回傳辨識文字。
-        按下退出鍵時拋出 VoiceModeExit，由呼叫端決定後續行為。
+        收音、偵測語音、靜音超過 SILENCE_DURATION 秒後停止並回傳辨識文字（沒聽到東西＝空字串）。
+        使用者在本視窗按 ESC ⇒ 回傳 None（由呼叫端決定後續，見 core/producers/user_input.py）。
         """
-        print("🎙 聆聽中...（按 ESC 可退出語音模式）")
+        console.emit("🎙 聆聽中...（按 ESC 可退出語音模式）")
 
         self.vad_model.reset_states()  # ⚠️ 必須重置，否則上一輪殘留狀態會污染本輪判斷
-        self._exit_event.clear()       # 清空上一輪殘留的退出旗標
+        _drain_keys()                  # 她說話期間按的鍵不算（與上一輪的退出旗標同理）
 
         chunk_size = CHUNK_SIZE
         audio_buffer = []
@@ -80,9 +96,11 @@ class VoiceInput:
 
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32") as stream:
             while True:
-                if self._exit_event.is_set():
-                    print("\n⏹ 偵測到退出鍵，結束語音模式聆聽。")
-                    raise VoiceModeExit("使用者按下退出鍵，要求離開語音模式")
+                if self._stop.is_set():
+                    return ""
+                if _drain_keys():
+                    console.emit("\n⏹ 偵測到退出鍵，結束語音模式聆聽。")
+                    return None
 
                 chunk, _ = stream.read(chunk_size)
                 chunk_mono = chunk[:, 0] if chunk.ndim > 1 else chunk.flatten()
@@ -90,7 +108,7 @@ class VoiceInput:
 
                 rms = float(torch.sqrt(torch.mean(tensor ** 2)))
                 if DEBUG_PRINT_RMS:
-                    print(f"[debug] rms={rms:.4f}")
+                    console.emit(f"[debug] rms={rms:.4f}")
 
                 # 先用音量門檻過濾底噪，未過門檻不送進 VAD（省一次模型推論）
                 if rms < RMS_GATE:
@@ -122,9 +140,9 @@ class VoiceInput:
             beam_size=5,
         )
         text = "".join(seg.text for seg in segments).strip()
-        print(f"📝 辨識結果：{text}")
+        console.emit(f"📝 辨識結果：{text}")
         return text
 
     def close(self):
-        """停止背景鍵盤監聽 thread，於程式結束時呼叫（切換模式時不呼叫，見 Agent._get_next_event）。"""
-        self._key_listener.stop()
+        """程式結束時呼叫：進行中的 listen() 在下一個音框（約 32 ms）內結束。"""
+        self._stop.set()

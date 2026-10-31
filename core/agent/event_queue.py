@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from typing import Optional
 
 from core.agent.events import Event, OBSERVATION
 
@@ -52,11 +53,15 @@ class EventQueue:
             self._items.append(event)
             self._cond.notify()
 
-    def get(self) -> Event:
-        """取出最早的事件，佇列為空時阻塞等待。"""
+    def get(self, timeout: Optional[float] = None) -> Optional[Event]:
+        """取出最早的事件；佇列為空時最多等 timeout 秒，等不到回傳 None（timeout=0 不等）。
+
+        ⚠️ 主執行緒一律帶 timeout 分段等：Windows 上不帶逾時的 wait 收不到 Ctrl+C
+           （Python 3.14 前），主迴圈會卡死在這裡。
+        """
         with self._cond:
-            while not self._items:
-                self._cond.wait()
+            if not self._cond.wait_for(lambda: self._items, timeout):
+                return None
             return self._items.popleft()
 
     def qsize(self) -> int:

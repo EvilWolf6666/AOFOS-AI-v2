@@ -4,7 +4,7 @@
 
 用法：python -m tools.judge_examples            （只跑下方 HELD_OUT：不在提示詞裡的句子）
       python -m tools.judge_examples --all      （另外把 prompts/memory_judge.txt【例子】也跑一遍）
-（推理後端照平常開著（start\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/runs/judge_examples/judge_examples_*.json。）
+（推理後端照平常開著（start\\啟動推理後端.bat）。不碰記憶檔；原始回應整份落檔 logs/runs/judge_examples/judge_examples_*.json。）
 
 ⭐ 分兩組是為了不「拿考古題考」（句子全在提示詞裡時分數偏樂觀）：
    HELD_OUT 刻意不放進提示詞；提示詞的例子只用 --all 順便看。

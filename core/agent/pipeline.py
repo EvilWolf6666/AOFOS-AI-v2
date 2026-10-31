@@ -19,21 +19,19 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple
 
 from config import EVENT_CONFIG, PERSONA_CONFIG
-from core.agent.events import Event, OBSERVATION
+from core.agent.events import Event
 from core import console
 
 
 class TurnResult:
-    """單輪處理結果，供 Agent 決定要不要印出來 / 驅動 VTube / 結束迴圈。"""
+    """單輪處理結果，供 Agent 決定要不要印出來。結束與否只看 state.running。"""
 
     def __init__(
         self,
-        should_exit: bool = False,
         reply: Optional[str] = None,
         system_message: Optional[str] = None,
         printed: bool = False,
     ) -> None:
-        self.should_exit = should_exit
         self.reply = reply
         self.system_message = system_message
 
@@ -138,7 +136,7 @@ class Pipeline:
     def is_command(self, user_input: str) -> bool:
         return self._resolve(user_input) is not None
 
-    def handle_command(self, user_input: str, state, voice_input_factory: Callable) -> TurnResult:
+    def handle_command(self, user_input: str, state) -> TurnResult:
         """
         處理系統指令，回傳結果讓 Agent 決定後續動作（此處不直接操作 VTube 等模組）。
 
@@ -149,33 +147,32 @@ class Pipeline:
         if resolved is None:
             raise KeyError(user_input)
         handler, arg = resolved
-        return handler(state, voice_input_factory, arg)
+        return handler(state, arg)
 
-    # ── 指令 handler（簽名統一為 (state, voice_input_factory, arg)）─
+    # ── 指令 handler（簽名統一為 (state, arg)）──────────────────────
 
-    def _cmd_quit(self, state, _factory, _arg) -> TurnResult:
-        # 離場收尾（補寫原句、關背景判斷、重建事件層；毫秒級，不需要「請稍候」提示）。
-        self.memory.compress_on_exit()
+    def _cmd_quit(self, state, _arg) -> TurnResult:
+        # 只標記結束；收尾（記憶、背景判斷、連線）一律在 Agent._shutdown()，Ctrl+C 與例外也走那裡。
         state.stop()
-        return TurnResult(should_exit=True, system_message="掰掰。")
+        return TurnResult(system_message="掰掰。")
 
-    def _cmd_mode_text(self, state, _factory, _arg) -> TurnResult:
+    def _cmd_mode_text(self, state, _arg) -> TurnResult:
         state.switch_to_text()
         return TurnResult(system_message="[切換為文字模式]")
 
-    def _cmd_mode_voice(self, state, voice_input_factory, _arg) -> TurnResult:
-        state.switch_to_voice(voice_input_factory)
+    def _cmd_mode_voice(self, state, _arg) -> TurnResult:
+        state.switch_to_voice()
         return TurnResult(system_message="[切換為語音模式]")
 
-    def _cmd_proactive_on(self, state, _factory, _arg) -> TurnResult:
+    def _cmd_proactive_on(self, state, _arg) -> TurnResult:
         state.proactive_enabled = True
         return TurnResult(system_message="[已開啟：會對環境事件作出反應]")
 
-    def _cmd_proactive_off(self, state, _factory, _arg) -> TurnResult:
+    def _cmd_proactive_off(self, state, _arg) -> TurnResult:
         state.proactive_enabled = False
         return TurnResult(system_message="[已關閉：環境事件將被忽略]")
 
-    def _cmd_test_on(self, _state, _factory, _arg) -> TurnResult:
+    def _cmd_test_on(self, _state, _arg) -> TurnResult:
         self._set_test_mode(True)
         return TurnResult(system_message=(
             "[測試模式已開啟]\n"
@@ -187,7 +184,7 @@ class Pipeline:
             "  · 本設定不寫入 config，重開程式後自動回到正常模式"
         ))
 
-    def _cmd_test_off(self, _state, _factory, _arg) -> TurnResult:
+    def _cmd_test_off(self, _state, _arg) -> TurnResult:
         self._set_test_mode(False)
         return TurnResult(system_message=(
             "[測試模式已關閉]\n"
@@ -205,7 +202,7 @@ class Pipeline:
         self.memory.set_test_mode(on)
         self.llm.set_test_mode(on)
 
-    def _cmd_status(self, state, _factory, _arg) -> TurnResult:
+    def _cmd_status(self, state, _arg) -> TurnResult:
         return TurnResult(system_message=(
             "[目前狀態]\n"
             f"  · 模式：{'文字' if state.mode == 't' else '語音'}\n"
@@ -259,8 +256,7 @@ class Pipeline:
 
         🔴 **但只傳到這一層為止。** 往下呼叫 MemoryManager 時改傳明確的值，
         不傳 Event 物件——core/memory/ 是 core/agent/ 的下層，讓它 import
-        core.agent.events 會造成反向依賴，而那正是 events.py 與 ctrl_signals.py
-        兩處檔頭都明寫要避免的事。
+        core.agent.events 會造成反向依賴，而那正是 events.py 檔頭明寫要避免的事。
         ⭐ 附帶好處：**記憶的欄位集是它自己的規格，不該隨 Event 新增欄位而漂移。**
         """
         user_input = event.payload

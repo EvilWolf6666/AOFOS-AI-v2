@@ -205,7 +205,7 @@ def set_meta(cx: sqlite3.Connection, key: str, value: int) -> None:
 def _selftest() -> int:  # noqa: C901
     import shutil, tempfile, threading, time
 
-    from core.memory.pre_write import PreWrite, content_hash
+    from core.memory.pre_write import PreWrite
     from core.memory.transcript import Transcript
 
     fails: list[str] = []

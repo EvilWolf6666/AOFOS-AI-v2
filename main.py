@@ -12,7 +12,9 @@ from __future__ import annotations
 # 環境設定集中於 config.py：tools/ 底下的腳本直接 import config、不經過 main.py（《歸檔》I0026）。
 import config  # noqa: F401
 
+import os  # noqa: E402
 import sys  # noqa: E402
+import traceback  # noqa: E402
 
 from core.agent.agent import Agent  # noqa: E402
 from core.memory.run_lock import RunLock, lock_path  # noqa: E402
@@ -33,4 +35,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    code = 1
+    try:
+        main()
+        code = 0
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+    except BaseException:
+        traceback.print_exc()
+    finally:
+        # ⚠️ 收尾在 Agent.run() 裡已做完，這裡直接結束行程、不走 Python 的正常退出：
+        #    文字讀取執行緒可能還卡在 input()（OS 層阻塞、停不了），正常退出時 C 執行環境要先
+        #    鎖住 stdin 才能清理，整個行程就卡在那裡（Linux 終端實測，Ctrl+C 後關不掉）。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)

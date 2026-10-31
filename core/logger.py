@@ -4,13 +4,14 @@
 import json
 import logging
 import os
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
 
 import colorlog
 
-from config import PROJECT_ROOT, TIMING_CONFIG
+from config import LOG_CONFIG, PROJECT_ROOT, TIMING_CONFIG
 
 # 日常紀錄（每日 log、timing-*.jsonl）的位置。專案根只取 config.PROJECT_ROOT（config.py 開頭：不得自己推算）。
 # 紀錄結構：logs/daily（本檔）、logs/backend（start_llama_server）、logs/runs/<工具>（各工具每次執行）、logs/archive_lmstudio（舊紀錄）。
@@ -21,53 +22,48 @@ LOG_LEVEL = logging.DEBUG
 # 所有計時輸出共用同一個 logger，方便單獨調整等級或關閉
 _timing_logger = None
 
-# 終端輸出目標。None 表示直接寫 stderr（colorlog 預設）。
-#
-# ⚠️ 由 core/console.py 在啟動時透過 set_console_stream() 設定。相依方向刻意
-# 是「console 告訴 logger」而非「logger 去 import console」——logger 的職責是
-# 決定記什麼、什麼格式，輸出到哪裡是終端層的事，日後改成寫檔或送遠端時
-# 不必動 logger。
-_console_stream = None
 
-# 本模組建立過的 logger 名稱。
-#
-# 用途：core/console.py 需要把「專案自己的終端輸出」導向終端協調器，但
-# logging.root.manager.loggerDict 會一併取到 chromadb、sentence-transformers
-# 等所有 import 過的第三方套件。由建立方登記是唯一不會漏也不會多的來源——
-# 在 console.py 另外硬編一份清單會變成兩處真相，新增模組時漏改即靜默失效。
-KNOWN_LOGGERS: list[str] = []
-
-
-def set_console_stream(stream) -> None:
+class _ConsoleSink:
     """
-    登記終端輸出目標。設定之後才建立的 logger 會直接使用它，不必再改接。
+    所有 logger 的終端 handler 共用這一個 stream；寫入當下才決定去哪：
+    有登記 writer（core/console.py 啟動時登記）就交給它，沒有就寫 stderr。
 
-    ⚠️ 存在理由是「惰性建立的 logger 會漏掉」：TIMING logger 在第一次 timed()
-    區塊結束時才誕生，而那必定發生在 console.install_logging_bridge() 之後
-    ——它是全專案輸出最密集的 logger，且必定發生在使用者等待回應期間
-    （此時輸入提示正在等待），漏掉它等於終端協調在最主要的來源上失效。
-    只靠「改接既有 logger」的做法無法涵蓋這種情況。
+    ⭐ 因為每個 handler 從建立起就指向這裡，之後才建立的 logger（例如第一次 timed()
+       才誕生的 TIMING）也自動涵蓋，不必在啟動時回頭改接任何 handler。
+
+    ⚠️ 相依方向刻意是「console 告訴 logger」而非「logger 去 import console」——
+       logger 只決定記什麼、什麼格式，輸出到哪裡是終端層的事。
     """
-    global _console_stream
-    _console_stream = stream
+
+    writer = None
+
+    def write(self, text: str) -> int:
+        w = self.writer
+        if w is None:
+            sys.stderr.write(text)   # 當下的 sys.stderr，不是 import 時的那個
+        else:
+            w(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.writer is None:
+            sys.stderr.flush()
 
 
-def setup_logger(name: str) -> logging.Logger:
-    """建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 LOG_DIR（純文字，每日一份）。"""
+_CONSOLE_SINK = _ConsoleSink()
+
+
+def set_console_writer(writer) -> None:
+    """登記終端輸出函式（收到的是一筆已格式化、結尾帶換行的 log）。傳 None 還原成 stderr。"""
+    _CONSOLE_SINK.writer = writer
+
+
+def _add_handlers(logger: logging.Logger) -> None:
+    """終端（彩色，經 _ConsoleSink，等級看 LOG_CONFIG）＋ LOG_DIR 每日一份純文字檔。"""
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger  # 避免重複加 handler
-
-    if name not in KNOWN_LOGGERS:
-        KNOWN_LOGGERS.append(name)
-
-    logger.setLevel(LOG_LEVEL)
-    logger.propagate = False  # 避免日後有人加了 root handler 造成重複輸出
-
-    console_handler = colorlog.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler = colorlog.StreamHandler(_CONSOLE_SINK)
+    console_handler.setLevel(LOG_CONFIG["console_level"])
     console_handler.setFormatter(colorlog.ColoredFormatter(
         "%(log_color)s[%(levelname)s]%(reset)s %(name)s — %(message)s",
         log_colors={
@@ -90,13 +86,28 @@ def setup_logger(name: str) -> logging.Logger:
         datefmt="%H:%M:%S"
     ))
 
-    # 在 addHandler 之前套用，涵蓋 set_console_stream() 之後才建立的 logger
-    if _console_stream is not None:
-        console_handler.stream = _console_stream
-
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
+
+
+def setup_logger(name: str) -> logging.Logger:
+    """建立並回傳指定名稱的 logger，同時輸出到終端機（彩色）與 LOG_DIR（純文字，每日一份）。"""
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger  # 避免重複加 handler
+
+    logger.setLevel(LOG_LEVEL)
+    logger.propagate = False  # 不往 root 傳：root 另有自己的 handler（見下方第三方套件），傳上去會印兩次
+    _add_handlers(logger)
     return logger
+
+
+# 第三方套件的 log 與 warnings 也走同一套出口：寫進每日 log 檔，警告以上經 console 印在對話視窗
+# （不再繞過 console 直接寫 stderr、把輸入列推走）。只收 WARNING 以上（root 預設等級）：
+# 第三方的 INFO／DEBUG 量大且與本專案無關。⚠️ 進度條（tqdm 等）直接寫 stderr、不經 logging，管不到。
+logging.captureWarnings(True)
+if not logging.getLogger().handlers:
+    _add_handlers(logging.getLogger())
 
 
 def _get_timing_logger() -> logging.Logger:

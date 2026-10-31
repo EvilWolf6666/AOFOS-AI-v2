@@ -41,7 +41,7 @@ def open_handles(d: str) -> list[str]:
        （Windows 實跑時自測在清暫存資料夾時炸過）。這裡在 Linux 上把同一件事變成可見。
     """
     import gc
-    gc.collect()
+    gc.collect()   # sqlite3 連線可能卡在循環參考裡，先收掉，只留真的還被持有的
     fd_dir = "/proc/self/fd"
     if not os.path.isdir(fd_dir):
         return []
@@ -65,10 +65,23 @@ def mm(d: str, **kw) -> MemoryManager:
                          test_db_path=os.path.join(d, "memory_test.db"), **kw)
 
 
-def block(ctx: list[dict]) -> str:
-    """整個 ⟦記憶⟧ 區塊（沒有就空字串）。只認以 block_open 開頭的那則（固定說明不算）。"""
-    return "\n".join(m["content"] for m in ctx
-                     if m["role"] == "system" and m["content"].startswith(MEMORY_CONFIG["block_open"]))
+def sent(m: MemoryManager, text: str) -> list[dict]:
+    """正式路徑實際送出的形狀（build_turn：context ＋ 本輪 user），區塊位置依 config 的 block_position。"""
+    context, user_content = m.build_turn(text)
+    return context + [{"role": "user", "content": user_content}]
+
+
+def block(msgs: list[dict]) -> str:
+    """整個 ⟦記憶⟧ 區塊（沒有就空字串）：尾端 system，或併在本輪 user 開頭（block_position）。固定說明不算。"""
+    op, cl = MEMORY_CONFIG["block_open"], MEMORY_CONFIG["block_close"]
+    out = []
+    for i, x in enumerate(msgs):
+        c = x["content"]
+        if x["role"] == "system" and c.startswith(op):
+            out.append(c)
+        elif x["role"] == "user" and i == len(msgs) - 1 and c.startswith(op) and cl in c:
+            out.append(c[:c.index(cl) + len(cl)])
+    return "\n".join(out)
 
 
 def count(path: str) -> int:
@@ -102,15 +115,15 @@ def main() -> int:  # noqa: C901
         m.add_turn("我上次去高雄玩了三天", "高雄的海風很舒服吧", source="user_text", kind="utterance")
         m.add_turn("", "你在打 Minecraft 耶", source="window", kind="observation",
                    situation="使用者切換到 Minecraft")
-        check("第一場沒有上一場 ⇒ 不注入開場", block(m.get_context("嗨")) == "")
-        m.compress_on_exit()
+        check("第一場沒有上一場 ⇒ 不注入開場", block(sent(m, "嗨")) == "")
+        m.close()
         cx = sqlite3.connect(os.path.join(d, "memory.db"))
         check("原句落地、clean 欄已寫", cx.execute("SELECT COUNT(*) FROM transcript").fetchone()[0] == 4
               and cx.execute("SELECT COUNT(*) FROM transcript WHERE clean IS NULL").fetchone()[0] == 0)
         cx.close()
 
         m2 = mm(d)   # 新場次
-        ctx = m2.get_context("")
+        ctx = sent(m2, "")
         b0 = block(ctx)
         check("新場次開頭帶狀態（包夾）",
               b0.startswith(MEMORY_CONFIG["block_open"]) and b0.endswith(MEMORY_CONFIG["block_close"])
@@ -121,21 +134,25 @@ def main() -> int:  # noqa: C901
                   MEMORY_CONFIG["block_open"] in fixed and not fixed.startswith(MEMORY_CONFIG["block_open"])
                   and MEMORY_CONFIG["block_note"] not in b0, fixed[:120])
             check("固定說明：每輪逐字相同（快取前綴不變）",
-                  m2.get_context("")[0] == ctx[0] and m2.get_context("隨便問")[0] == ctx[0])
+                  sent(m2, "")[0] == ctx[0] and sent(m2, "隨便問")[0] == ctx[0])
         else:
             check("區塊自帶說明（inline）", MEMORY_CONFIG["block_note"] in b0, b0[:300])
         mi = mm(d, cfg_override={"v4_enabled": False, "note_position": "inline"})
-        bi = block(mi.get_context(""))
+        bi = block(sent(mi, ""))
         check("inline 模式＝舊形狀（說明在區塊第二行、沒有固定說明）",
               bi.split("\n")[1] == MEMORY_CONFIG["block_note"]
               and not any(MEMORY_CONFIG["block_open"] in x["content"] and not x["content"].startswith(MEMORY_CONFIG["block_open"])
-                          for x in mi.get_context("")), bi[:200])
-        mi.compress_on_exit()
+                          for x in sent(mi, "")), bi[:200])
+        mi.close()
         check("開場不帶原句（代表句／最後幾句已淘汰）",
               "那次最後幾句" not in b0 and "那次你特別說過" not in b0 and "我上次去高雄" not in b0, b0)
         check("開場不含日期數字", "2026-" not in b0 and "天前" not in b0)
-        check("注入在尾端、送模型的訊息只有 role/content",
-              ctx and ctx[-1]["role"] == "system" and all(set(x) == {"role", "content"} for x in ctx))
+        op = MEMORY_CONFIG["block_open"]
+        check("區塊緊鄰本輪輸入（尾端 system，或併在本輪 user 開頭）、送模型的訊息只有 role/content",
+              len(ctx) >= 2 and ctx[-1]["role"] == "user"
+              and (ctx[-1]["content"].startswith(op)
+                   or (ctx[-2]["role"] == "system" and ctx[-2]["content"].startswith(op)))
+              and all(set(x) == {"role", "content"} for x in ctx))
 
         print("\n[測試模式：讀取共用、寫入分流]")
         daily = os.path.join(d, "memory.db")
@@ -143,13 +160,13 @@ def main() -> int:  # noqa: C901
         m2.set_test_mode(True)
         check("WM 清空", m2.working_memory == [])
         m2.add_turn("測試區才有的句子：藍莓鬆餅", "好")
-        check("開場仍讀日常區", "[狀態]" in block(m2.get_context("")))
+        check("開場仍讀日常區", "[狀態]" in block(sent(m2, "")))
         check("測試區有寫入", count(os.path.join(d, "memory_test.db")) == 2)
         check("日常區整輪靜止（筆數不變）", count(daily) == before)
         m2.set_test_mode(False)
         check("關閉後測試區整包丟棄",
               not any(os.path.exists(os.path.join(d, "memory_test.db" + s)) for s in ("", "-wal", "-shm")))
-        m2.compress_on_exit()
+        m2.close()
 
     with tempfile.TemporaryDirectory() as d:
         print("\n[壞資料]")
@@ -167,7 +184,7 @@ def main() -> int:  # noqa: C901
         """)
         old.commit(); old.close()
         m = mm(d)
-        b = block(m.get_context("台南"))
+        b = block(sent(m, "台南"))
         check("舊檔補欄位後照常運作、開場時間是口語", "上次聊天是" in b and "2026-" not in b, b[:160])
         cx = connect(p)
         pw = PreWrite(cx)
@@ -179,7 +196,7 @@ def main() -> int:  # noqa: C901
             check("預寫區 hash 不符時不崩潰", True)
         except Exception as e:  # noqa: BLE001
             check("預寫區 hash 不符時不崩潰", False, repr(e))
-        m.compress_on_exit()
+        m.close()
 
     with tempfile.TemporaryDirectory() as d:
         print("\n[寫入失敗]")
@@ -187,7 +204,7 @@ def main() -> int:  # noqa: C901
         m = mm(d)
         try:
             m.add_turn("存不進去的一句", "嗯")
-            ctx = m.get_context("存不進去")
+            ctx = sent(m, "存不進去")
             check("寫入失敗不中斷對話", True)
             check("沒寫進去的留在 WM", len([t for t in m.working_memory if "serial" not in t]) == 2)
             check("WM 照常進 context", any(x["content"] == "存不進去的一句" for x in ctx))
@@ -203,7 +220,7 @@ def main() -> int:  # noqa: C901
                 w = mm(d)
                 for i in range(40):
                     w.add_turn(f"{tag}說的第{i}句", f"回{tag}{i}")
-                w.compress_on_exit()
+                w.close()
             except Exception as e:  # noqa: BLE001
                 errs.append(repr(e))
 
@@ -215,13 +232,13 @@ def main() -> int:  # noqa: C901
 
         print("\n[跨執行緒誤用要大聲]")
         m = mm(d)
-        m.get_context("甲")   # 主執行緒開了連線
+        sent(m, "甲")   # 主執行緒開了連線
         m._opening_cache = None
         out: list = []
-        th = threading.Thread(target=lambda: out.append(m.get_context("甲說的")))
+        th = threading.Thread(target=lambda: out.append(sent(m, "甲說的")))
         th.start(); th.join()
         check("別的執行緒呼叫不崩潰、回傳不含注入（錯誤已記 log）", out and block(out[0]) == "")
-        m.compress_on_exit()
+        m.close()
 
     with tempfile.TemporaryDirectory() as d:
         print("\n[事件層與開場]")
@@ -240,7 +257,7 @@ def main() -> int:  # noqa: C901
             for i in range(5):
                 clock[0] = base + timedelta(hours=3, minutes=i)
                 m.add_turn(f"在寫記憶模塊第{i}次", f"加油{i}")
-            m.compress_on_exit()
+            m.close()
         finally:
             mgr._now_iso = real_now
         cx = connect(os.path.join(d, "memory.db"))
@@ -252,13 +269,13 @@ def main() -> int:  # noqa: C901
               str(last["keywords"]))
         cx.close()
         m2 = mm(d)
-        b1 = block(m2.get_context("嗨"))
+        b1 = block(sent(m2, "嗨"))
         check("開場帶上一場關鍵詞", "[上一場] 聊到：" in b1 and "記憶模塊" in b1, b1[:300])
         check("開場時間是口語（很久以前的那場）", "上次聊天是" in b1 and "2026-" not in b1, b1[:120])
         for i in range(3):
             m2.add_turn(f"閒聊{i}", "嗯")
-        check("過了開頭幾輪就不再帶開場", "[上一場]" not in block(m2.get_context("閒聊")))
-        m2.compress_on_exit()
+        check("過了開頭幾輪就不再帶開場", "[上一場]" not in block(sent(m2, "閒聊")))
+        m2.close()
         now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone(timedelta(hours=8)))
         check("時間感：昨天／上週／很久",
               (time_bucket("2026-09-26T12:00:00+08:00", now), time_bucket("2026-09-18T12:00:00+08:00", now),
