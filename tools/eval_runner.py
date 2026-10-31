@@ -164,58 +164,35 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
     memory = None
     try:
         llm = LLMClient()
-        persona = Persona()
+        persona = Persona(send_system=not no_persona)
         memory = MemoryManager(llm, db_path=os.path.join(work, "memory.db"),
                                test_db_path=os.path.join(work, "memory_test.db"))
         pipeline = Pipeline(llm, persona, memory)
-
-        usage_log: list[dict] = []
-        orig_usage = llm._check_usage
-
-        def check_usage(usage, purpose, max_tokens):
-            if purpose == "dialogue":
-                usage_log.append(None if usage is None else
-                                 {"prompt_tokens": usage.prompt_tokens,
-                                  "completion_tokens": usage.completion_tokens})
-            return orig_usage(usage, purpose, max_tokens)
-
-        sent: list = []
-        orig_build = persona.build_messages
-
-        def build(history, user_input):
-            msgs = orig_build(history, user_input)
-            if no_persona:
-                # 只拿掉開頭的人格 system；開頭不是它就報錯（Persona.build_messages 形狀變了）。
-                if not (msgs and msgs[0].get("role") == "system" and msgs[0].get("content") == persona.system_prompt):
-                    raise RuntimeError("--no-persona：送出的第一則不是人格 system，Persona.build_messages 形狀可能改了")
-                msgs = msgs[1:]
-            sent.append(msgs)
-            return msgs
-
-        llm._check_usage, persona.build_messages = check_usage, build
 
         pipeline._set_test_mode(True)   # ＝ /test on
         if not (llm.test_mode and memory.test_mode):
             raise RuntimeError(f"測試模式沒開成（llm={llm.test_mode}, memory={memory.test_mode}）")
 
         for t in turns:
-            nu, ns = len(usage_log), len(sent)
+            before = llm.last_call
             res = pipeline.handle_turn(Event("user_text", UTTERANCE, t))
             pipeline.finalize_turn()
-            u = usage_log[nu] if len(usage_log) > nu else None
+            # 本輪的 LLM 呼叫紀錄（LLMClient.last_call；換了一個新的 dict 才算這輪有呼叫）
+            call = llm.last_call if llm.last_call is not before else None
+            u = call and call["usage"]
             rec["turns"].append({
                 "input": t,
                 "reply": res.reply,
                 "prompt_tokens": u and u["prompt_tokens"],
                 "completion_tokens": u and u["completion_tokens"],
-                "messages": sent[ns] if len(sent) > ns else None,
+                "messages": call and call["messages"],
             })
     except Exception as e:  # noqa: BLE001  錯誤寫進結果，由父行程大聲列出
         rec["error"] = f"{type(e).__name__}: {e}"
     finally:
         if memory is not None:
             try:
-                memory.compress_on_exit()   # 測試模式下＝丟棄測試區、關連線（暫存資料夾裡的）
+                memory.close()   # 測試模式下＝丟棄測試區、關連線（暫存資料夾裡的）
             except Exception as e:  # noqa: BLE001
                 rec["error"] = (rec["error"] or "") + f"｜收尾失敗：{type(e).__name__}: {e}"
         with open(out_file, "w", encoding="utf-8") as f:

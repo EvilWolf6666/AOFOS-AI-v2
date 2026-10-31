@@ -70,9 +70,9 @@ def _print_messages(query: str) -> None:
         for x in ctx + [{"role": "user", "content": user_content}]:
             print(f'--- role={x["role"]} ---\n{x["content"]}')
     finally:
-        # 只呼叫 compress_on_exit()：測試模式下它會自己丟棄測試區、不碰日常區。
+        # 只呼叫 close()：測試模式下它會自己丟棄測試區、不碰日常區。
         #    ⚠️ 先 set_test_mode(False) 會把日常區以可寫開啟並重建事件層，違反「不寫入日常區」。
-        m.compress_on_exit()
+        m.close()
 
 
 if __name__ == "__main__":

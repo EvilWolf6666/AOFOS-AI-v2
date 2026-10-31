@@ -30,6 +30,7 @@ from core.memory.db import connect
 from core.memory.judge import (_FORCE_BUILD, decide, drop_copies, fallback_topic, load_prompt, norm_topic, p_build,
                                parse_topics, prompt_digest, split_answer, split_segment)
 from core.memory.manager import MemoryManager
+from core.memory.selftest import block as injected, open_handles, sent   # 兩份自測共用，不各寫一份
 from core.memory.topic_index import TopicSearch, fill_fts
 from core.memory.topics import SCHEMA as TOPIC_SCHEMA
 from core.memory.topics import TopicStore
@@ -177,29 +178,6 @@ def wait(pred, timeout=8.0) -> bool:
     return False
 
 
-def open_handles(d: str) -> list[str]:
-    """本行程還開著、指向 d 底下的檔案（Linux 用 /proc 看；其他平台回空＝不檢查）。
-
-    🔴 存在理由：Windows 不能刪開著的檔，Linux 可以 ⇒ 連線漏關在 Linux 自測永遠看不出來
-       （Windows 實跑時自測在清暫存資料夾時炸過）。這裡在 Linux 上把同一件事變成可見。
-    """
-    import gc
-    gc.collect()   # sqlite3 連線可能卡在循環參考裡，先收掉，只留真的還被持有的
-    fd_dir = "/proc/self/fd"
-    if not os.path.isdir(fd_dir):
-        return []
-    real = os.path.realpath(d)
-    out = []
-    for fd in os.listdir(fd_dir):
-        try:
-            t = os.readlink(os.path.join(fd_dir, fd))
-        except OSError:
-            continue
-        if t.startswith(real):
-            out.append(os.path.basename(t))
-    return sorted(out)
-
-
 def has_table(path: str, name: str) -> bool:
     # 🔴 一定要關：Windows 上沒關的連線會讓測試區刪不掉、暫存資料夾清不掉
     #    （Linux 刪得掉開著的檔，所以 Linux 上自測看不出來）。
@@ -208,12 +186,6 @@ def has_table(path: str, name: str) -> bool:
         return cx.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone() is not None
     finally:
         cx.close()
-
-
-def injected(ctx: list[dict]) -> str:
-    # 只認以 block_open 開頭的區塊：固定說明（note_position="fixed"）也提到標記，但不是注入內容
-    return "\n".join(m["content"] for m in ctx
-                     if m["role"] == "system" and m["content"].startswith(MEMORY_CONFIG["block_open"]))
 
 
 def mm(d: str, fake: FakeLLM, **over) -> MemoryManager:
@@ -322,7 +294,7 @@ def main() -> int:
         for i in range(31):
             m.add_turn(f"u{i}", f"a{i}")
             sizes.append(len(m.working_memory) // 2)
-        m.compress_on_exit()
+        m.close()
         check("滿 20 輪後一次丟 10 輪、之後再長回 20（開頭只在丟的那輪改變）",
               sizes[:20] == list(range(1, 21)) and sizes[20:31] == list(range(11, 21)) + [11], str(sizes))
 
@@ -493,17 +465,17 @@ def main() -> int:
                                              max_topics=MEMORY_CONFIG["judge_max_topics"])[0])
             check("判斷來源落地（模型 alias＋規則檔雜湊）", src == {("fake", want)}, f"{src} want={want}")
             check("speaker_id 落地（使用者／奧狐）", spk == ["evilwolf", "aofos"] * 2, str(spk))
-            inj = injected(m.get_context("港都熱不熱"))
+            inj = injected(sent(m, "港都熱不熱"))
             check("同義查詢撈回主題句（帶口語時間）", "邪狼住在高雄" in inj and "（剛剛）" in inj, inj)
-            inj = injected(m.get_context("高雄熱不熱"))
+            inj = injected(sent(m, "高雄熱不熱"))
             check("兩路都命中同一件 ⇒ 只出現一次（聯集去重）", inj.count("邪狼住在高雄") == 1, inj)
-            inj = injected(m.get_context("喵星人好嗎"))
+            inj = injected(sent(m, "喵星人好嗎"))
             check("第二件也撈得回", "貓很胖" in inj, inj)
 
             turn(m, "我搬到台北了，現在住那邊", "恭喜搬家")
             # 進度推進（add_topics）與補向量是先後兩步 ⇒ 要等向量補完再查，否則偶發撈不到新的那件
             ok = wait(lambda: judged(m)[0] == 6 and "主題未補向量 0" in m.status_text())
-            inj = injected(m.get_context("你現在住哪"))
+            inj = injected(sent(m, "你現在住哪"))
             check("新住地取代舊住地：只注入台北", ok and "台北" in inj and "高雄" not in inj, inj)
 
             turn(m, "今天天氣不錯", "對啊")
@@ -577,13 +549,13 @@ def main() -> int:
             check("施測中不判（測試區沒有主題表）", not has_table(m.memory_path, "topic"))
             check("/status 即時顯示施測區待判 2 句（背景停用、不判）", "待判 2 句" in m.status_text(),
                   m.status_text())
-            inj = injected(m.get_context("你住哪"))
+            inj = injected(sent(m, "你住哪"))
             check("施測中仍讀得到日常區主題", "台北" in inj, inj)
             m.set_test_mode(False)
             check("離場測試區整包丟棄", not os.path.exists(os.path.join(d, "memory_test.db")))
             check("日常區進度沒被施測動到", judged(m)[0] == before)
 
-            m.compress_on_exit()
+            m.close()
             h = open_handles(d)
             check("離場後沒有任何連線還開著（Windows 才刪得掉）", not h, str(h))
 
@@ -593,7 +565,7 @@ def main() -> int:
             turn(m, "我朋友阿凱下次會來直播", "好期待")
             turn(m, "我住在高雄", "嗯")
             ok = wait(lambda: judged(m)[0] == 4 and "主題未補向量 0" in m.status_text())
-            inj = injected(m.get_context("阿凱什麼時候來"))
+            inj = injected(sent(m, "阿凱什麼時候來"))
             check("向量下限調到撈不到 ⇒ 仍由關鍵字撈回專有名詞那件、且只有配額內 1 件",
                   ok and "阿凱下次會來" in inj and "高雄" not in inj, inj)
             turn(m, "這段會抄例子", "嗯")
@@ -612,7 +584,7 @@ def main() -> int:
                   and fb["type"] == "原句" and fb["attr_key"] is None
                   and "全抄那天" in fb["text"] and "／" in fb["text"] and "對話時間" not in fb["text"],
                   f"{st_} {dict(fb) if fb else None}")
-            m.compress_on_exit()
+            m.close()
             h = open_handles(d)
             check("離場後沒有任何連線還開著", not h, str(h))
 
@@ -630,7 +602,7 @@ def main() -> int:
                               cfg_override={"v4_enabled": False})
             for u in ("我住在高雄", "我家的貓很胖", "今天天氣不錯"):
                 m.add_turn(u, "嗯")
-            m.compress_on_exit()
+            m.close()
             mk = lambda: BackgroundLLM(base_url=fake.base_url, model="fake", params={"temperature": 0.0})
             over = {"judge_segment_close_s": 0, "judge_segment_max": 2, "v4_enabled": True}
             lines: list[str] = []
@@ -655,7 +627,7 @@ def main() -> int:
             m = MemoryManager(None, db_path=db, test_db_path=os.path.join(d, "t.db"), embed_enabled=False,
                               cfg_override={"v4_enabled": False})
             m.add_turn("我搬到台北了", "恭喜")
-            m.compress_on_exit()
+            m.close()
             fake.prefill_s = 3.0
             n0 = len(fake.log)
             lines = []
@@ -688,7 +660,7 @@ def main() -> int:
             m.add_turn("我住在高雄", "嗯")      # 模擬收尾掛點漏呼叫 bg_resume
             ok = wait(lambda: judged(m)[0] == 2, 6.0)
             check("暫停沒被恢復 ⇒ 逾時自動恢復並完成", ok, str(judged(m)))
-            m.compress_on_exit()
+            m.close()
             h = open_handles(d)
             check("離場後沒有任何連線還開著", not h, str(h))
     finally:

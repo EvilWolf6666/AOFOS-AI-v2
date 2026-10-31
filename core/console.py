@@ -2,7 +2,7 @@
 """
 終端輸出協調。
 
-問題：主執行緒阻塞在 input("你：") 時，背景執行緒（事件 producer、log）的輸出
+問題：等待輸入（input("你：")）時，其他執行緒（回應、事件 producer、log）的輸出
 會直接插進去，把提示字元推走。使用者看到自己打的字散落在別的位置，
 且不確定輸入還有沒有效。
 
@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import sys
 import threading
+
+from core.logger import set_console_writer
 
 # ANSI：\r 回到行首，\033[K 清除該行從游標到行尾
 _CLEAR_LINE = "\r\033[K"
@@ -148,72 +150,54 @@ def end_stream(trailing: str = "\n") -> None:
         sys.stdout.flush()
 
 
+# ── 關視窗 ───────────────────────────────────────────────────────
+
+_close_handler = None   # ⚠️ 必須留著參照：被回收後系統會呼叫到已釋放的位址，整個行程直接當掉
+
+
+def on_window_close(done: threading.Event, wait_s: float = 4.5) -> None:
+    """
+    Windows：按視窗 X 關閉時，比照 Ctrl+C 走正常收尾；done 由收尾的一方在收完時 set。
+
+    ⚠️ Python 的 signal 機制接不到關視窗（處理前行程就被結束），只能用 SetConsoleCtrlHandler；
+       系統只給約 5 秒，處理函式一返回行程就被結束。
+    ⚠️ 處理函式跑在系統另開的執行緒，而記憶的 DB 連線只能在主執行緒用 ⇒ 這裡不收尾，
+       只對主執行緒送 KeyboardInterrupt，再等它收完。主執行緒正卡在非串流的 LLM 呼叫時，
+       要等呼叫回來才收得到，可能超過 5 秒。
+    """
+    global _close_handler
+    if sys.platform != "win32":
+        return
+    import _thread
+    import ctypes
+    from ctypes import wintypes
+
+    ctrl_close_event = 2
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(event: int) -> bool:
+        if event != ctrl_close_event:
+            return False          # Ctrl+C 等其他事件照 Python 原本的處理
+        _thread.interrupt_main()
+        done.wait(wait_s)
+        return True
+
+    _close_handler = handler
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
+
+
 # ── logging 橋接 ─────────────────────────────────────────────────
 
-class _ConsoleStream:
+def _log_line(text: str) -> None:
+    # 一筆 log 結尾帶換行；emit() 自己會補，這裡拿掉，避免每筆多一行空白
+    text = text.rstrip("\n")
+    if text:
+        emit(text)
+
+
+def install_logging_bridge() -> None:
     """
-    file-like 包裝，把 logging 的輸出導進 emit()。
-
-    logging 的 StreamHandler 會分兩次寫入（訊息本體、換行符），故 write() 收到
-    純換行時直接忽略——否則每筆 log 都會多觸發一次重畫，畫面閃爍。
+    把專案 logger 的終端輸出導進 emit()（檔案 log 不受影響）。之後才建立的 logger 也涵蓋，
+    機制見 core.logger._ConsoleSink。
     """
-
-    def write(self, text: str) -> int:
-        if text and text != "\n":
-            emit(text.rstrip("\n"))
-        return len(text)
-
-    def flush(self) -> None:
-        pass
-
-
-def install_logging_bridge() -> int:
-    """
-    把本專案 logger 的「終端 handler」導向 emit()，回傳改接的 handler 數。
-
-    ⚠️ 兩個必須排除的東西，漏掉任一個都會出事：
-
-      1. **FileHandler 是 StreamHandler 的子類別**。只用
-         isinstance(h, StreamHandler) 過濾會一併改接檔案 handler——
-         結果是檔案 log 被印到畫面（每筆訊息出現兩次，第二次帶時間戳），
-         而 logs/daily/*.log 從此空白。長期記錄斷掉且無任何徵兆。
-
-      2. **第三方 logger**。掃 logging.root.manager.loggerDict 會取到
-         chromadb / sentence-transformers / urllib3 等所有 import 過的套件。
-         改接它們沒有意義，且數量會讓回報值失去參考價值。
-
-    故改接對象限定為 core.logger.KNOWN_LOGGERS 登記的 logger，
-    且只取非 FileHandler 的 StreamHandler。
-
-    ⚠️ 呼叫時尚未建立的 logger 由 logger.set_console_stream() 涵蓋——本函式
-    只能改接「當下已存在」的，而 TIMING logger 是惰性建立的（第一次 timed()
-    區塊結束時才誕生，必定在本函式之後），且它是全專案輸出最密集的 logger。
-    兩者缺一，終端協調就會在最主要的來源上失效。
-    """
-    import logging
-
-    try:
-        from core.logger import KNOWN_LOGGERS, set_console_stream
-    except ImportError:
-        logging.getLogger(__name__).warning(
-            "core.logger 未提供 KNOWN_LOGGERS，log 未導向終端協調器"
-            "（背景輸出可能插斷輸入行）"
-        )
-        return 0
-
-    stream = _ConsoleStream()
-
-    # 之後才建立的 logger（含惰性建立的 TIMING）由此涵蓋
-    set_console_stream(stream)
-
-    count = 0
-
-    for name in list(KNOWN_LOGGERS):
-        for handler in logging.getLogger(name).handlers:
-            if isinstance(handler, logging.FileHandler):
-                continue  # 檔案輸出不得改接，見上方說明
-            if isinstance(handler, logging.StreamHandler) and hasattr(handler, "stream"):
-                handler.stream = stream
-                count += 1
-
-    return count
+    set_console_writer(_log_line)

@@ -140,40 +140,30 @@ def latest_probe_db() -> str | None:
 
 
 class Recorder:
-    """包住 LLMClient／Persona 的幾個方法，記下每輪的 TTFT、server timings 與送出的 messages。"""
+    """每輪記下 TTFT、server timings 與送出的 messages——取自 LLMClient.last_call（探測不包任何方法）。"""
 
-    def __init__(self, llm: LLMClient, persona: Persona) -> None:
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
         self.cur: dict = {}
-        orig_chat, orig_timings, orig_build = llm.chat, llm._log_timings, persona.build_messages
-
-        def chat(messages, purpose="dialogue", on_delta=None):
-            t0 = time.monotonic()
-
-            def delta(text):
-                if "ttft_ms" not in self.cur:
-                    self.cur["ttft_ms"] = round((time.monotonic() - t0) * 1000)
-                if on_delta is not None:
-                    on_delta(text)
-            reply = orig_chat(messages, purpose=purpose, on_delta=delta)
-            self.cur["total_ms"] = round((time.monotonic() - t0) * 1000)
-            return reply
-
-        def log_timings(obj, purpose):
-            t = (getattr(obj, "model_extra", None) or {}).get("timings") if obj is not None else None
-            if t:
-                self.cur["timings"] = {k: t.get(k) for k in
-                                       ("prompt_n", "prompt_ms", "cache_n", "predicted_n", "predicted_ms")}
-            return orig_timings(obj, purpose)
-
-        def build(history, user_input):
-            msgs = orig_build(history, user_input)
-            self.cur["messages"] = msgs
-            return msgs
-
-        llm.chat, llm._log_timings, persona.build_messages = chat, log_timings, build
+        self._before = None
 
     def start(self, label: str, text: str) -> None:
         self.cur = {"label": label, "input": text}
+        self._before = self.llm.last_call
+
+    def collect(self) -> None:
+        """本輪結束後呼叫。本輪沒有呼叫 LLM（last_call 沒換）就什麼都不記。"""
+        call = self.llm.last_call
+        if call is None or call is self._before:
+            return
+        self.cur["messages"] = call["messages"]
+        if call["ttft_ms"] is not None:   # 只有串流才有
+            self.cur["ttft_ms"] = call["ttft_ms"]
+        t = call["timings"]
+        if t:
+            self.cur["timings"] = {k: t.get(k) for k in
+                                   ("prompt_n", "prompt_ms", "cache_n", "predicted_n", "predicted_ms")}
+        self.cur["total_ms"] = call["total_ms"]
 
 
 def queue_wait(rec: dict) -> int | None:
@@ -304,7 +294,7 @@ def run_session(k: int, src: str | None, out_dir: str, gap_min: int | None, v4: 
                                test_db_path=os.path.join(out_dir, "memory_test.db"),
                                cfg_override=override)
         pipeline = Pipeline(llm, persona, memory)
-        rec = Recorder(llm, persona)
+        rec = Recorder(llm)
         params = run_params(persona, llm, gap_min, v4)
         v4_now = memory._v4   # 實際生效的值（override 優先於 config）
         print(f"note_position={config.MEMORY_CONFIG.get('note_position')}｜seed={llm.seed}"
@@ -340,6 +330,7 @@ def run_session(k: int, src: str | None, out_dir: str, gap_min: int | None, v4: 
                 rec.cur["error"] = f"{type(e).__name__}: {e}"
             finally:
                 pipeline.finalize_turn()
+                rec.collect()
             annotate(rec.cur, state["prev_reply"], sit_prefix, s2t)
             if rec.cur.get("reply"):
                 state["prev_reply"] = rec.cur["reply"]
@@ -396,7 +387,7 @@ def run_session(k: int, src: str | None, out_dir: str, gap_min: int | None, v4: 
                       f, ensure_ascii=False, indent=2)
         print(f"本場完整紀錄：{os.path.join(out_dir, 'result.json')}")
         if memory is not None:
-            memory.compress_on_exit()   # 只收尾副本（事件層重建 ⇒ 下一場的開場從這裡來）
+            memory.close()   # 只收尾副本（事件層重建 ⇒ 下一場的開場從這裡來）
 
 
 def session_summary(k: int, records: list[dict], cancel: dict | None) -> dict:

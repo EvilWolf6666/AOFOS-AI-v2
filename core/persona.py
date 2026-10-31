@@ -20,8 +20,10 @@ STRIP_MARKER = "[[NOT_SENT_TO_MODEL]]"
 
 
 class Persona:
-    def __init__(self):
+    def __init__(self, send_system: bool = True):
+        """send_system=False：不送人格 system（只給 tools/eval_runner --no-persona 對照組用）。"""
         self.system_prompt = self._load_prompt()
+        self.send_system = send_system
 
     def _load_prompt(self) -> str:
         with open(PROMPT_PATH, "r", encoding="utf-8") as f:
@@ -44,7 +46,7 @@ class Persona:
 
     def build_messages(self, conversation_history: list[dict], user_input: str) -> list[dict]:
         """順序固定：人格 system → 記憶 context → 本輪輸入。"""
-        messages = [{"role": "system", "content": self.system_prompt}]
+        messages = [{"role": "system", "content": self.system_prompt}] if self.send_system else []
         messages.extend(conversation_history)
         messages.append({"role": "user", "content": user_input})
         return messages

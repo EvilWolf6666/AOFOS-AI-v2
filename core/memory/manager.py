@@ -14,8 +14,7 @@
 Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪、一次丟 WM_DROP_ROUNDS 輪），超出的直接滑出——
 ⭐ 原句已經落地，滑出不會丟任何東西，**所以不需要壓縮**。
 
-⚠️ `compress_on_exit()` 名稱沿用 v1（呼叫點多），實際做的是**離場收尾**：
-   關背景判斷、補寫原句、重建事件層或丟棄測試區、關連線。
+離場收尾是 `close()`：關背景判斷、補寫原句、重建事件層或丟棄測試區、關連線。
 
 🔴 **執行緒**：DB 連線在**第一次使用時**於當下執行緒開啟，之後只能在同一執行緒用
    （sqlite3 預設 check_same_thread，跨執行緒會直接拋 ProgrammingError——大聲，是對的）。
@@ -143,7 +142,7 @@ class MemoryManager:
         self._fixed_note = (cfg["fixed_note"].format(open=self._open, close=self._close,
                                                      remember=self._lab_rem, recall=self._lab_rec)
                             if cfg["note_position"] == "fixed" else None)
-        # 區塊放哪（config 的 block_position）：只影響 build_turn()；get_context() 永遠是尾端 system 的形狀
+        # 區塊放哪（config 的 block_position），見 build_turn()
         if cfg["block_position"] not in ("tail_system", "in_user"):
             raise ValueError(f"MEMORY_CONFIG['block_position'] 只能是 tail_system／in_user：{cfg['block_position']!r}")
         self._block_in_user = cfg["block_position"] == "in_user"
@@ -427,10 +426,16 @@ class MemoryManager:
         而 user_input 仍是空 placeholder——檢索看的是 user_input，所以 observation 輪照舊不檢索。
         situation_in_history="latest" 時，有新情境的這一輪，歷史裡舊的情境全部收回成空 user。
 
-        "tail_system"：等同 get_context()，user 內容就是輸入本身。
+        "tail_system"：區塊是 context 尾端一則 system（本輪輸入之前），user 內容就是輸入本身。
         "in_user"：context 不含區塊；區塊併進 user 內容開頭（區塊＋換行＋輸入）。
+        ⚠️ 順序依「變動頻率由低到高」：區塊每輪不同，放在 WM 之後才不會讓 WM 落在 prompt cache
+           斷點之後（prompt cache 比對的是最長共同前綴）。
         ⚠️ Working Memory 存的仍是原始輸入（add_turn 收的是 user_input），區塊不進歷史——
-           下一輪快取斷在上一輪那則 user 訊息，重算量與 tail_system 相近。
+           下一輪快取斷在上一輪區塊原本的位置（in_user 時＝上一輪那則 user 訊息），兩種放法重算量相近。
+        ⚠️ note_position="fixed" 時，不變的說明是開頭一則 system 訊息、**每輪都送**
+           （有沒有區塊都送：時有時無會讓開頭變動，快取反而斷得更早）。
+        ⚠️ user_input 為空（observation 輪次的 placeholder）時不做檢索；
+           但本場開頭的開場（狀態＋上一場關鍵詞）照帶（它不依賴輸入）。
         ⚠️ 為什麼不放尾端 system：見 config 的 block_position 註解（區塊夾在上一句回覆後面時，她會照講上一句）。
         """
         text = user_input if situation is None else self.render_situation(situation)
@@ -441,25 +446,6 @@ class MemoryManager:
             return context, f"{block}\n{text}"
         context.append({"role": "system", "content": block})
         return context, text
-
-    def get_context(self, user_input: str = "") -> list[dict]:
-        """〔固定說明〕＋ Working Memory ＋ 一個 `⟦記憶⟧` 區塊（追加在尾端、本輪輸入之前）。
-
-        ⚠️ 正式路徑走 build_turn()（區塊位置看 config 的 block_position）；
-           本方法固定回傳「區塊在尾端 system」的形狀，給自測與 memory_peek 檢查區塊內容用。
-
-        ⚠️ 順序依「變動頻率由低到高」：記憶區塊每輪不同，放尾端才不會讓
-           WM 落在 prompt cache 斷點之後（prompt cache 比對的是最長共同前綴）。
-        ⚠️ 區塊不留在 WM ⇒ 下一輪快取斷在「上一輪區塊原本的位置」，區塊裡的字每輪都重算。
-           note_position="fixed" 時，不變的說明改成開頭一則 system 訊息、**每輪都送**
-           （有沒有區塊都送：時有時無會讓開頭變動，快取反而斷得更早）。
-        ⚠️ user_input 為空（observation 輪次的 placeholder）時不做檢索；
-           但本場開頭的開場（狀態＋上一場關鍵詞）照帶（它不依賴輸入）。
-        """
-        context, block = self._assemble(user_input)
-        if block is not None:
-            context.append({"role": "system", "content": block})
-        return context
 
     def _history(self, fresh_situation: bool) -> list[dict]:
         """WM 投影成 messages；observation 那則 user 依 situation_in_history 顯示情境。"""
@@ -603,8 +589,8 @@ class MemoryManager:
 
     # ── 離場 ──────────────────────────────────────────────────
 
-    def compress_on_exit(self) -> None:
-        """離場收尾（名稱沿用 v1，不壓縮）：關背景判斷、補寫原句、事件層重建或丟棄測試區、關連線。"""
+    def close(self) -> None:
+        """離場收尾：關背景判斷、補寫原句、事件層重建或丟棄測試區、關連線。"""
         if self._judge is not None:
             self._judge.close()
         self._flush()
