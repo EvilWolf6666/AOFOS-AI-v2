@@ -1,0 +1,18 @@
+# 核心
+openai
+python-dotenv
+colorlog
+numpy
+opencc-python-reimplemented
+
+# 語音輸入
+sounddevice
+torch
+faster-whisper
+
+# 記憶（主題向量檢索）
+sentence-transformers
+faiss-cpu
+
+# VTube Studio
+websockets
