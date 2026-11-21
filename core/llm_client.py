@@ -9,7 +9,7 @@ import time
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-from openai import OpenAI
+from openai import OpenAI, Timeout   # Timeout：openai 套件轉出的 httpx.Timeout（不直接依賴 httpx 的版本）
 
 from config import LLAMA_SERVER, LLM_CONFIG, TEST_CONFIG, TEST_MODE
 from core.backend_check import verify_llamaserver
@@ -24,15 +24,18 @@ _EXTRA_BODY_KEYS = ("top_k", "repeat_penalty", "min_p")
 
 # context 用量（prompt + max_tokens）達此比例即警告。
 # 不放進 config：這個值不會為了改變行為而被調整，只在換模型／context 變動時
-# 重新檢視一次（判準見《歸檔》I0010）。
+# 重新檢視一次（判準見 260801-程式-10）。
 _CONTEXT_WARN_RATIO = 0.85
 
 
 class LLMClient:
     def __init__(self):
+        # 逾時與重試明帶（理由見 config.LLM_CONFIG 對應段）
         self.client = OpenAI(
             base_url=LLM_CONFIG["base_url"],
             api_key=LLM_CONFIG["api_key"],
+            timeout=Timeout(LLM_CONFIG["timeout_read_s"], connect=LLM_CONFIG["timeout_connect_s"]),
+            max_retries=LLM_CONFIG["max_retries"],
         )
         self.model = LLM_CONFIG["model"]
 
@@ -68,14 +71,17 @@ class LLMClient:
         # 最近一次 chat() 的紀錄，給量測工具（tools/eval_runner、tools/chat_probe）讀，
         # 工具不必包本類別的方法。每次 chat() 開頭換成新的 dict（`is` 比對即可知道這輪有沒有呼叫）：
         #   purpose、messages（實際送出的）、usage（{prompt_tokens, completion_tokens}；拿不到為 None）、
-        #   timings（後端回報的原始 dict；拿不到為 None）、ttft_ms（只有串流才有）、total_ms
+        #   timings（後端回報的原始 dict；拿不到為 None）、ttft_ms（只有串流才有）、total_ms、
+        #   error（呼叫失敗時的例外文字；成功為 None——回空字串是「失敗」還是「模型答空」看這裡）
         self.last_call: dict | None = None
 
         logger.info("初始化完成")
         logger.info(
             f"參數：model={self.model} temperature={self.temperature} "
             f"top_p={self.top_p} max_tokens={self.max_tokens} seed={self.seed} "
-            f"extra_body={self.extra_body}"
+            f"extra_body={self.extra_body} "
+            f"timeout(connect/read)={LLM_CONFIG['timeout_connect_s']}/{LLM_CONFIG['timeout_read_s']}s "
+            f"max_retries={LLM_CONFIG['max_retries']}"
         )
         if self.seed is not None:
             # 固定 seed＝每次請求同一串亂數，日常對話會一再抽出同一句
@@ -217,7 +223,8 @@ class LLMClient:
         )
 
     def _log_timings(self, obj, purpose: str) -> None:
-        """記下 llama-server 回應自帶的 timings（server 端自己量的 prefill／生成時間）。
+        """記下後端回應自帶的 timings（server 端自己量的 prefill／生成時間）。
+        ⚠️ timings 欄位是 llama-server 的擴充（2026-10 換 llama-server 起才有），換後端時這裡要重看。
 
         存在理由：本程式量的 TTFT 混了 HTTP 與 SDK 開銷；server 端數字能把兩者分開
         （《參考庫》A.2「原生 timing 可分離 wrapper 開銷」）。cache_n＝本次重用快取的
@@ -282,7 +289,7 @@ class LLMClient:
         max_tokens = self.max_tokens_by_purpose.get(purpose, self.max_tokens)
         t0 = time.monotonic()
         self.last_call = {"purpose": purpose, "messages": messages, "usage": None,
-                          "timings": None, "ttft_ms": None, "total_ms": None}
+                          "timings": None, "ttft_ms": None, "total_ms": None, "error": None}
 
         try:
             if self._should_stream(on_delta):
@@ -293,6 +300,7 @@ class LLMClient:
             # 回傳 "" 但必須夠醒目：施測時一個失敗的呼叫看起來會跟
             # 「模型答得很差」一模一樣
             logger.error(f"LLM 呼叫失敗（purpose={purpose}，本輪回傳空字串，勿當作模型表現）：{e}")
+            self.last_call["error"] = f"{type(e).__name__}: {e}"
             return ""
         finally:
             self.last_call["total_ms"] = round((time.monotonic() - t0) * 1000)
@@ -357,7 +365,7 @@ class LLMClient:
         raw_parts: list[str] = []     # 模型原始輸出（未轉換）
         usage = None
         actual_model = None
-        last_with_timings = None      # llama-server 把 timings 附在最後幾個 chunk
+        last_with_timings = None      # timings 附在最後幾個 chunk（llama-server 時期的實測行為，2026-10 起）
 
         with timed(f"LLM呼叫[{purpose}]", model=self.model, purpose=purpose):
             stream = self.client.chat.completions.create(
@@ -449,7 +457,7 @@ class LLMClient:
 #
 # 🔴 **為什麼取消這麼重要**：推理後端只有一個推理槽（config.LLAMA_SERVER["parallel"]＝1）。
 #    背景呼叫還在跑時使用者開口，對話那一次會排在它後面，**多等一次 5～15 秒**。
-#    ⇒ 取消若做不出來，準 v4 裁決是直接改上小模型（甲），見《現況》〈🔒 隔離區〉〈準 v4〉。
+#    ⇒ 取消若做不出來，準 v4 裁決是直接改上小模型（甲），見〈現況-記憶〉。
 #    ⚠️ 本類別能保證的是「我們這端立刻放手、連線關掉」；後端何時真的停是它的行為：
 #       現行後端正在做的那一批 prefill 不會被打斷，做完那批才停（批次大小見 config.LLAMA_SERVER["batch"]）。
 #       量法：tools/chat_probe 的「排隊」欄（TTFT 扣掉後端自算的 prompt 時間）。

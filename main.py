@@ -9,7 +9,7 @@ from __future__ import annotations
 # 的模組（sentence-transformers、faster-whisper）先被 import，設定就來不及了，
 # 而且不會報錯，只會靜默地變回連網。
 #
-# 環境設定集中於 config.py：tools/ 底下的腳本直接 import config、不經過 main.py（《歸檔》I0026）。
+# 環境設定集中於 config.py：tools/ 底下的腳本直接 import config、不經過 main.py（260806-程式-26）。
 import config  # noqa: F401
 
 import os  # noqa: E402

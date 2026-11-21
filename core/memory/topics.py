@@ -1,13 +1,13 @@
 # core/memory/topics.py
 """
-準 v4 的主題表（《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）。
+準 v4 的主題表（〈現況-記憶〉）。
 
 它是什麼：**原句存放區（transcript）的索引**，不是資料本身。
   · 每一列＝一件事的一句主題句（主詞寫明），帶「指回原句」的 serial 範圍。
   · 原句永遠在 transcript，一筆不刪；日常主題壞掉可以從原句重建（重跑背景判斷）。
     例外是核心設定與審核結果（status／replaces），見下方〈鎖定與人工審核〉。
     ⇒ 寫入端做的歸納是**可重建的衍生物**，不是不可逆的結論
-      （《現況》〈📐 規則〉三「歸納放在讀取端」要防的是不可逆，這裡沒有違反）。
+      （〈現況-開場〉〈📐 規則〉三「歸納放在讀取端」要防的是不可逆，這裡沒有違反）。
 
 版本（重寫）：
   · 一件事第一次被記下來＝一列，`root = 自己的 id`、`parent = NULL`。
@@ -22,7 +22,7 @@
   · 判斷「是不是同一件事的新狀態」需要語意，那一步已經搭在標主題那次呼叫裡（產出 attr_key）。
   · 檢索預設跳過 `valid_to IS NOT NULL` 的列；原句照留。
 
-鎖定與人工審核（《現況》〈🔒 隔離區〉準 v4〈鎖定區與人工審核〉）：
+鎖定與人工審核（〈現況-記憶〉鎖定區與人工審核）：
   · `status`：normal（日常）／locked（核心設定）／pending（待審）／rejected（駁回）。
   · 人工審核只管「要不要進核心設定」：背景判斷寫進來的新事實若要**機械取代一件核心設定**
     （同屬性鍵），不直接取代；新的那件寫成 pending、`replaces` 指向被它挑戰的鎖定 root，
@@ -30,7 +30,7 @@
   · 駁回的事日後要當日常記憶撈（加註「有人提過、未採用」，同時帶入現行核心設定，矛盾時核心優先）。
     ⏸ 這段讀取行為等有鎖定條目時才實作；**現行**檢索只看 normal／locked，
     pending、rejected 不注入（原句照留，駁回的列也不刪）。
-  ⚠️ 目前沒有任何路徑會產生 locked（世界觀灌入未做，《現況》17之1）⇒ 欄位先在、機制先不會被觸發。
+  ⚠️ 目前沒有任何路徑會產生 locked（世界觀灌入未做，〈現況-人格與訓練〉世界觀）⇒ 欄位先在、機制先不會被觸發。
   ⚠️ 核心設定（locked）與審核結果（status／replaces）**不能從原句重建**：前者日後由世界觀灌入、
      不一定來自對話，後者是人的決定。重建日常主題（重跑背景判斷）前要先把它們另外留下，
      否則會跟著一起消失。重寫版本（add_version）沿用上一版的 status／replaces。
@@ -50,7 +50,12 @@ import sqlite3
 from datetime import datetime
 
 from core.logger import setup_logger
-from core.memory.db import get_meta, set_meta, write_txn
+from core.memory.db import (backup_before_migration, check_schema_version, get_meta,
+                            mark_schema_version, set_meta, write_txn)
+
+# 主題相關表（topic 等）的結構版本，存在 meta 的 schema_topic 鍵。規則同 db.SCHEMA_VERSION。
+# 1＝2026-11-21 的形狀（含 status、replaces、judge_model、judge_prompt）。
+TOPIC_SCHEMA_VERSION = 1
 
 logger = setup_logger("MemoryTopics")
 
@@ -94,15 +99,20 @@ def ensure_schema(cx: sqlite3.Connection) -> None:
     # 舊表補欄位：沒有 status／replaces 的補上（既有列一律 normal，行為不變）；
     # 沒有 judge_model／judge_prompt 的補上（既有列為 NULL＝來源不明）。
     # ⚠️ 這是對正式記憶檔的結構改動：第一次跑新版前先備份 data/memory.db。
+    check_schema_version(cx, "schema_topic", TOPIC_SCHEMA_VERSION)
     cols = {r[1] for r in cx.execute("PRAGMA table_info(topic)")}
-    for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'normal'"), ("replaces", "INTEGER"),
-                     ("judge_model", "TEXT"), ("judge_prompt", "TEXT")):
+    adds = (("status", "TEXT NOT NULL DEFAULT 'normal'"), ("replaces", "INTEGER"),
+            ("judge_model", "TEXT"), ("judge_prompt", "TEXT"))
+    if any(col not in cols for col, _ in adds):
+        backup_before_migration(cx, "topic")   # 失敗即拋例外、不遷移
+    for col, ddl in adds:
         if col not in cols:
             with write_txn(cx):
                 cx.execute(f"ALTER TABLE topic ADD COLUMN {col} {ddl}")
             logger.warning(f"主題表補欄位 {col}（舊表遷移，既有列不變）")
     with write_txn(cx):
         cx.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, 0)", (_JUDGED_KEY,))
+    mark_schema_version(cx, "schema_topic", TOPIC_SCHEMA_VERSION)
 
 
 class TopicStore:

@@ -1,6 +1,6 @@
 # core/memory/manager.py
 """
-記憶入口（準 v4；《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）。
+記憶入口（準 v4；〈現況-記憶〉）。
 
 做的事：
   ① 每輪把雙方原句寫進原文存放區（pre_write → transcript），一句不刪
@@ -25,6 +25,7 @@ Working Memory 是滑動視窗（MAX_WORKING_MEMORY 輪、一次丟 WM_DROP_ROUN
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 
 from config import EVENT_CONFIG, MAX_WORKING_MEMORY, MEMORY_CONFIG, TEST_MODE, WM_DROP_ROUNDS
@@ -41,6 +42,10 @@ from core.memory.topics import TopicStore
 from core.memory.transcript import Transcript
 
 logger = setup_logger("MemoryManager")
+
+# 事件層整張重建超過這個時間就警告（不是行為參數，是「該改做法了」的告警線）。
+# 依據：它在啟動與收尾各跑一次、在主執行緒；1 秒是使用者開始感覺得到等待的量級。
+_EPISODE_REBUILD_WARN_MS = 1000
 
 _DEFAULT = object()   # add_turn 的 user_speaker 預設值（None 有意義：observation 輪次沒人說話）
 
@@ -80,8 +85,14 @@ class _Store:
         if not (self.writable and self._ep_cfg):
             return
         try:
-            self.episodes.build(gap_minutes=self._ep_cfg["gap"],
-                                n_keywords=self._ep_cfg["kw"], n_reps=self._ep_cfg["reps"])
+            t0 = time.perf_counter()
+            with timed("事件層重建"):
+                n = self.episodes.build(gap_minutes=self._ep_cfg["gap"],
+                                        n_keywords=self._ep_cfg["kw"], n_reps=self._ep_cfg["reps"])
+            ms = (time.perf_counter() - t0) * 1000
+            if ms > _EPISODE_REBUILD_WARN_MS:
+                logger.warning(f"事件層整張重建花了 {ms:.0f} ms（{n} 段）。成本隨原句總數成長，"
+                               "啟動與收尾會越來越慢：該改成只重建最後一段了。")
         except Exception as e:  # noqa: BLE001
             logger.error(f"事件層重建失敗（不影響原句與主題）：{type(e).__name__}: {e}")
 
@@ -241,6 +252,13 @@ class MemoryManager:
         if on == self.test_mode:
             return
         self._flush()
+        # 🔴 補寫沒成功就不切：切換會清空 Working Memory，沒拿到 serial 的那幾則只存在那裡，
+        #    清掉就真的沒了（先確認結果有效，再做不可逆的那一步）。原因已在 _flush 記 ERROR。
+        left = [t for t in self.working_memory if "serial" not in t]
+        if left:
+            raise RuntimeError(
+                f"測試模式沒有切換：還有 {len(left)} 則原句沒寫進去（原因見上一筆「原句寫入失敗」），"
+                "切換會清掉它們。排除寫入問題後再切。")
         if self._judge is not None:
             self._judge.detach()   # 先放開 DB 再切：進場時日常區要靜止、離場時測試區要能刪
         self._enter_test() if on else self._leave_test()
@@ -331,14 +349,20 @@ class MemoryManager:
         🔴 但失敗要大聲——連續失敗代表原句根本沒在存，關係連續性是假的。
         """
         pending = [t for t in self.working_memory if "serial" not in t]
-        if not pending:
-            return
         try:
+            if not pending:
+                # 沒有新的要寫時，只在「連線已開、預寫區還有積壓」才往下走：上一輪進了預寫區但
+                # 落地失敗的，這裡補做（否則離場前最後一輪要等到下次啟動才落地、被算進下一場）。
+                # ⚠️ 連線沒開就不開：tools/memory_peek 靠這點不替日常區建檔。
+                st = self._test if self.test_mode else self._daily
+                if st is None or st._cx is None or st.pre_write.backlog() == 0:
+                    return
             with timed("原句寫入"):
                 st = self._write_store()
-                serials = st.pre_write.append(pending)
-                for t, s in zip(pending, serials):
-                    t["serial"] = s
+                if pending:
+                    serials = st.pre_write.append(pending)
+                    for t, s in zip(pending, serials):
+                        t["serial"] = s
                 rows, halt = st.pre_write.read_pending(st.transcript.landed_upto)
                 if rows:
                     st.transcript.land(rows)
@@ -379,7 +403,7 @@ class MemoryManager:
         """本輪回應若與 Working Memory 內既有 assistant 內容逐字相同，記一次。
 
         **純診斷，刻意不改變任何行為**：在日常運行中累積「逐字複製」樣本
-        （《現況》12之0）。⚠️ 必須在 append 之前比對，之後比對必定自我命中。
+        （〈現況-人格與訓練〉逐字複製傾向）。⚠️ 必須在 append 之前比對，之後比對必定自我命中。
         ⚠️ 只比對完全相同、不做相似度——部分重複另有成因，混進同一個計數會使
         這個數字失去意義。記 test_mode 是因為 `/test on` 下也觸發才是乾淨條件的證據。
         """
@@ -487,7 +511,7 @@ class MemoryManager:
     def _opening(self) -> str:
         """開場：上次聊天是多久以前／今天聊過幾次／那次聊了幾輪＋上一場的關鍵詞（事件層）。
 
-        不帶代表句與原句：原句直接注入是逐字照抄的來源（《現況》12之0）；細節改由主題依輸入撈。
+        不帶代表句與原句：原句直接注入是逐字照抄的來源（〈現況-人格與訓練〉逐字複製傾向）；細節改由主題依輸入撈。
         ⭐ 本場只算一次、之後原樣重用 ⇒ 開頭幾輪這段字不變（對 prompt cache 友善），
            且不依輸入——問「上次聊甚麼」「上次聊天是多久以前」這種沒有內容詞的話也有東西可用。
         ⭐ 時間只給口語的時間感（`time_bucket`），不給日期與天數，避免她照唸。
@@ -520,7 +544,7 @@ class MemoryManager:
     def _topics(self, query: str) -> str:
         """準 v4 讀取：向量＋關鍵字兩路，**各取自己的配額、聯集去重、不重新排名**，依事件時間排列。
 
-        不用 RRF（《現況》〈🔒 隔離區〉準 v4 檢索列）：RRF 讓兩路搶同一組名額，
+        不用 RRF（〈現況-記憶〉檢索列）：RRF 讓兩路搶同一組名額，
            只有一路命中的（例：關鍵字逐字命中的專有名詞）可能被擠掉。
            去重空出的名額不遞補（遞補就得決定「下一名給誰」，又回到排名次）。
         ⭐ 兩路各自的命中名單寫 debug log ⇒ 日後可離線重算 RRF 比對，不必重跑對話。
@@ -597,6 +621,14 @@ class MemoryManager:
         left = [t for t in self.working_memory if "serial" not in t]
         if left:
             logger.error(f"離場時仍有 {len(left)} 則沒寫進原文存放區，程式結束後消失。")
+        try:
+            st = self._test if self.test_mode else self._daily
+            stuck = st.pre_write.backlog() if st is not None and st._cx is not None else 0
+            if stuck:
+                logger.error(f"離場時預寫區仍有 {stuck} 則沒落地（還在預寫區、沒有遺失；原因見上方 ERROR。"
+                             "能落地時會在下次啟動補上，並被算進下一場）。")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"離場時查不到預寫區積壓：{type(e).__name__}: {e}")
         if self.test_mode:
             self._leave_test()   # 施測結束整包丟棄
         else:

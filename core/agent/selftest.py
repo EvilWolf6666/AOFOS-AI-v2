@@ -4,8 +4,9 @@
 
 涵蓋：事件佇列（逾時、同來源覆蓋）、使用者輸入讀取器（一次只讀一次、空的不算、讀取壞掉
 仍推得出事件、ESC＝/mode t）、語音模型載不起來時留在文字模式、對話視窗只看到一行結果
-（原因在 log）、她沒回應時有一行提示、收尾只做一次且不怕某步壞掉、收完會通知、
-log 終端輸出（之後才建立的 logger 與第三方套件也走登記的出口、等級照登記的、檔案 log 不受影響）、
+（原因在 log）、她沒回應時有一行提示、一輪出錯不會讓程式結束、收尾只做一次且不怕某步壞掉、收完會通知、
+log 終端輸出（之後才建立的 logger 與第三方套件也走登記的出口、等級照登記的、檔案 log 不受影響、
+共用一個檔案 handler、redirect_log_dir 改接）、
 惰性載入（import 主迴圈不會拉進語音棧）。
 
 不連推理後端、不開麥克風、不碰 data/。
@@ -200,6 +201,35 @@ def test_agent_parts() -> None:
     check("對話視窗有一行提示（不然只看到提示字元又出現）、收尾照做",
           len(shown) == 1 and "沒有回應" in shown[0] and done == ["收尾"], f"{shown} {done}")
 
+    print("\n[一輪出錯]")
+    done2: list[str] = []
+
+    def boom(_e):
+        raise RuntimeError("讀檔失敗")
+
+    a.pipeline = types.SimpleNamespace(is_command=lambda t: False, handle_turn=boom,
+                                       finalize_turn=lambda: done2.append("收尾"))
+    escaped = None
+    with _dialog() as shown:
+        try:
+            a._dispatch(Event("user_text", UTTERANCE, "哈囉"))
+        except Exception as e:  # noqa: BLE001
+            escaped = e
+    check("例外不穿出主迴圈（程式不會因此結束）、對話視窗一行結果、收尾照做",
+          escaped is None and len(shown) == 1 and "出錯" in shown[0] and "讀檔失敗" not in shown[0]
+          and done2 == ["收尾"], f"{escaped!r} {shown} {done2}")
+
+    def ctrl_c(_e):
+        raise KeyboardInterrupt
+
+    a.pipeline = types.SimpleNamespace(is_command=lambda t: False, handle_turn=ctrl_c, finalize_turn=lambda: None)
+    try:
+        a._dispatch(Event("user_text", UTTERANCE, "哈囉"))
+        passed = False
+    except KeyboardInterrupt:
+        passed = True
+    check("Ctrl+C 照常往外走（主迴圈照常收尾結束）", passed)
+
     print("\n[收尾]")
     calls: list[str] = []
 
@@ -268,6 +298,27 @@ def test_log_sink() -> None:
     files = [h for h in early.handlers if isinstance(h, logging.FileHandler)]
     check("檔案 log 不受影響（仍寫檔、不寫進終端出口）",
           len(files) == 1 and files[0].stream is not L._CONSOLE_SINK and len(got) == 2, str(got))
+
+    import tempfile
+    shared = [h for h in late.handlers if isinstance(h, logging.FileHandler)]
+    check("所有 logger 共用同一個檔案 handler（redirect_log_dir 改一處就全部改接）",
+          len(shared) == 1 and shared[0] is files[0])
+    old_dir, old_file = L.LOG_DIR, files[0].baseFilename
+    tmp = tempfile.mkdtemp(prefix="aofos_logdir_")
+    try:
+        dst = L.redirect_log_dir(tmp)
+        early.warning("改接後早")
+        late.warning("改接後晚")
+        files[0].flush()
+        with open(dst, encoding="utf-8") as f:
+            txt = f.read()
+        import re
+        check("redirect_log_dir：改接前建立的 logger 也寫進新資料夾，檔名是每日格式（log 視窗靠它找檔）",
+              "改接後早" in txt and "改接後晚" in txt
+              and re.fullmatch(r"\d{4}-\d{2}-\d{2}\.log", os.path.basename(dst)) is not None, dst)
+    finally:
+        files[0].retarget(old_file)   # 還原：本自測之後的 log 照舊寫原處
+        L.LOG_DIR = old_dir
 
 
 def test_lazy_import() -> None:

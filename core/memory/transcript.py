@@ -108,7 +108,7 @@ class Transcript:
             if top > self.landed_upto:
                 set_meta(self.cx, "landed_upto", top)
 
-        # ⚠️ 依《現況》0之3「成功靜默」：常態只印一行批次匯總，不逐筆。
+        # ⚠️ 依〈現況-原則〉〈呈現簡短，記錄完整〉「成功靜默」：常態只印一行批次匯總，不逐筆。
         #    逐筆留給診斷模式。（修補那一行是失敗訊號，在上面已經大聲過了。）
         logger.info(
             f"本批 {len(records)} 筆：{written} 寫入／{skipped} 跳過／{repaired} 修補"

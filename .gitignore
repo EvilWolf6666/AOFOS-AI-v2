@@ -11,6 +11,9 @@ venv/
 data/
 logs/
 archive/
+worldview/
+prompts/
+evaluation/
 
 # 環境變數 / API金鑰
 .env

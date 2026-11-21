@@ -10,7 +10,7 @@ blind_eval.py — AOFOS 施測記錄表的盲評工具（make / merge）
   · 只用 Python 標準庫，無第三方依賴
   · 獨立指令觸發，不掛進 pipeline._commands，不進 Agent 生命週期
 
-理由（同《歸檔》C0035）：`tools/` 底下的腳本共用 config.py
+理由（同 260807-訓練-35）：`tools/` 底下的腳本共用 config.py
 唯一入口，而本工具不需要任何設定值，硬接會讓一個純文字處理工具綁上
 `HF_HUB_OFFLINE` 那條啟動路徑。施測時推理後端可能正載著別的模型、
 config.py 可能改到一半，本工具不該因此跑不起來。
@@ -396,6 +396,16 @@ def cmd_make(args):
     stem = os.path.splitext(os.path.basename(args.record))[0]
     key_path = os.path.join(outdir, f'{stem}.對照表.json')
 
+    # 🔴 對照表已存在就不覆寫（除非 --force）：盲評版發出去之後再跑一次 make，
+    #    對照表會換成新的順序，收回來的分數就對到錯的組別，而 merge 不會報錯。
+    #    先擋再產生：擋下時盲評版與對照表都不動。
+    if os.path.exists(key_path) and not args.force:
+        print(f'🔴 對照表已存在：{key_path}', file=sys.stderr)
+        print('   若盲評版已經發給評審，重跑會讓收回來的分數對到錯的組別。', file=sys.stderr)
+        print('   確定要重產（評審手上的舊版作廢）才加 --force；否則換 --outdir。', file=sys.stderr)
+        print('   ⚠️ 未產生任何檔案。', file=sys.stderr)
+        return 1
+
     # 每位評審一份獨立檔案（不共用同一份）。
     # ⚠️ 內容與 seed 相同、只是檔名不同——**分開的是填答與收回，不是題序**。
     #    刻意不為每位評審各洗一次牌：那會變成一位評審一張對照表，
@@ -407,7 +417,7 @@ def cmd_make(args):
     # 白名單已經擋掉絕大部分，這是最後一道；而它與下方的 collect_secrets
     # 不同——那邊的字串可能同時是評分依據，所以只定位不阻擋；
     # 標準答案則是一定不該在，且**一旦寫出去，磁碟上就躺著一份可以被誤送的檔案**。
-    # ⇒ 先擋再產生（同《現況》0之4「先確認結果有效，再做不可逆的那一步」）。
+    # ⇒ 先擋再產生（同〈現況-原則〉〈錯誤處理的兩種取向〉「先確認結果有效，再做不可逆的那一步」）。
     if questions or rubric:
         marks = [w for w in ('標準答案', '判讀重點', '參考答案', '正解')
                  if w in blind_text]
@@ -464,9 +474,14 @@ def cmd_make(args):
     skipped = [q for q in samples if q not in qids]
     if skipped:
         why = ('不在判準檔的計分題清單內' if scored_set is not None
-               else 'F/A 類預設不盲評')
+               else f'沒給 --rubric，只出 {"/".join(SCORED_PREFIXES)} 類')
         print(f'（未輸出：{"、".join(skipped)}——{why}，'
               f'要放進來用 --include）')
+        # v2 的計分題有 G／H／I 類：沒給 --rubric 時它們會被當成非計分題漏掉
+        lost = [q for q in skipped if q[0] not in ('F', 'A')]
+        if scored_set is None and lost:
+            print(f'⚠️ {"、".join(lost)} 不是 F/A 類卻沒輸出。v2 題本請帶 --rubric，'
+                  '計分範圍以判準檔為準。')
 
     # 殘留檢查：只定位、不自動改。
     # 模型自稱（「我是 Qwen」）既是識別線索、也是 A/D 類的判讀材料，
@@ -548,8 +563,8 @@ def parse_record_scores(path, titles):
                 qid = m.group(1)
                 continue
             if gi >= 0 and qid:
-                for f in flag_re.findall(line):
-                    flags[gi][f] += 1
+                for flag in flag_re.findall(line):
+                    flags[gi][flag] += 1
             m = score_re.match(line)
             if m and gi >= 0 and qid:
                 v, err = parse_score_value(
@@ -564,7 +579,7 @@ def parse_record_scores(path, titles):
 # 門檻的成立條件。🔴 **這三個值與下方的分數門檻是綁在一起的**，
 # 原門檻是在「8 個計分題、每題滿分 2、配對 t 檢定 df=7」之下算出來的。
 # ⚠️ 題數一變，df 與滿分都變，而原門檻不會跟著變——**它會安靜地指向錯的數字**。
-#    這正是《現況》零章第十一條原則要防的形狀（不由本處維護的數字過期時無聲），
+#    這正是第十一條原則要防的形狀（不由本處維護的數字過期時無聲），
 #    所以這裡不重算統計（要重算得有標準差），而是**條件不符就宣告門檻失效**。
 THRESHOLD_BASIS = {'n_items': 8, 'per_item': 2.0}
 THRESHOLD_TABLE = {          # 評分者人數 → (90% 信心, 95% 信心)
@@ -793,6 +808,8 @@ def main():
                          '外部評審模型沒有題本，不注入等於讓它憑印象打分')
     mk.add_argument('--rubric', default=None,
                     help='判準 .md 路徑。給了就把每題的判分界線注入評分表')
+    mk.add_argument('--force', action='store_true',
+                    help='對照表已存在時仍重產（評審手上的舊盲評版作廢）。預設拒絕覆寫')
     mk.set_defaults(func=cmd_make)
 
     mg = sub.add_parser('merge', help='對照表 ＋ 分數檔 → 開盲、合併、算差距')

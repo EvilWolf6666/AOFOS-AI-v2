@@ -26,7 +26,7 @@ prompt_tokens 比對
   python -m tools.eval_runner run                        題本預設 evaluation/題本_v2.md、組別預設＝config 的 alias
   python -m tools.eval_runner run --batch 擂台第二輪       同一批測試放同一個資料夾（預設＝當天日期）
   python -m tools.eval_runner run --group 甲 --only D1,B1  只跑指定題（驗證用）；兩個參數都可另給
-  python -m tools.eval_runner run --no-persona            不送人格 system（《現況》第八章 C22 補測；組別與資料夾自動加 _nopersona）
+  python -m tools.eval_runner run --no-persona            不送人格 system（待辦 C22 補測；組別與資料夾自動加 _nopersona）
   start\\自動施測_無人格.bat                                同上一行（雙擊用）
   start\\自動施測.bat                                       同第一行（雙擊用）
   python -m tools.eval_runner compare <results.json> <results.json> ...                       比對第一輪 prompt_tokens
@@ -44,6 +44,8 @@ import subprocess
 import sys
 import urllib.request
 from datetime import datetime
+
+from core.run_snapshot import digest
 
 # 記錄表的題目順序（同《施測記錄表_v2模板》：計分 14 題在前、驗證 6 題在後）
 SCORED = ["B1", "B2", "B3", "C1", "C2", "D1", "D2", "D3", "E1", "G1", "G2", "H1", "I1", "I2"]
@@ -154,6 +156,7 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
     from core.llm_client import LLMClient
     from core.memory.manager import MemoryManager
     from core.persona import Persona
+    from core.run_snapshot import snapshot
 
     with open(turns_file, encoding="utf-8") as f:
         turns = json.load(f)
@@ -172,6 +175,7 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
         pipeline._set_test_mode(True)   # ＝ /test on
         if not (llm.test_mode and memory.test_mode):
             raise RuntimeError(f"測試模式沒開成（llm={llm.test_mode}, memory={memory.test_mode}）")
+        rec["snapshot"] = snapshot(persona, llm)   # 本題實際用的參數（父行程逐題比對、寫進 results.json）
 
         for t in turns:
             before = llm.last_call
@@ -179,6 +183,10 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
             pipeline.finalize_turn()
             # 本輪的 LLM 呼叫紀錄（LLMClient.last_call；換了一個新的 dict 才算這輪有呼叫）
             call = llm.last_call if llm.last_call is not before else None
+            # 🔴 呼叫失敗（或根本沒呼叫）不得當成「模型答空」記進記錄表：該題作廢，由父行程大聲列出。
+            if call is None or call.get("error"):
+                raise RuntimeError(f"第 {len(rec['turns']) + 1} 輪 LLM 呼叫失敗，不是模型答空："
+                                   f"{call['error'] if call else '本輪沒有呼叫 LLM'}")
             u = call and call["usage"]
             rec["turns"].append({
                 "input": t,
@@ -201,6 +209,64 @@ def run_one(qid: str, turns_file: str, out_file: str) -> int:
 
 
 # ── 一組（父行程）────────────────────────────────────────────────────
+
+# ── 自動抓「實際」狀態（取代手動補欄位）────────────────────────────
+
+_NGL_RE = re.compile(r"(?:^|\s)-ngl\s+(\d+)")
+_M_RE = re.compile(r'(?:^|\s)-m\s+("([^"]+)"|\S+)')
+
+
+def launch_info(model_path: str | None) -> dict:
+    """找「這次正在跑的後端」的啟動指令（tools/start_llama_server.py 落的 *.cmd.txt），讀出 -ngl。
+
+    挑法：logs/backend 裡最新、且 -m 等於後端 /props 回報的模型檔的那一份。
+    找不到（例：後端不是用啟動腳本開的）就回 source=None，呼叫端退回 config 值並標明。
+    """
+    from tools.start_llama_server import LOG_DIR
+    try:
+        files = sorted(LOG_DIR.glob("llama-server_*.cmd.txt"), reverse=True)
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            line = f.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        m = _M_RE.search(line)
+        if not m or not _same_path(m.group(2) or m.group(1), model_path):
+            continue
+        n = _NGL_RE.search(line)
+        return {"source": f.name, "ngl": int(n.group(1)) if n else None}
+    return {"source": None, "ngl": None}
+
+
+def gpu_memory() -> str:
+    """後端的顯存用量（nvidia-smi）。拿不到就回「未取得：原因」，不回空字串。
+
+    先試「llama-server 這個行程用了多少」；Windows 的 WDDM 模式常回 N/A，
+    那時改回「整張卡用了多少（含其他程式）」並寫明。AMD 卡沒有 nvidia-smi ⇒ 未取得，要手動補。
+    """
+    def q(args: list[str]) -> list[str]:
+        p = subprocess.run(["nvidia-smi", *args, "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip() or f"returncode {p.returncode}")
+        return [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+    try:
+        for ln in q(["--query-compute-apps=process_name,used_memory"]):
+            name, _, mem = ln.rpartition(",")
+            if "llama-server" in name.lower() and mem.strip().isdigit():
+                return f"{mem.strip()} MiB（nvidia-smi，llama-server 行程）"
+        rows = q(["--query-gpu=memory.used,memory.total"])
+        if rows:
+            used, total = (x.strip() for x in rows[0].split(","))
+            return f"整張卡 {used}/{total} MiB（nvidia-smi；含其他程式，取不到單一行程）"
+        return "未取得：nvidia-smi 沒有回傳顯卡（請手動補）"
+    except FileNotFoundError:
+        return "未取得：找不到 nvidia-smi（AMD 卡或沒裝驅動工具，請手動補）"
+    except Exception as e:  # noqa: BLE001
+        return f"未取得：nvidia-smi 失敗（{type(e).__name__}: {e}；請手動補）"
+
 
 def _quant(path: str) -> str:
     m = re.search(r"(I?Q\d_[A-Z0-9_]+|F16|BF16|Q8_0)", os.path.basename(path), re.I)
@@ -266,9 +332,13 @@ def cmd_run(args) -> int:
     print(f"模型 {cfg['alias']}｜後端 {backend['build_info']}｜LoRA {backend['lora_adapters']}")
     print("人格 system：" + ("❗ 不送（--no-persona）" if args.no_persona else "照常送出"))
     print(f"結果資料夾：{root}\n")
+    from core.log_window import open_log_window
+    if open_log_window("AOFOS log｜自動施測", root):
+        print("每題子行程的 log 另開視窗即時顯示（自動跟到正在跑的那一題）\n")
 
     results: dict[str, dict] = {}
     failed: list[str] = []
+    run_snap: dict | None = None
     try:
         for i, q in enumerate(order, 1):
             qdir = os.path.join(root, q)
@@ -299,6 +369,15 @@ def cmd_run(args) -> int:
             if r.get("persona") is not (not args.no_persona):
                 failed.append(f"{q}：子行程的人格狀態與 --no-persona 不符（{r.get('persona')}）")
                 break
+            snap = r.get("snapshot")
+            if snap is None:
+                failed.append(f"{q}：子行程沒有回報參數快照")
+                break
+            if run_snap is None:
+                run_snap = snap
+            elif digest(snap) != digest(run_snap):   # 同一組內每題的參數必須一模一樣
+                failed.append(f"{q}：參數快照與第一題不同（同一組內參數變了，看 results.json）")
+                break
             empties = [n for n, t in enumerate(r["turns"], 1) if not t["reply"]]
             if empties:
                 print(f"   ⚠️ 第 {empties} 輪空回覆（照原樣記，不補字）")
@@ -309,18 +388,25 @@ def cmd_run(args) -> int:
         lock.release()
 
     lora = cfg.get("optional_args", {}).get("--lora")
+    li = launch_info(backend.get("model_path"))
+    if li["source"]:
+        ngl = f"{li['ngl']}（實際啟動指令 {li['source']}）" if li["ngl"] is not None else f"未指定（{li['source']}）"
+    else:
+        ngl = f"{cfg.get('ngl', '')}（config 值：找不到這次後端的啟動指令，可能不是用啟動腳本開的）"
+    vram = gpu_memory()
     meta = {
         "模型": f"{cfg['alias']}（{os.path.basename(cfg['model'])}）" + ("｜不送人格 system" if args.no_persona else ""),
         "量化": _quant(cfg["model"]),
         "LoRA": os.path.basename(lora) if lora else "無（模型檔本身；合併版或底模）",
         "推理後端": f"llama-server {backend['build_info']}",
-        "GPU 卸載層數": cfg.get("ngl", ""),
-        "後端回報 VRAM": "",
+        "GPU 卸載層數": ngl,
+        "後端回報 VRAM": vram,
         "測試模式開法（/test on 或 config）": "/test on（tools/eval_runner.py 呼叫同一函式）",
         "施測日期": datetime.now().strftime("%Y-%m-%d"),
     }
     with open(os.path.join(root, "results.json"), "w", encoding="utf-8") as f:
         json.dump({"group": args.group, "persona": not args.no_persona, "meta": meta, "backend": backend, "order": order,
+                   "snapshot": run_snap, "snapshot_digest": run_snap and digest(run_snap),
                    "results": results, "failed": failed}, f, ensure_ascii=False, indent=2)
 
     if failed:
@@ -333,7 +419,8 @@ def cmd_run(args) -> int:
     with open(md, "w", encoding="utf-8") as f:
         f.write(render_group(args.group, meta, results))
     print(f"\n✅ 20 題完成。\n   記錄表區塊：{md}\n   完整紀錄：{os.path.join(root, 'results.json')}")
-    print("   「後端回報 VRAM」請照 llama-server 啟動 log 手動補上。")
+    if vram.startswith("未取得"):
+        print(f"   ⚠️ 「後端回報 VRAM」{vram}")
     return 0
 
 
@@ -345,6 +432,24 @@ def cmd_compare(args) -> int:
         with open(p, encoding="utf-8") as f:
             runs.append(json.load(f))
     names = [r["meta"]["模型"].split("（")[0] for r in runs]
+    # 施測前六步「人格兩組相同、參數全帶入」的自動核對：模型不同是刻意的，其餘參數必須一致
+    snaps = [r.get("snapshot") for r in runs]
+    snap_bad = False
+    if any(s is None for s in snaps):
+        print("⚠️ 有組別沒有參數快照（舊版 eval_runner 跑的），無法核對人格與參數是否一致\n")
+    else:
+        same = {s.get("persona_sent") for s in snaps}
+        drop = ("llama_server", "llm") if len(same) == 1 else ("llama_server", "llm", "persona_sent")
+        ds = [digest(s, drop=drop) for s in snaps]
+        if len(set(ds)) != 1:
+            snap_bad = True
+            print("❌ 各組的人格或參數不一致（施測前六步第 4、5 步）：")
+            for n, s, d in zip(names, snaps, ds):
+                print(f"   {n}：快照 {d}｜人格 {s['persona_sha256'][:12]}｜送人格 {s.get('persona_sent')}｜"
+                      f"取樣 {s['effective']}")
+            print()
+        else:
+            print(f"✅ 各組人格與參數一致（快照 {ds[0]}，模型欄不比）\n")
     print("第一輪 prompt_tokens（跨模型必須相同；不同＝模板或送出內容沒對齊，該組分數作廢）")
     print(f"{'題號':<6}" + "".join(f"{n:>16}" for n in names))
     bad = []
@@ -356,6 +461,9 @@ def cmd_compare(args) -> int:
         print(f"{q:<6}" + "".join(f"{str(v):>16}" for v in vals) + mark)
     if bad:
         print(f"\n❌ 第一輪不一致：{bad}")
+        return 1
+    if snap_bad:
+        print("\n❌ prompt_tokens 一致，但人格或參數不一致（見上方）")
         return 1
     print("\n✅ 20 題第一輪全部一致（第二輪起含各自回覆，本來就不同，不比）")
     return 0

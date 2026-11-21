@@ -37,7 +37,7 @@ def verify_llamaserver(client, base_url: str, model: str, *, expected_ctx: int |
     """
     啟動時查驗 llama-server 實際狀態是否與 config 一致，在提問之前就給出結論。
 
-    防的事（《歸檔》J0004）：回應看起來完全正常，但跑的不是
+    防的事（260730-量測-04）：回應看起來完全正常，但跑的不是
     你以為的那顆模型／那個 context，整批實驗數據靜默作廢。llama-server 的載入參數雖然
     來自同一份 config，仍可能是「改了 config 沒重開 server」或「手動另開了一個」。
 
@@ -86,7 +86,7 @@ def verify_llamaserver(client, base_url: str, model: str, *, expected_ctx: int |
     if expected_slots and slots is not None and slots != expected_slots:
         logger.error(f"⚠ llama-server 推理槽數為 {slots}，設定為 {expected_slots}。")
 
-    # chat template：只確認有；內容一致性用 /apply-template 人工看（《現況》第五章 #4 雙 BOS）
+    # chat template：只確認有；內容一致性用 /apply-template 人工看（〈現況-模型與後端〉雙 BOS）
     if not props.get("chat_template"):
         logger.warning("/props 未回報 chat_template：server 可能沒加 --jinja，或該版欄位改名。")
 

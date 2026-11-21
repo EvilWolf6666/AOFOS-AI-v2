@@ -1,6 +1,6 @@
 """對話探測：照劇本自動跑一場或連續幾場對話，量延遲、看注入、測背景取消與 observation。
 
-劇本（《現況》第八章 P1 第 ③ 點基線＋P22）：
+劇本（待辦 P1 第 ③ 點基線＋P22）：
    · 23 輪：中段兩則 observation，後面接「剛剛在玩什麼」「現在在幹嘛」（P22：驗
      situation_in_history 在正式路徑上的歷史）；長度超過 Working Memory 上限，量丟批那一輪。
    · 第 16 輪後閒置，等背景判斷開跑後插話 ⇒ 量「歷史已長、判斷進行中」的取消代價。
@@ -33,6 +33,8 @@
   python -m tools.chat_probe --from-prev         來源＝最近一次探測最後一場的副本
   python -m tools.chat_probe --from <db 路徑>    來源＝指定的副本
   python -m tools.chat_probe --empty             來源＝空庫
+log：寫進本次的 logs/runs/chat_probe/chat_probe_<時間>/（不混進日常 log），並另開一個視窗即時顯示（core/log_window.py）；
+     開了 log 視窗，這個視窗就只印摘要。
 結果：畫面印摘要；每輪完整紀錄（含送出的 messages）落檔 logs/runs/chat_probe/chat_probe_<時間>/s<k>/result.json，
       全部場次的總表在 logs/runs/chat_probe/chat_probe_<時間>/summary.json
 """
@@ -41,7 +43,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import glob
-import hashlib
 import json
 import os
 import sqlite3
@@ -51,9 +52,12 @@ import time
 from datetime import datetime
 
 import config
+from core.run_snapshot import snapshot
 from core.agent.events import OBSERVATION, UTTERANCE, Event
 from core.agent.pipeline import Pipeline
 from core.llm_client import LLMClient
+from core.log_window import open_log_window
+from core.logger import redirect_log_dir, set_console_writer
 from core.memory.manager import MemoryManager
 from core.memory.run_lock import RunLock, lock_path
 from core.persona import Persona
@@ -65,7 +69,7 @@ PROBE_EPISODE_GAP_MIN = 3        # 連跑時的切段門檻（分鐘）；劇本
 BASELINE_SESSIONS = 5
 
 # 劇本：("say", 文字) 是邪狼說話；("obs", 描述) 是 observation（真實情境格式同 window_watcher，
-#    《現況》22之84 五）；第三欄是 P22 的答案核對（回覆要提到其中一個詞）。
+#    261023-過程-84 五）；第三欄是 P22 的答案核對（回覆要提到其中一個詞）。
 # ⚠️ 長度刻意超過 MAX_WORKING_MEMORY（現為 20）：第 21 輪寫回後一次丟 WM_DROP_ROUNDS 輪，
 #    第 22 輪送出的開頭改變 ⇒ 快取斷、整段重讀，那一輪就是「丟批那輪」。改 WM 上限時劇本要跟著改。
 MINECRAFT = ("Minecraft", "minecraft", "麥塊", "創世神")
@@ -224,7 +228,7 @@ def summarize(rec: dict) -> str:
 
 
 def check_baseline_conditions() -> list[str]:
-    """《現況》第八章 P1 第 ③ 點的基線條件。人格是不是 V3 程式驗不了，只記雜湊。"""
+    """待辦 P1 第 ③ 點的基線條件。人格是不是 V3 程式驗不了，只記雜湊。"""
     bad = []
     if config.MEMORY_CONFIG.get("block_position") != "in_user":
         bad.append(f"block_position={config.MEMORY_CONFIG.get('block_position')!r}（應為 'in_user'）")
@@ -236,18 +240,10 @@ def check_baseline_conditions() -> list[str]:
 
 
 def run_params(persona: Persona, llm: LLMClient, gap_min: int | None, v4: bool | None) -> dict:
-    """本場實際用的參數全部落檔（施測前六步第 4、5 步的探測版：人格兩組相同、參數全帶入）。"""
-    keys_mem = ("block_position", "note_position", "opening_turns", "v4_enabled", "episode_gap_minutes")
-    keys_evt = ("observation_delivery", "situation_in_history", "situation_template")
+    """本場實際用的參數全部落檔（施測前六步第 4、5 步的探測版：人格兩組相同、參數全帶入）。
+    共用欄位由 core.run_snapshot 產生（與 eval_runner 同一份），這裡只加探測自己的參數。"""
     return {
-        "persona_sha256": hashlib.sha256(persona.system_prompt.encode("utf-8")).hexdigest(),
-        "persona_first_line": persona.system_prompt.splitlines()[0] if persona.system_prompt else "",
-        "llama_server": {k: config.LLAMA_SERVER.get(k) for k in ("build", "model", "alias")},
-        "llm": {k: v for k, v in config.LLM_CONFIG.items() if k not in ("api_key",)},
-        "seed_in_client": llm.seed,
-        "memory": {k: config.MEMORY_CONFIG.get(k) for k in keys_mem},
-        "event": {k: config.EVENT_CONFIG.get(k) for k in keys_evt},
-        "wm": {"MAX_WORKING_MEMORY": config.MAX_WORKING_MEMORY, "WM_DROP_ROUNDS": config.WM_DROP_ROUNDS},
+        **snapshot(persona, llm),
         "probe": {"idle_s": PROBE_IDLE_S, "episode_gap_min_override": gap_min,
                   "v4_enabled_override": v4, "thresholds": THRESHOLDS},
     }
@@ -551,6 +547,11 @@ def main() -> int:
         return 1
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root = os.path.join(PROBE_RUNS_DIR, f"chat_probe_{stamp}")
+    # 之後的 log 改寫進本次資料夾：探測流量不混進日常 log，開著的 AOFOS log 視窗也不會冒出探測的內容。
+    log_file = redirect_log_dir(root)
+    if open_log_window("AOFOS log｜對話探測", root):
+        set_console_writer(None, config.LOG_CONFIG["dialog_level"])   # log 去另開的視窗，這裡只留摘要
+        print(f"log 另開視窗即時顯示（檔案：{log_file}）")
     gap_min = PROBE_EPISODE_GAP_MIN if n_sessions > 1 else None
     s2t = make_s2t()
     if s2t is None:

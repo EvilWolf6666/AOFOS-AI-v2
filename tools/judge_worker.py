@@ -57,6 +57,8 @@ def main(*, db_path: str | None = None, llm=None, cfg_override: dict | None = No
         st = TopicStore(cx, writable=False)
         out(f"背景判斷開始：待判 {st.pending_count()} 句（AOFOS 一啟動就會自動讓路）")
         judge.set_path(db)
+        # 「連續出錯」：只數上一次成功判完一段之後的錯誤（stats 是累計數，判成一段就歸零重數）
+        seg_seen, err_base = judge.stats["segments"], judge.stats["errors"]
         while True:
             time.sleep(poll_s)
             if held_by_other(run):
@@ -64,8 +66,10 @@ def main(*, db_path: str | None = None, llm=None, cfg_override: dict | None = No
                 out("偵測到 AOFOS 啟動：已取消手上的判斷並結束（沒判完的下次再判，不會重複建）")
                 break
             pend = st.pending_count()
-            if judge.stats["errors"] >= 3:
-                out(f"連續出錯，停止（llama-server 有開嗎？）：{judge.status(pend)}")
+            if judge.stats["segments"] != seg_seen:
+                seg_seen, err_base = judge.stats["segments"], judge.stats["errors"]
+            if judge.stats["errors"] - err_base >= 3:
+                out(f"連續出錯 3 次，停止（推理後端有開嗎？）：{judge.status(pend)}")
                 rc = 1
                 break
             if pend == 0 and not judge.busy:

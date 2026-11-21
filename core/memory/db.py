@@ -11,7 +11,7 @@
    ——分成兩個檔就沒有交易保證，那個「原文寫成功但 N 沒更新」的窗口會回來。
    `serial` 發號同理：取號與寫入同一交易 ⇒ **不會有「號發了但紀錄沒寫」。**
 
-🔴 **為什麼是 SQLite 不是 JSONL**（量測與舊做法見《歸檔》）：交易保證讓「寫到一半的紀錄」
+🔴 **為什麼是 SQLite 不是 JSONL**（量測與舊做法見〈日誌-記憶〉）：交易保證讓「寫到一半的紀錄」
    這個狀態不存在 ⇒ 不必自己做檔尾換行檢查、解析失敗檢查、啟動截尾。
 
 ⚠️ **每個執行緒各自 connect()。** Python 的 sqlite3 連線預設不可跨執行緒共用
@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 
 from core.logger import setup_logger
 
@@ -62,11 +63,11 @@ CREATE TABLE IF NOT EXISTS transcript (
     kind      TEXT,
     situation TEXT,
     clean     TEXT,               -- 乾淨文字：供檢索與注入（規則見 clean.py）
-    recalled  INTEGER NOT NULL DEFAULT 0,  -- 被撈次數計數器
-    retired   INTEGER NOT NULL DEFAULT 0,  -- 可標失效；⚠️ 永不刪除列
+    recalled  INTEGER NOT NULL DEFAULT 0,  -- 預留欄位：被撈次數（2026-09-13 全候選共同前置第 3 項，會寫進持久化資料的先建）。目前沒有寫入端也沒有讀取端，值恆為 0：⚠️ 不可讀成「從未被撈」，日後開始計數時舊列是「沒算過」
+    retired   INTEGER NOT NULL DEFAULT 0,  -- 可標失效，⚠️ 永不刪除列。讀取端（主題判斷、事件層）已會略過 1，目前沒有寫入端：刻意，等有「標失效」的功能時再接
     speaker_id TEXT                        -- 準 v4：這一句是誰說的；NULL＝未知（欄位加入前的舊列）
 );
--- speaker_id 每句一個（《現況》11之2 丁；舊做法 participants 見《歸檔》D0030）。
+-- speaker_id 每句一個（〈現況-記憶〉；舊做法 participants 見 260930-記憶-30）。
 --    「誰在場」由同一段對話的 speaker_id 收集推出，不另存（兩份會對不上）。
 --    舊列不回填：「猜的值」與「記錄到的值」長得一樣，寧可留 NULL。
 
@@ -78,6 +79,12 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 _DEFAULT_META = {"next_serial": 1, "landed_upto": 0}
+
+# 本檔管的表（pre_write／transcript／meta）的結構版本，存在 meta 的 schema_db 鍵。
+# 規則：改了欄位、或改了「欄位的意思」（例：回填規則變了）就 +1，並在 _migrate 補上從舊版升上來的步驟。
+#   ⚠️ 只看「欄位在不在」分不出「欄位在、意思變了」——這就是要有版本號的原因。
+# 1＝2026-11-21 的形狀（含 clean、speaker_id）。
+SCHEMA_VERSION = 1
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -94,18 +101,68 @@ def connect(path: str) -> sqlite3.Connection:
     #    然後雙雙嘗試寫入，其中一個炸 UNIQUE constraint。
     #    ⇒ 改為 autocommit，並由 write_txn() 明確 BEGIN IMMEDIATE（見下）。
     cx = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
-    cx.row_factory = sqlite3.Row
-    cx.execute("PRAGMA journal_mode=WAL")
-    cx.execute("PRAGMA synchronous=FULL")
-    cx.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-    cx.executescript(SCHEMA)
-    _migrate(cx)
-    with write_txn(cx):
-        cx.executemany(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
-            list(_DEFAULT_META.items()),
-        )
+    # ⚠️ 下面任何一步失敗（版本比程式新而拒開、遷移前備份失敗…）都要先關掉連線再丟出：
+    #    不關的話 Windows 上記憶檔會一直被這個行程鎖住（刪不掉、別的程式開不了），
+    #    直到垃圾回收才放（2026-11-21 Windows 自測撞到：拒開之後暫存資料夾刪不掉）。
+    try:
+        cx.row_factory = sqlite3.Row
+        cx.execute("PRAGMA journal_mode=WAL")
+        cx.execute("PRAGMA synchronous=FULL")
+        cx.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        cx.executescript(SCHEMA)
+        check_schema_version(cx, "schema_db", SCHEMA_VERSION)   # 比程式新的檔：遷移前就拒絕
+        _migrate(cx)
+        with write_txn(cx):
+            cx.executemany(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
+                list(_DEFAULT_META.items()),
+            )
+        mark_schema_version(cx, "schema_db", SCHEMA_VERSION)
+    except BaseException:
+        cx.close()
+        raise
     return cx
+
+
+def check_schema_version(cx: sqlite3.Connection, key: str, code_version: int) -> None:
+    """記憶檔的結構版本比程式新 ⇒ 拒絕開啟（舊程式不懂新結構，照舊寫下去會寫壞）。沒有紀錄＝舊檔，放行。"""
+    row = cx.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if row is not None and row[0] > code_version:
+        raise RuntimeError(f"記憶檔的結構版本（{key}={row[0]}）比這份程式（{code_version}）新："
+                           "可能是用新版程式開過、又換回舊版。拒絕開啟，以免寫壞。")
+
+
+def mark_schema_version(cx: sqlite3.Connection, key: str, code_version: int) -> None:
+    """遷移完成後記下版本（只升不降）。"""
+    row = cx.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if row is None or row[0] < code_version:
+        with write_txn(cx):
+            cx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, code_version))
+        if row is not None:
+            logger.warning(f"記憶檔結構版本 {key}：{row[0]} → {code_version}")
+
+
+def backup_before_migration(cx: sqlite3.Connection, what: str) -> str | None:
+    """一次性結構改動之前，把整個記憶檔複製一份（SQLite backup API）。
+
+    🔴 失敗就拋例外、不遷移：〈現況-開場〉「先確認結果有效，再做不可逆的那一步」。
+       代價是磁碟滿時程式起不來——那時本來就不該動正式檔。
+    輸出：<記憶檔所在資料夾>/backups/<檔名>_<時間>_before_<what>.db
+    """
+    path = cx.execute("PRAGMA database_list").fetchone()[2]
+    if not path:   # 記憶體內的 DB（自測用）沒有檔可備份
+        return None
+    d = os.path.join(os.path.dirname(path), "backups")
+    os.makedirs(d, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    dst = os.path.join(d, f"{stem}_{datetime.now():%Y%m%d_%H%M%S}_before_{what}.db")
+    b = sqlite3.connect(dst)
+    try:
+        cx.backup(b)
+    finally:
+        b.close()
+    logger.warning(f"結構遷移前已備份記憶檔：{dst}")
+    return dst
 
 
 def _migrate(cx: sqlite3.Connection) -> None:
@@ -117,6 +174,12 @@ def _migrate(cx: sqlite3.Connection) -> None:
     補完後把既有列回填成 `clean = content`——剝除規則未定前兩欄本來就相同，
     ⚠️ 不回填的話舊列的 clean 是 NULL，而「NULL」與「剝完是空字串」是兩件事。
     """
+    # 要動結構就先備份一次（新建的空檔不會走到這裡：SCHEMA 已含全部欄位）
+    t_cols = {r["name"] for r in cx.execute("PRAGMA table_info(transcript)")}
+    p_cols = {r["name"] for r in cx.execute("PRAGMA table_info(pre_write)")}
+    if not {"clean", "speaker_id"} <= t_cols or "speaker_id" not in p_cols:
+        backup_before_migration(cx, "transcript")
+
     cols = {r["name"] for r in cx.execute("PRAGMA table_info(transcript)")}
     if "clean" not in cols:
         with write_txn(cx):
@@ -126,7 +189,7 @@ def _migrate(cx: sqlite3.Connection) -> None:
         logger.warning(f"原文存放區補上 clean 欄位（一次性），回填 {n} 列")
 
     # speaker_id（預寫區與原文存放區都要有，預寫區是原樣轉寫的上游）。
-    # ⚠️ 一次性結構改動（《現況》〈📐 規則〉二「架構上只做一次的事」）：動手前先備份 data/memory.db。
+    # ⚠️ 一次性結構改動（〈現況-開場〉〈📐 規則〉二「架構上只做一次的事」）：動手前先備份 data/memory.db。
     for table in ("pre_write", "transcript"):
         cols = {r["name"] for r in cx.execute(f"PRAGMA table_info({table})")}
         if "speaker_id" not in cols:
@@ -153,7 +216,9 @@ def write_txn(cx: sqlite3.Connection):
     cx.execute("BEGIN IMMEDIATE")
     try:
         yield cx
-    except Exception:
+    except BaseException:
+        # BaseException 而非 Exception：Ctrl+C 打在交易中途時也要回滾，
+        # 否則連線停在交易裡，收尾時下一個 BEGIN 會失敗、那一輪原句寫不進去。
         cx.execute("ROLLBACK")
         raise
     cx.execute("COMMIT")
@@ -197,7 +262,7 @@ def set_meta(cx: sqlite3.Connection, key: str, value: int) -> None:
 # 自測：python -m core.memory.db --selftest
 # ══════════════════════════════════════════════════════════════
 #
-# 🔴 **每一項都用一個已知該被抓到的樣本撞一次**（《現況》20之3）——
+# 🔴 **每一項都用一個已知該被抓到的樣本撞一次**（〈現況-文件與協作〉第三節第 21 點）——
 #    只印「通過」只證明射程內沒問題，沒證明射程夠寬。
 # ⚠️ **一律在暫存目錄造假 DB，不碰任何真檔**。
 # 📌 本自測涵蓋整個儲存層（pre_write ＋ transcript ＋ meta），因為它們是同一個 DB。

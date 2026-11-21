@@ -212,6 +212,113 @@ def main() -> int:  # noqa: C901
             check("寫入失敗不中斷對話", False, repr(e))
 
     with tempfile.TemporaryDirectory() as d:
+        print("\n[寫入失敗之後：切測試模式與離場]")
+
+        def contents(path: str) -> list[str]:
+            cx = sqlite3.connect(path)
+            try:
+                return [r[0] for r in cx.execute("SELECT content FROM transcript ORDER BY serial")]
+            finally:
+                cx.close()
+
+        def boom(*_a):
+            raise OSError("寫入失敗（模擬）")
+
+        daily = os.path.join(d, "memory.db")
+        m = mm(d)
+        m.add_turn("先寫進去的一句", "嗯")
+        st = m._write_store()
+        st.pre_write.append = boom
+        m.add_turn("寫不進去的一句", "嗯")
+        try:
+            m.set_test_mode(True)
+            refused = False
+        except RuntimeError:
+            refused = True
+        check("還有沒寫進去的原句 ⇒ 拒絕切測試模式、WM 不清",
+              refused and not m.test_mode and any(t["content"] == "寫不進去的一句" for t in m.working_memory))
+        del st.pre_write.append                    # 寫入恢復
+        m.set_test_mode(True)
+        m.set_test_mode(False)
+        check("寫入恢復後照常切換、那句已落地", "寫不進去的一句" in contents(daily), str(contents(daily)))
+        m.close()
+
+    with tempfile.TemporaryDirectory() as d:
+        daily = os.path.join(d, "memory.db")
+        m = mm(d)
+        st = m._write_store()
+        st.transcript.land = boom
+        m.add_turn("最後一句", "最後的回覆")     # 進了預寫區、落地失敗
+        del st.transcript.land
+        m.close()
+        cx = sqlite3.connect(daily)
+        left = cx.execute("SELECT COUNT(*) FROM pre_write").fetchone()[0]
+        cx.close()
+        check("落地失敗後直接離場 ⇒ 離場時補落地、預寫區清空",
+              contents(daily) == ["最後一句", "最後的回覆"] and left == 0, f"{contents(daily)} 預寫區 {left}")
+
+    with tempfile.TemporaryDirectory() as d:
+        print("\n[結構遷移：先備份、記版本、拒開比程式新的檔]")
+        from core.memory import db as dbm
+        old = os.path.join(d, "old.db")
+        cx = sqlite3.connect(old)      # 造一個沒有 speaker_id 的舊檔
+        cx.executescript(
+            "CREATE TABLE pre_write (serial INTEGER PRIMARY KEY, ts TEXT NOT NULL, role TEXT NOT NULL,"
+            " content TEXT NOT NULL, hash TEXT NOT NULL, source TEXT, kind TEXT, situation TEXT);"
+            "CREATE TABLE transcript (serial INTEGER PRIMARY KEY, ts TEXT NOT NULL, role TEXT NOT NULL,"
+            " content TEXT NOT NULL, hash TEXT NOT NULL, source TEXT, kind TEXT, situation TEXT, clean TEXT,"
+            " recalled INTEGER NOT NULL DEFAULT 0, retired INTEGER NOT NULL DEFAULT 0);"
+            "INSERT INTO transcript(serial, ts, role, content, hash, clean)"
+            " VALUES(1, '2026-01-01T00:00:00', 'user', '舊的一句', 'h', '舊的一句');")
+        cx.close()
+        c2 = dbm.connect(old)
+        bdir = os.path.join(d, "backups")
+        baks = sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []
+        ver = c2.execute("SELECT value FROM meta WHERE key='schema_db'").fetchone()
+        c2.close()
+        ok_bak = False
+        if baks:
+            b = sqlite3.connect(os.path.join(bdir, baks[0]))
+            cols = {r[1] for r in b.execute("PRAGMA table_info(transcript)")}
+            ok_bak = "speaker_id" not in cols and b.execute("SELECT COUNT(*) FROM transcript").fetchone()[0] == 1
+            b.close()
+        check("舊檔補欄位前先備份一份（備份是遷移前的形狀、資料完整）", len(baks) == 1 and ok_bak, str(baks))
+        check("遷移後記下結構版本", ver is not None and ver[0] == dbm.SCHEMA_VERSION, str(ver and ver[0]))
+        c3 = dbm.connect(old)
+        c3.close()
+        check("已是新形狀的檔再開不會再備份", len(os.listdir(bdir)) == 1, str(os.listdir(bdir)))
+        cx = sqlite3.connect(old)
+        cx.execute("UPDATE meta SET value=? WHERE key='schema_db'", (dbm.SCHEMA_VERSION + 1,))
+        cx.commit()
+        cx.close()
+        import sqlite3 as _sq
+        opened: list = []
+        real_connect = _sq.connect
+
+        def spy(*a, **k):   # 記下 connect() 開的連線，看拒開之後有沒有關
+            c = real_connect(*a, **k)
+            opened.append(c)
+            return c
+        _sq.connect = spy
+        try:
+            dbm.connect(old).close()
+            refused = False
+        except RuntimeError:
+            refused = True
+        finally:
+            _sq.connect = real_connect
+        check("結構版本比程式新 ⇒ 拒絕開啟", refused)
+        still_open = []
+        for c in opened:
+            try:
+                c.execute("SELECT 1")
+                still_open.append(c)
+            except _sq.ProgrammingError:   # 已關的連線再用會丟這個
+                pass
+        check("拒開之後連線已關（不關的話 Windows 上記憶檔一直被鎖住）", opened and not still_open,
+              f"開了 {len(opened)} 條、還開著 {len(still_open)} 條")
+
+    with tempfile.TemporaryDirectory() as d:
         print("\n[兩條執行緒同時寫同一個 DB]")
         errs: list[str] = []
 

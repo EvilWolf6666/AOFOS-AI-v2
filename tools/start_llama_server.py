@@ -3,7 +3,9 @@
 設定的唯一來源是 config.py；本檔只負責：啟動前檢查 → 組指令 → 落檔紀錄 → 啟動。
 用法（專案根目錄）：python -m tools.start_llama_server
 """
+import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -52,12 +54,20 @@ def check_port_free(cfg: dict) -> None:
 
 
 def warn_if_lmstudio_running() -> None:
-    """兩個後端同時載模型會搶 VRAM，觸發 Sysmem Fallback 無聲降速。只警告不擋。"""
-    out = subprocess.run(
-        ["tasklist", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if "LM Studio.exe" in out.stdout:
+    """兩個後端同時載模型會搶 VRAM，觸發 Sysmem Fallback 無聲降速。只警告不擋。
+
+    Windows 用 tasklist、其他系統用 ps。查詢本身失敗（指令不存在等）只略過這項檢查，不擋開機。
+    """
+    if os.name == "nt":
+        cmd, needles = ["tasklist", "/FO", "CSV", "/NH"], ("LM Studio.exe",)
+    else:
+        cmd, needles = ["ps", "-eo", "args"], ("LM Studio", "LM-Studio", "lm-studio")   # 不比對 "lmstudio"：模型路徑 .lmstudio/ 會誤中
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"⚠️ 無法檢查 LM Studio 是否在執行（{e}），略過這項檢查。\n")
+        return
+    if any(n in out.stdout for n in needles):
         print("⚠️ LM Studio 正在執行：若它載著模型，請先卸載或關閉，否則會搶 VRAM。\n")
 
 
@@ -125,7 +135,8 @@ def main() -> None:
     cmd = build_cmd(cfg, log_file)
 
     # 完整指令落檔：日後比對延遲／施測時能查到當時用了哪組參數
-    cmd_line = subprocess.list2cmdline(cmd)
+    # 指令字串依系統的引號規則組（只用於落檔與顯示；實際啟動傳的是 list，不經 shell）
+    cmd_line = subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd)
     (LOG_DIR / f"llama-server_{stamp}.cmd.txt").write_text(cmd_line + "\n", encoding="utf-8")
     print(f"▶ {cmd_line}\n")
 

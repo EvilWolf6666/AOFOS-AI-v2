@@ -7,7 +7,7 @@ import threading
 #    而後者在 import 當下就讀 HF_HUB_OFFLINE（config 開頭設定，見 main.py 開頭）。
 from config import VOICE_CONFIG
 from core import console
-from core.logger import setup_logger
+from core.logger import setup_logger, timed
 
 import numpy as np
 import sounddevice as sd
@@ -51,14 +51,16 @@ def _drain_keys() -> bool:
 
 
 class VoiceInput:
-    def __init__(self, model_size: str = "small", language: str = "zh"):
+    def __init__(self, model_size: str = VOICE_CONFIG["whisper_model"], language: str = "zh"):
         console.emit("[語音模型載入中…]")
         logger.info(f"載入 Whisper 模型（{model_size}）")
-        self.whisper = WhisperModel(
-            model_size,
-            device="cpu",
-            compute_type="int8"
-        )
+        with timed("Whisper載入", model=model_size):
+            self.whisper = WhisperModel(
+                model_size,
+                device="cpu",
+                compute_type="int8"
+            )
+        self.model_size = model_size
         self.language = language
 
         logger.info("載入 Silero VAD 模型")
@@ -135,12 +137,16 @@ class VoiceInput:
             return ""
 
         audio_np = np.concatenate(audio_buffer)
-        segments, _ = self.whisper.transcribe(
-            audio_np,
-            language=self.language,
-            beam_size=5,
-        )
-        text = "".join(seg.text for seg in segments).strip()
+        audio_s = len(audio_np) / SAMPLE_RATE
+        # ⚠️ transcribe() 回傳的是產生器，真正的辨識發生在 join 逐段取值時——計時要包到 join
+        with timed("語音辨識", model=self.model_size, audio_s=round(audio_s, 2)):
+            segments, _ = self.whisper.transcribe(
+                audio_np,
+                language=self.language,
+                beam_size=5,
+            )
+            text = "".join(seg.text for seg in segments).strip()
+        logger.info(f"辨識了 {audio_s:.1f} 秒的音訊（{self.model_size}）")
         console.emit(f"📝 辨識結果：{text}")
         return text
 

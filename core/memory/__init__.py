@@ -5,7 +5,7 @@
 執行鎖 run_lock，入口 manager）。
 
 本套件是記憶這條線的唯一分群：**這幾個檔會一起被改，而且不跟外面一起改**
-——分群判準是這個，不是行數（《現況》零章第八條）。
+——分群判準是這個，不是行數（第八條原則）。
 
 對外入口
     from core.memory.manager import MemoryManager

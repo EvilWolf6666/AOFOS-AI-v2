@@ -16,6 +16,7 @@ from config import PROJECT_ROOT, TIMING_CONFIG
 # 日常紀錄（每日 log、timing-*.jsonl）的位置。專案根只取 config.PROJECT_ROOT（config.py 開頭：不得自己推算）。
 # 紀錄結構：logs/daily（本檔）、logs/backend（start_llama_server）、logs/runs/<工具>（各工具每次執行）、logs/archive_lmstudio（舊紀錄）。
 # AOFOS_LOG_DIR：子行程用的覆寫——tools/eval_runner 每題開的行程設成該題資料夾，施測流量不混進日常 log。
+# 同一個行程裡要改寫到別處（工具確定了自己的執行資料夾之後）用 redirect_log_dir()。
 LOG_DIR = os.environ.get("AOFOS_LOG_DIR") or os.path.join(PROJECT_ROOT, "logs", "daily")
 LOG_LEVEL = logging.DEBUG
 
@@ -68,10 +69,60 @@ def set_console_writer(writer, level: str | None = "DEBUG") -> None:
     _CONSOLE_SINK.level = logging.CRITICAL + 1 if level is None else logging.getLevelName(level)
 
 
-def _add_handlers(logger: logging.Logger) -> None:
-    """終端（彩色，經 _ConsoleSink，印多少由它決定）＋ LOG_DIR 每日一份純文字檔（全部）。"""
-    os.makedirs(LOG_DIR, exist_ok=True)
+class _SharedFileHandler(logging.FileHandler):
+    """所有 logger 共用的這一個檔案 handler（每日一份純文字檔，全部等級）。
 
+    共用一個而不是每個 logger 各開一個：同一個檔只開一次，而且 redirect_log_dir() 改一處就全部改接。
+    檔名取第一次寫入時的日期、之後不換檔：跑過午夜的那一場整場在同一個檔（start/log.bat 靠這個跟住）。
+    """
+
+    def retarget(self, path: str) -> None:
+        self.acquire()
+        try:
+            if self.stream is not None:
+                self.stream.flush()
+                self.stream.close()
+                self.stream = None   # 下一筆 emit 時照新路徑開檔（FileHandler 的 delay 行為）
+            self.baseFilename = os.path.abspath(path)
+        finally:
+            self.release()
+
+
+_FILE_HANDLER: _SharedFileHandler | None = None
+
+
+def _file_handler() -> _SharedFileHandler:
+    global _FILE_HANDLER
+    if _FILE_HANDLER is None:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        _FILE_HANDLER = _SharedFileHandler(
+            os.path.join(LOG_DIR, datetime.now().strftime("%Y-%m-%d") + ".log"),
+            encoding="utf-8", delay=True)
+        _FILE_HANDLER.setLevel(logging.DEBUG)
+        _FILE_HANDLER.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+    return _FILE_HANDLER
+
+
+def redirect_log_dir(path: str) -> str:
+    """之後的檔案 log 與 timing-*.jsonl 改寫到 path（工具自己的執行資料夾），回傳新的 log 檔路徑。
+
+    已經建立的 logger 一併改接（共用同一個檔案 handler）；改接之前寫的留在原檔。
+    用途：tools/chat_probe 這類在同一個行程裡跑正式路徑的工具，確定執行資料夾後呼叫，
+    探測流量就不混進日常 log、也不會出現在開著的 AOFOS log 視窗裡（2026-11-21，待辦 C24）。
+    """
+    global LOG_DIR
+    LOG_DIR = path
+    os.makedirs(path, exist_ok=True)
+    dst = os.path.join(path, datetime.now().strftime("%Y-%m-%d") + ".log")
+    _file_handler().retarget(dst)
+    return dst
+
+
+def _add_handlers(logger: logging.Logger) -> None:
+    """終端（彩色，經 _ConsoleSink，印多少由它決定）＋ LOG_DIR 每日一份純文字檔（全部，共用一個 handler）。"""
     console_handler = colorlog.StreamHandler(_CONSOLE_SINK)
     console_handler.addFilter(_CONSOLE_SINK.passes)
     console_handler.setFormatter(colorlog.ColoredFormatter(
@@ -85,19 +136,8 @@ def _add_handlers(logger: logging.Logger) -> None:
         }
     ))
 
-    log_filename = datetime.now().strftime("%Y-%m-%d") + ".log"
-    file_handler = logging.FileHandler(
-        os.path.join(LOG_DIR, log_filename),
-        encoding="utf-8"
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        datefmt="%H:%M:%S"
-    ))
-
     logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
+    logger.addHandler(_file_handler())
 
 
 def setup_logger(name: str) -> logging.Logger:

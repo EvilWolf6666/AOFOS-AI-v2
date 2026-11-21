@@ -7,7 +7,8 @@
 端到端（閒置 → 判斷 → 建主題 → 向量 → 注入）、取消（prefill 中／串流中）、施測隔離、
 暫停逾時保險、壞輸出、判斷一次呼叫＋logprobs 算 P(建)（含「答不建但機率過門檻 ⇒ 補一次」與「拿不到機率」）、
 規則檔解析（用真的 prompts/memory_judge.txt）、關鍵字那一路與配額聯集、鎖定／待審／人工審核、舊表遷移、
-判斷來源（judge_model／judge_prompt）落地與舊表補欄、重寫版本沿用鎖定狀態。
+判斷來源（judge_model／judge_prompt）落地與舊表補欄、重寫版本沿用鎖定狀態、滑動視窗、
+人工審核工具、獨立終端背景判斷與執行鎖、殘留的取消旗標。
 ⚠️ 不測「真的推理後端斷線後會不會停止運算」——那要在 Windows 實測（看取消後下一輪對話 TTFT）。
 """
 
@@ -652,6 +653,24 @@ def main() -> int:
                   f"res={res} dt={dt:.2f} aborted={aborted} {lines[-1:]}")
             h = open_handles(d)
             check("worker 結束後沒有連線還開著（鎖檔除外）", [x for x in h if not x.startswith("aofos.run")] == [], str(h))
+
+        print("\n[殘留的取消旗標]")
+        with tempfile.TemporaryDirectory() as d:
+            m = mm(d, fake)
+            turn(m, "我住在高雄", "嗯")
+            ok = wait(lambda: judged(m)[0] == 2)
+            bg = m._judge.llm
+            bg.cancel()                          # 模擬 set_path 與切換交錯後留下的旗標（不在暫停、目標沒換）
+            t0 = time.process_time()
+            m.add_turn("我家的貓很胖", "嗯")      # 不經 pause／resume：沒人替它清旗標
+            ok2 = wait(lambda: judged(m)[0] == 4)
+            cpu = time.process_time() - t0
+            check("旗標殘留 ⇒ 背景自己清掉並繼續判、不空轉",
+                  ok and ok2 and not bg.cancelled and m._judge.stats["cancelled"] <= 2 and cpu < 1.0,
+                  f"judged={judged(m)} cancelled={m._judge.stats['cancelled']} cpu={cpu:.2f}")
+            m.close()
+            h = open_handles(d)
+            check("離場後沒有任何連線還開著", not h, str(h))
 
         print("\n[暫停逾時保險]")
         with tempfile.TemporaryDirectory() as d:

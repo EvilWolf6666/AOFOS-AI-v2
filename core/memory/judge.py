@@ -2,7 +2,7 @@
 """
 準 v4 寫入端的背景判斷（乙：同一顆對話模型，閒置時跑、一開口就取消）。
 
-一段對話 → **一次呼叫**（舊做法 json_schema 兩段式見《歸檔》D0033）：
+一段對話 → **一次呼叫**（舊做法 json_schema 兩段式見 261009-記憶-33）：
   第一行「建／不建／不確定」，要建就接著一行一件「類型｜屬性鍵｜主題句」，**JSON 由 Python 組**。
   · 建不建由 `decide()` 定，看 config `judge_build_threshold`：
       None＝看第一行的字：只有「不建」不建，「不確定」與看不懂都當建。
@@ -11,7 +11,7 @@
   · P(建) 兩種模式都照算、照寫 log（之後要不要恢復門檻，靠這些樣本校準）。
   · 拿不到 logprobs ⇒ WARNING（只記一次）＋計數，看文字（同 None）。
   · 不用 json_schema：後端在格式限制下回的是限制「之前」的分布，讀不出選項機率，
-    而且同一段結論會變（實測，《現況》11之2 己）。
+    而且同一段結論會變（實測，〈現況-記憶〉不要用 json_schema）。
   ⭐ prompt 順序＝「規則在前（system，固定不變）、對話片段在後」：規則是每段共用的前綴，
     連續判好幾段時吃得到 prompt cache。規則、類型、例子都在 prompts/memory_judge.txt。
 
@@ -22,7 +22,7 @@
     「取消之後下一輪對話有沒有排隊」——後端行為見 core/llm_client.py BackgroundLLM 段首註解
     （量法：tools/chat_probe 的「排隊」欄），
     本檔只負責把次數與時間點記下來（log 搜「背景取消」對照下一行「LLM呼叫」耗時）。
-    量不到改善或做不到 ⇒ 換甲（極小判斷模型），見《現況》準 v4。
+    量不到改善或做不到 ⇒ 換甲（極小判斷模型），見〈現況-記憶〉。
 
 🔴 **會默默死掉的那種執行緒**：每步例外都接住記 ERROR、不讓執行緒結束；
    待判積壓超過門檻記 WARNING；/status 看得到積壓與計數。
@@ -285,7 +285,7 @@ class BackgroundJudge:
         self.names = cfg["speaker_names"]
         self.system, self.types, self.examples = load_prompt(
             cfg["judge_prompt_path"], max_topics=cfg["judge_max_topics"])
-        # 判斷來源（寫進主題表，《現況》〈🔒 隔離區〉準 v4；core/memory/topics.py 檔頭〈判斷來源〉）。
+        # 判斷來源（寫進主題表，〈現況-記憶〉；core/memory/topics.py 檔頭〈判斷來源〉）。
         # 規則檔只在這裡讀一次 ⇒ 整個執行期間雜湊不變；改規則檔要重開才生效，與送出的內容一致。
         self.judge_model = llm.model
         self.judge_prompt = prompt_digest(self.system)
@@ -296,6 +296,7 @@ class BackgroundJudge:
         self._path: str | None = None
         self._want_path: str | None = None
         self._cx = None
+        self._st = None             # 綁在 _cx 上的 TopicStore；_cx 換了就跟著換（見 _step）
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = False
@@ -314,9 +315,11 @@ class BackgroundJudge:
 
     def set_path(self, path: str | None) -> None:
         """換要判的 DB；None＝停用（施測中）。會取消進行中的呼叫。"""
+        # 🔴 改目標與取消在同一把鎖裡：分開做時，判斷執行緒可能在兩步之間完成切換並 resume()，
+        #    隨後這裡的 cancel() 就留著沒人清，之後每次背景呼叫都立刻被取消。
         with self._lock:
             self._want_path = path
-        self.llm.cancel()
+            self.llm.cancel()
         self._wake.set()
 
     def detach(self, timeout: float = 5.0) -> bool:
@@ -379,15 +382,15 @@ class BackgroundJudge:
     # ── 執行緒 ────────────────────────────────────────────────
 
     def _reconcile_path(self) -> None:
+        # 讀目標、切換、恢復在同一把鎖裡做完（與 set_path 互斥，理由見 set_path）。
         with self._lock:
             want = self._want_path
-        if want == self._path:
-            return
-        if self._cx is not None:
-            self._cx.close()
-            self._cx = None
-        self._path = want
-        with self._lock:
+            if want == self._path:
+                return
+            if self._cx is not None:
+                self._cx.close()
+                self._cx = None
+            self._path = want
             if self._paused_at is None:
                 self.llm.resume()   # set_path 的 cancel 只為打斷舊對象，不該留著擋新對象
         if want is not None:
@@ -433,6 +436,14 @@ class BackgroundJudge:
                     self._wake.clear()
             except BackgroundCancelled:
                 self.stats["cancelled"] += 1
+                # 沒在暫停、目標也沒換，卻被取消＝取消旗標是殘留的（例：set_path 傳了與現在相同的目標）
+                # ⇒ 清掉。暫停中或目標已換的不動：那兩種各有自己的恢復點（resume／_reconcile_path）。
+                with self._lock:
+                    if self._paused_at is None and self._want_path == self._path and not self._stop:
+                        self.llm.resume()
+                # 短暫讓出：旗標還在時不等待會整圈空轉（實測 2 秒一萬圈、吃滿一核）
+                self._wake.wait(0.2)
+                self._wake.clear()
             except Exception as e:  # noqa: BLE001
                 self.stats["errors"] += 1
                 logger.error(f"背景判斷失敗，稍後重試：{type(e).__name__}: {e}")
@@ -446,7 +457,12 @@ class BackgroundJudge:
         cfg = self.cfg
         if self._cx is None:
             self._cx = connect(self._path)
-        st = TopicStore(self._cx)             # 首次：建表＋judged_upto（舊表補 status 欄）
+            self._st = None
+        if self._st is None or self._st.cx is not self._cx:
+            # 每條連線建一次就好：建表／舊表補欄／judged_upto 都是一次性的。
+            # （原本每圈都建，閒置時每 0.5～30 秒就多一次寫交易，與對話的寫入搶鎖。）
+            self._st = TopicStore(self._cx)
+        st = self._st
         fill_fts(self._cx)                    # 首次：補上舊主題的關鍵字索引（衍生物，冪等）
         if self.emb is not None and self.emb.ready.is_set():
             fill_vectors(self._cx, self.emb)

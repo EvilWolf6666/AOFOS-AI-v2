@@ -3,11 +3,12 @@
 
 import os
 
+from config import PROJECT_ROOT
 from core.logger import setup_logger
 
 logger = setup_logger("Persona")
 
-PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "prompts", "aofos_persona.txt")
+PROMPT_PATH = os.path.join(PROJECT_ROOT, "prompts", "aofos_persona.txt")   # 路徑一律由 config.PROJECT_ROOT 組
 
 # 此標記行以下的內容不送進模型。
 #

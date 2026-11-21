@@ -1,7 +1,7 @@
 # config.py
 # 統一設定檔 — 換模型 / 換 API / 調參數只改這裡
 
-# ── 環境變數：必須在任何 huggingface / chromadb 相關 import 之前生效 ──
+# ── 環境變數：必須在任何 huggingface 相關 import 之前生效 ──
 import os
 
 from dotenv import load_dotenv
@@ -49,7 +49,7 @@ LLAMA_SERVER = {
     "host": "127.0.0.1",
     "port": 8080,
 
-    # ── 載入參數（依 tools/chat_probe 單一變數實驗定，GTX 1650；《現況》13之2）──
+    # ── 載入參數（依 tools/chat_probe 單一變數實驗定，GTX 1650；〈現況-模型與後端〉）──
     # ⚠️ 換設備整組重量（延遲結論不可跨設備轉移）。
     "ctx": 8192,          # VRAM 約束下的值（模型標稱支援 131072）
     "ngl": 17,            # 16GB 級顯卡到位後改 99（整顆上 GPU）
@@ -61,7 +61,7 @@ LLAMA_SERVER = {
     "batch": 512,
     "ubatch": 512,        # 實體批次；不得大於 batch
     "flash_attn": "on",   # on／off／auto
-    # 附加旗標（原樣接在指令後）。⚠️ --cache-reuse 屬片段式重用、可能有偏差，施測時不得加（《現況》11之2 己）。
+    # 附加旗標（原樣接在指令後）。⚠️ --cache-reuse 屬片段式重用、可能有偏差，施測時不得加（〈現況-模型與後端〉）。
     "extra_args": [],
 
     # ── 其餘後端參數 ──
@@ -73,7 +73,7 @@ LLAMA_SERVER = {
         # RAM 提示詞快取上限（MiB，預設 8192）。對話與背景判斷輪流用同一推理槽，靠它存彼此前綴、
         #   切回來不必整段重算；壓到 1024：系統 RAM 只有 8GB 級，預設可能吃光而換頁。
         "-cram": 1024,   # 長名 --cache-ram
-        "--cache-reuse": None,          # 片段式 KV 重用的最小區塊（預設 0＝關）。⚠️ 可能有偏差，施測時不得開（《現況》11之2 己）
+        "--cache-reuse": None,          # 片段式 KV 重用的最小區塊（預設 0＝關）。⚠️ 可能有偏差，施測時不得開（〈現況-模型與後端〉）
         "--no-cache-prompt": False,     # True＝關掉提示詞快取（只在量「不吃快取」的成本時用）
         "--no-cache-idle-slots": False, # True＝新任務時不把閒置槽存進 RAM 快取（預設會存）
         "--kv-unified": None,           # True＝多槽共用一塊 KV（槽數為 auto 時預設開）；parallel 實驗時再看
@@ -126,8 +126,8 @@ LLAMA_SERVER = {
 
         # ── 模板與思考 ──
         # 覆寫聊天模板。⚠️ 必須與訓練端一致。用底模的簡單 llama3 模板，不帶日期行
-        #   （v3 合併版 gguf 內建的官方模板會在 system 前加兩行日期，《現況》13之2）。
-        "--chat-template-file": r"C:\Users\EvilWolf\Desktop\AI-project\AOFOS-AI\AOFOS-LOKA\prompts\llama3_plain.jinja",
+        #   （v3 合併版 gguf 內建的官方模板會在 system 前加兩行日期，〈現況-模型與後端〉）。
+        "--chat-template-file": os.path.join(PROJECT_ROOT, "prompts", "llama3_plain.jinja"),
         "--chat-template-kwargs": None,
         "--reasoning": None,            # on／off／auto：思考模式（Llama 3.1 沒有，維持預設）
         "--no-prefill-assistant": False,
@@ -144,7 +144,7 @@ LLAMA_SERVER = {
 # LLM 連線與推理參數
 # ─────────────────────────────────────────────────────────────
 # 所有影響輸出的參數一律在此明確指定並隨 request 送出。
-# ⚠️ 沒帶的參數會吃後端預設值，或 GGUF 內嵌的取樣值（general.sampling.*，《現況》第五章 #5）
+# ⚠️ 沒帶的參數會吃後端預設值，或 GGUF 內嵌的取樣值（general.sampling.*，〈現況-模型與後端〉）
 #    ——換模型時會各自不同，跨模型比較靜默失效且無警告。
 
 LLM_CONFIG = {
@@ -181,6 +181,15 @@ LLM_CONFIG = {
     # ⚠️ 只作用於有接串流回呼的呼叫點（目前僅 handle_turn / handle_observation）。
     #    施測時由 TEST_CONFIG["disable_stream"] 強制關閉。（背景判斷另走 BackgroundLLM，一律串流。）
     "stream": True,
+
+    # ── 連線逾時與重試（明帶，不留給 SDK 預設；openai 套件預設是讀取 600 秒、自動重試 2 次）──
+    # 重試 0：後端回 5xx 或斷線時，SDK 會在背後把整份 prompt 重送（多一次 prefill，log 看不到）。
+    #   失敗要大聲 ⇒ 直接失敗，由對話視窗「她這輪沒有回應」提示，原因進 log。
+    # 讀取逾時：串流時是「兩塊之間」最多等多久；非串流（施測）時是整段生成最多等多久，所以放寬到 300 秒。
+    #   ⚠️ 必須大於最長的首字時間（2026-10 實測約 4～7 秒）；換慢的模型或大幅加長 context 時重看。
+    "timeout_connect_s": 5.0,
+    "timeout_read_s": 300.0,
+    "max_retries": 0,
 }
 
 
@@ -197,7 +206,7 @@ LLM_CONFIG = {
 MAX_WORKING_MEMORY = 20      # 最多保留幾輪（一輪＝一問一答）
 WM_DROP_ROUNDS = 10          # 超過上限時一次丟掉最舊的幾輪（1＝每輪都斷快取）
 
-# ── 記憶（core/memory/manager.py；準 v4，《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）──────────
+# ── 記憶（core/memory/manager.py；準 v4，〈現況-記憶〉）──────────
 MEMORY_CONFIG = {
     # 日常區與測試區是兩個獨立檔。/test on 時「讀取共用、寫入分流」：
     # 讀兩個、寫只寫測試區；進出測試模式時整包丟棄測試區。日常檔不存在時不讀、也不建檔。
@@ -229,7 +238,7 @@ MEMORY_CONFIG = {
     # 區塊放哪：
     #   "tail_system"＝一則 system 訊息，夾在上一句回覆與本輪輸入之間。
     #   "in_user"    ＝併進本輪 user 訊息的開頭（區塊＋換行＋輸入）。
-    # ⚠️ tail_system 會讓她傾向把上一句原樣再講一次（實測，《現況》22之84）。
+    # ⚠️ tail_system 會讓她傾向把上一句原樣再講一次（實測，261023-過程-84）。
     # ⚠️ 兩組對照施測必須同值（它改變 prompt 結構）。
     "block_position": "in_user",
     # {open}／{close}／{remember}／{recall} 由上面四個鍵代入（標記與標題只存一份）。
@@ -252,10 +261,10 @@ MEMORY_CONFIG = {
     "embed_enabled": True,
     "embed_model": "paraphrase-multilingual-MiniLM-L12-v2",
 
-    # ══ 準 v4（《現況》〈🔒 隔離區〉記憶模塊〈準 v4〉）══════════════
+    # ══ 準 v4（〈現況-記憶〉）══════════════
     # 寫入端：原句全存＋背景判斷「這段有沒有值得記的事」→ 有就建主題（transcript 的索引）。
     # 讀取端：主題兩路檢索 → 注入最新有效版本的主題句（重寫尚未實作）。
-    # 關閉時（換判斷模型前，《現況》第八章 P1）：原句照存、開場照常；向量模型不載；
+    # 關閉時（換判斷模型前，待辦 P1）：原句照存、開場照常；向量模型不載；
     #    start/背景判斷.bat 也不啟動。重開後，關閉期間存下的原句會被補判。
     "v4_enabled": False,         # 關掉＝只存原句、不判不撈
 
@@ -316,6 +325,11 @@ TEXT_CONFIG = {
 
 # 語音輸入
 VOICE_CONFIG = {
+    # Whisper 模型大小。⚠️ HF_HUB_OFFLINE（本檔開頭）＝只用已下載的；換成沒下載過的會直接報錯，
+    #   第一次要下載時命令列先設 HF_HUB_OFFLINE=0。
+    #   2026-11-01 由 small 改：本機快取沒有 small（只有 medium、large-v3、large-v3-turbo）。
+    #   medium 與 "large-v3-turbo" 哪個在本機 CPU 較快未量：log 視窗的 [TIMING] 語音辨識 比較。
+    "whisper_model": "medium",
     "sample_rate": 16000,
     "channels": 1,
     "vad_threshold": 0.5,      # 語音判定信心值門檻
@@ -349,12 +363,12 @@ EVENT_CONFIG = {
     #   "in_user"       ＝併進本輪 user 訊息（「[目前情境]\n描述」；有記憶區塊時接在區塊後面）。
     #   "separate_role" ＝一則 observation_role 訊息放在空 user 之前。
     # ⚠️ separate_role 在模板裡被渲染成 ipython header、內容包成 JSON 字串，扣住情境最差；
-    #    ⛔ 不可改成尾端 system（會照講上一句）。實測見《現況》22之84。
+    #    ⛔ 不可改成尾端 system（會照講上一句）。實測見 261023-過程-84。
     # ⚠️ in_user 時 user_placeholder 不送給模型，只用在寫回 Working Memory 與「observation 輪不做檢索」。
     # ⚠️ 只在一對一成立；聊天室恢復後 user 位置多人共用，要重看。
     "observation_delivery": "in_user",
 
-    # 情境要不要留在之後幾輪的對話歷史裡（《現況》第八章 P20）：
+    # 情境要不要留在之後幾輪的對話歷史裡（待辦 P20，已結案）：
     #   "none"   ＝情境只存在記憶 db 的欄位，之後幾輪模型看不到（歷史裡是空 user）。
     #   "latest" ＝只留最近一則：更早的收回成空 user（收回會讓快取斷掉）。
     #   "all"    ＝每則 observation 都顯示情境。
@@ -368,7 +382,7 @@ EVENT_CONFIG = {
     # 情境訊息的 role 名稱（只在 observation_delivery="separate_role" 時用）。
     #
     # ⚠️ 現行後端與模板下，"tool" 與 "ipython" 都渲染成 ipython header，輸出逐字相同（/apply-template 實查）。
-    #    換模板或後端要重查；改值前先讀《現況》第八章 P8。
+    #    換模板或後端要重查；改值前先讀待辦 P8（已結案，261024-人格-16）。
     "observation_role": "tool",
 
     # 要手動注入情境時，新增 producer，不另寫注入腳手架——路徑必須與真實事件相同。
@@ -398,7 +412,9 @@ ARBITRATION_CONFIG = {
 # ⚠️ 「畫面上發生什麼」需要 VL，屬另一個 producer，兩者互補不重疊。
 
 WINDOW_WATCHER_CONFIG = {
-    "enabled": True,
+    # 2026-11-21 邪狼：停用。視窗監看算前期測試；之後改走遊戲狀態監測（類 Neuro 的遊戲接口，待辦 P21），
+    # 屆時直接換新的 producer，不回頭調這裡。改回 True 即恢復。
+    "enabled": False,
 
     # 輪詢間隔（秒）。Win32 API 呼叫成本極低，但過密無意義——
     # 人切換視窗的頻率遠低於每秒一次。
@@ -487,9 +503,13 @@ TIMING_CONFIG = {
 #   log 視窗：其餘全部——載入細節、計時、背景判斷、警告與錯誤的原因。
 # dialog_level：log 也要印在對話視窗時填等級（"WARNING"＝警告以上、"DEBUG"＝全部）；None＝不印。
 #   理由：串流中插進來的 log 會把回應切成好幾行、把正在打的字洗掉。
-#   只管 AOFOS 對話視窗；tools/ 的腳本沒有 log 視窗，它們的終端照舊全部印。
+#   AOFOS 對話視窗，以及另開了 log 視窗的工具（tool_log_window）自己的視窗都照它；
+#   沒開 log 視窗的 tools/ 腳本，終端照舊全部印。
 LOG_CONFIG = {
     "dialog_level": None,
+    # 對話探測、自動施測執行時另開一個 log 視窗，盯該次執行資料夾的 log（core/log_window.py）；
+    # 不動已開著的其他 log 視窗。False＝不開，log 照舊印在工具自己的視窗。（2026-11-21 邪狼，待辦 C24）
+    "tool_log_window": True,
 }
 
 
@@ -501,7 +521,7 @@ LOG_CONFIG = {
 # 註：TIMING_CONFIG 不屬腳手架（延遲量測是長期需求）。
 
 DIAGNOSTICS = {
-    # 保留到恢復 opencc（《現況》第八章 C13）：恢復時這是唯一能看見轉換內容的工具。
+    # 保留到恢復 opencc（待辦 C13）：恢復時這是唯一能看見轉換內容的工具。
     #    opencc_enabled 為 False 時不作用。⚠️ 施測期間不要開（它是新變數），兩組對照必須同值。
     "log_opencc_changes": True,
 }

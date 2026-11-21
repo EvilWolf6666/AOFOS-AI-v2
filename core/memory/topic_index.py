@@ -10,7 +10,7 @@
 ⚠️ 執行緒分工同 embed.py：寫 `topic_vec` 在背景（判斷執行緒建完主題順手算）；
    主執行緒只讀、只編碼查詢句。
 
-關鍵字那一路（《現況》〈🔒 隔離區〉準 v4 檢索列）：
+關鍵字那一路（〈現況-記憶〉檢索列）：
    `topic_fts`（FTS5，rowid＝topic.id）＝主題句的 bigram
    （core/memory/bigram.py 的 `bigrams()`／`_match_expr()`，寫入與查詢必須同一個函式）。
    同樣是衍生物、可重建；由判斷執行緒建完主題順手補（`fill_fts`）。

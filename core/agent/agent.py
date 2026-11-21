@@ -8,11 +8,11 @@ Agent（中央控制核心 / Single Control Point）
     - 驅動主迴圈：從 event_queue 取事件 → 依 kind 分流 → 輸出 / 結束
 
 「該怎麼處理這個事件」的決策細節屬於 Pipeline，Agent 不介入。
-拆分理由與例外記錄見《歸檔》F0006。
+拆分理由與例外記錄見 260802-人格-06。
 
 ⚠️ event_queue.get() 是所有事件的唯一取用點，仲裁層即建於此（_arbitrate）。
    新增仲裁規則一律加在該方法內，不得在各 producer 內分頭決定要不要發言
-   （分散決策點的失效案例見《歸檔》L0005）。
+   （分散決策點的失效案例見 260726-外參-05）。
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ class Agent:
                 # 函式內 import：文字模式的使用者不必載入語音模型。
                 # ⚠️ 前提是沒有任何模組在模組層級 import core.voice_input（core/agent/selftest.py 會驗）。
                 from core.voice_input import VoiceInput
-                self._voice_input = VoiceInput(model_size="small", language="zh")
+                self._voice_input = VoiceInput()
             except Exception as e:
                 logger.error(f"語音輸入啟動失敗：{type(e).__name__}: {e}")
                 console.emit("[語音模式啟動失敗，維持文字模式（原因見 log 視窗）]\n")
@@ -159,7 +159,7 @@ class Agent:
 
         這是系統中唯一的仲裁點——它成立的前提是 event_queue.get() 是唯一取用點。
         規則若下放到各 producer 自行判斷，多來源時必然出現同時輸出
-        （Lumi_Nox 失效案例，見《歸檔》L0005）。
+        （Lumi_Nox 失效案例，見 260726-外參-05）。
 
         現行兩條規則，皆只作用於 observation：
           1. proactive 開關關閉 → 不處理
@@ -169,7 +169,7 @@ class Agent:
         自言自語過於頻繁，不是用來擋人講話的。
 
         ⚠️ 尚未實作但位置已預留（TTS 接入主迴圈後才存在）：奧狐正在說話時使用者插話
-        怎麼處理（《現況》第八章 P12、〈🔒 事件驅動〉，未裁決）。目前沒有語音輸出，
+        怎麼處理（待辦 P12、〈現況-事件驅動〉，未裁決）。目前沒有語音輸出，
         輸出期間進來的輸入照一般事件排隊、下一輪處理。
         """
         if event.kind != OBSERVATION:
@@ -231,10 +231,30 @@ class Agent:
             self.state.last_speech_at = time.monotonic()
         else:
             # 原因（呼叫失敗、空內容）已記在 log；對話視窗只說結果，不然你只看到提示又出現
-            console.emit("\n[她這輪沒有回應（原因見 log 視窗）]\n")
+            # 這一輪沒有存進記憶（pipeline 只在有回應時 add_turn；2026-11-21 邪狼裁：失敗那輪維持不存），提示要講明
+            console.emit("\n[她這輪沒有回應，剛才那句沒有記下來（原因見 log 視窗）]\n")
 
         # 收尾一律在輸出之後，即使本輪無回應也要呼叫（恢復背景判斷，同 _handle_observation）。
         self.pipeline.finalize_turn()
+
+    def _dispatch(self, event: Event) -> None:
+        """
+        單輪的例外隔離：一輪出錯只結束這一輪，程式繼續等下一則事件。
+
+        ⚠️ 沒有這層時，任一輪的例外（例如記憶組裝讀檔失敗）會穿出主迴圈、走到 finally 的
+           _shutdown()，整個程式結束。只接 Exception：Ctrl+C（KeyboardInterrupt）照常往外走、照常收尾。
+        """
+        try:
+            if event.kind == OBSERVATION:
+                self._handle_observation(event)
+            else:
+                self._handle_utterance(event)
+        except Exception as e:
+            # 失敗要大聲：完整 traceback 進 log；對話視窗只說結果（同「她這輪沒有回應」的分工）
+            logger.exception(f"本輪處理失敗（程式繼續）：{type(e).__name__}: {e}")
+            console.emit("\n[這一輪出錯了，已略過（原因見 log 視窗）]\n")
+            # 輪次開始時已暫停背景判斷，例外跳過了正常路徑的收尾 ⇒ 這裡補。重複呼叫無害（只是恢復）。
+            self.pipeline.finalize_turn()
 
     # ── 主迴圈 ───────────────────────────────────────────────────────
 
@@ -247,10 +267,7 @@ class Agent:
                 event = self._next_event()
                 if event is None or not self._arbitrate(event):
                     continue
-                if event.kind == OBSERVATION:
-                    self._handle_observation(event)
-                else:
-                    self._handle_utterance(event)
+                self._dispatch(event)
         except KeyboardInterrupt:
             console.emit("\n[Ctrl+C：收尾後結束]")
         finally:
