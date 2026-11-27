@@ -19,10 +19,11 @@ from datetime import datetime, timedelta, timezone
 
 from config import MEMORY_CONFIG
 from core.memory.bigram import bigrams, check_fts5
-from core.memory.db import connect
+from core.memory.db import BUSY_TIMEOUT_MS, connect, write_txn
 from core.memory.episode import EpisodeIndex, time_bucket
 from core.memory.manager import MemoryManager
 from core.memory.pre_write import PreWrite
+from core.memory.transcript import Transcript
 
 _fail = 0
 
@@ -317,6 +318,58 @@ def main() -> int:  # noqa: C901
                 pass
         check("拒開之後連線已關（不關的話 Windows 上記憶檔一直被鎖住）", opened and not still_open,
               f"開了 {len(opened)} 條、還開著 {len(still_open)} 條")
+
+    with tempfile.TemporaryDirectory() as d:
+        # 🔴 以下三段補「植入 bug」實測抓到的盲點（2026-11-21）：把程式故意改壞一處，
+        #    原有自測照樣全過的三處。它們測的是「改壞時會不會被發現」，不是修現有程式。
+        p = os.path.join(d, "memory.db")
+        a, b = connect(p), connect(p)
+        try:
+            print("\n[交易鎖：寫入交易一開就排他]")
+            # 兩條執行緒各寫 40 句那段只「偶爾」抓得到 DEFERRED（Linux 上 10 次 3 次），
+            # 要看排程碰不碰得上。這裡直接看鎖：A 的交易還開著時，B 開寫入交易必須被擋。
+            # IMMEDIATE ⇒ B 等 busy_timeout 後報 locked；DEFERRED ⇒ B 照樣開得起來。
+            b.execute("PRAGMA busy_timeout=100")   # 只為不讓本段等滿 5 秒
+            blocked = False
+            with write_txn(a):
+                try:
+                    with write_txn(b):
+                        pass
+                except sqlite3.OperationalError as e:
+                    blocked = "locked" in str(e)
+            check("A 交易未結束時，B 開不了寫入交易（BEGIN IMMEDIATE）", blocked)
+            b.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+
+            print("\n[交易中途出錯要回滾]")
+            # 不回滾時連線停在交易裡，下一輪的 BEGIN 會失敗、那一輪原句寫不進去（db.py write_txn 註解）。
+            try:
+                with write_txn(a):
+                    a.execute("INSERT INTO meta(key, value) VALUES('_selftest_probe', 1)")
+                    raise RuntimeError("模擬交易中途出錯")
+            except RuntimeError:
+                pass
+            check("出錯後連線不在交易中", not a.in_transaction)
+            row = a.execute("SELECT 1 FROM meta WHERE key='_selftest_probe'").fetchone()
+            check("出錯那筆沒寫進去", row is None)
+            try:
+                with write_txn(a):
+                    pass
+                check("出錯後下一筆交易開得起來", True)
+            except sqlite3.OperationalError as e:
+                check("出錯後下一筆交易開得起來", False, repr(e))
+
+            print("\n[原句：同號同內容跳過、同號不同內容覆寫修補]")
+            t = Transcript(a)
+            t.land([{"serial": 1, "role": "user", "content": "原本那句"}])
+            r = t.land([{"serial": 1, "role": "user", "content": "原本那句"}])
+            check("同號同內容 ⇒ 跳過", r["skipped"] == 1 and r["repaired"] == 0, str(r))
+            r = t.land([{"serial": 1, "role": "user", "content": "修補後那句"}])
+            got = a.execute("SELECT content FROM transcript WHERE serial=1").fetchone()["content"]
+            check("同號不同內容 ⇒ 記一次修補", r["repaired"] == 1, str(r))
+            check("同號不同內容 ⇒ 庫裡真的換成新內容", got == "修補後那句", got)
+        finally:
+            a.close()
+            b.close()
 
     with tempfile.TemporaryDirectory() as d:
         print("\n[兩條執行緒同時寫同一個 DB]")
