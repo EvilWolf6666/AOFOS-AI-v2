@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import websockets
+import websockets.asyncio.client   # 只給型別標註用（connect() 回傳的連線類別）
 from config import PROJECT_ROOT
 from core.logger import setup_logger
 
@@ -28,7 +29,7 @@ APPROVE_TIMEOUT_S = 30.0
 
 class VTubeClient:
     def __init__(self):
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws: Optional[websockets.asyncio.client.ClientConnection] = None
         self.auth_token: Optional[str] = None
         self._loop = asyncio.new_event_loop()
 

@@ -1,0 +1,38 @@
+[project]
+name = "aofos-loka"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "colorlog",
+    "faiss-cpu",
+    "faster-whisper",
+    "numpy",
+    "openai",
+    "opencc-python-reimplemented",
+    "python-dotenv",
+    "sentence-transformers",
+    "sounddevice",
+    "torch",
+    "torchaudio",  # Silero VAD（torch.hub 載入）的工具模組在 import 時就需要它。2.11 是最後一版，官方說明可配之後所有 torch
+    "websockets",
+]
+
+[tool.uv]
+# 只解析 Windows 與 Linux；兩邊都必須有 wheel，缺了 uv lock 直接報錯。
+environments = ["sys_platform == 'win32'", "sys_platform == 'linux'"]
+# 版本由 uv.lock 決定（要 commit）。升級：uv lock --upgrade-package <名稱>，一次一個，升完跑自測。
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# torch 只走 PyTorch 官方 CPU index：Whisper 與 embedding 都跑 CPU，VRAM 留給推理後端。
+# 不設的話，Linux 從 PyPI 會裝到附帶 CUDA 的大包。
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]

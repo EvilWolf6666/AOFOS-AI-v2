@@ -4,8 +4,10 @@ __pycache__/
 *.pyo
 *.pyd
 
-# 虛擬環境
+# 虛擬環境（.venv 是 uv 建的現行環境；venv_old 是遷移前的舊環境，確認後刪除）
 venv/
+.venv/
+venv_old/
 
 # 資料檔（個人記憶不上傳）
 data/

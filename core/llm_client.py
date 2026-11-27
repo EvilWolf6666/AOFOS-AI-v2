@@ -9,7 +9,7 @@ import time
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-from openai import OpenAI, Timeout   # Timeout：openai 套件轉出的 httpx.Timeout（不直接依賴 httpx 的版本）
+from openai import OpenAI, Timeout   # Timeout 用 openai 套件自己匯出的（3.x 起底層是 httpx2），不直接依賴 HTTP 函式庫的版本
 
 from config import LLAMA_SERVER, LLM_CONFIG, TEST_CONFIG, TEST_MODE
 from core.backend_check import verify_llamaserver
@@ -472,8 +472,8 @@ class BackgroundLLM:
     🔴 **刻意不用 OpenAI SDK，改用標準庫 http.client 自己送**：取消要在兩個階段都立刻生效——
       ① 請求已送出、後端還在 prefill（連回應標頭都還沒回）
       ② 已在串流
-    SDK（httpx）在 ① 階段沒有從別的執行緒中斷的手段（關 client 不會打斷正在等的讀取，
-    假伺服器實測：取消後仍卡到標頭回來才放手）。
+    SDK 在 ① 階段沒有從別的執行緒中斷的手段（關 client 不會打斷正在等的讀取，
+    假伺服器實測：取消後仍卡到標頭回來才放手；實測時 SDK 底層是 httpx，openai 3.x 起換成 httpx2，未重測）。
     自己持有 socket ⇒ `shutdown()` 會讓另一條執行緒卡住的 recv 立刻返回 ⇒ 兩個階段都是毫秒級。
     ⚠️ 代價：SSE 解析自己做（只需 `data:` 行與 `[DONE]`，格式固定）。
     """

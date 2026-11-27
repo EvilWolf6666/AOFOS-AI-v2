@@ -94,9 +94,9 @@ start/                  Windows 一鍵啟動腳本
 
 ## 執行方式
 
-**環境**：Windows、Python 3.10 以上、[llama.cpp](https://github.com/ggml-org/llama.cpp) 的 `llama-server`、一個 GGUF 格式的語言模型。
+**環境**：Windows、[uv](https://docs.astral.sh/uv/)（Python 由 uv 依 `.python-version` 自動準備，最低 3.11）、[llama.cpp](https://github.com/ggml-org/llama.cpp) 的 `llama-server`、一個 GGUF 格式的語言模型。
 
-1. 安裝套件：`pip install -r requirements.txt`
+1. 安裝套件：在專案根目錄執行 `uv sync`（依 `uv.lock` 建立 `.venv`）
 2. 打開 `config.py`，把 `LLAMA_SERVER` 裡的 `exe`、`model` 等路徑改成自己電腦上的位置。
 3. 執行 `start/啟動推理後端.bat`，等模型載入完成。
 4. 執行 `start/啟動.bat`，開始對話。
@@ -104,8 +104,8 @@ start/                  Windows 一鍵啟動腳本
 自我測試（不需要模型）：
 
 ```
-python -m core.agent.selftest
-python -m core.memory.selftest_v4
+uv run python -m core.agent.selftest
+uv run python -m core.memory.selftest_v4
 ```
 
 ---
